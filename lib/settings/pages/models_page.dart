@@ -473,7 +473,8 @@ class _ModelsSettingsPageState extends State<ModelsSettingsPage> {
                 onEnabled: (value) =>
                     unawaited(_providers.setAntigravityHidden(!value)),
                 onOpen: switch (SettingsOpener.maybeOf(context)) {
-                  final open? => () => open(SettingsSection.accounts),
+                  final open? =>
+                    () => open(SettingsSection.antigravityAccounts),
                   null => null,
                 },
               ),

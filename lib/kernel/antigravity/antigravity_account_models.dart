@@ -497,6 +497,73 @@ class AntigravityQuotaData {
 
   AntigravityTier get tier => AntigravityTier.fromRaw(subscriptionTier);
 
+  /// Returns quota groups ordered with `weekly` first and `5h` second inside
+  /// each group, matching the official Antigravity `Usage` popover.
+  List<AntigravityQuotaGroup> get resolvedUsageGroups {
+    final raw = quotaGroups;
+    if (raw != null && raw.isNotEmpty) {
+      return [
+        for (final g in raw)
+          if (g.buckets.any((b) => b.remainingFractionKnown))
+            AntigravityQuotaGroup(
+              displayName: g.displayName,
+              description: g.description,
+              buckets: _sortUsageBuckets(
+                g.buckets.where((b) => b.remainingFractionKnown).toList(),
+              ),
+            ),
+      ];
+    }
+
+    // Fallback synthesis when `quota_groups` was not yet fetched.
+    final synthesized = <AntigravityQuotaGroup>[];
+    for (final (pool, title) in const [
+      (AntigravityQuotaPool.gemini, 'Gemini Models'),
+      (AntigravityQuotaPool.thirdParty, 'Claude and GPT models'),
+      (AntigravityQuotaPool.argon, 'Gemini 4 Argon'),
+      (AntigravityQuotaPool.carbon, 'Gemini 4 Carbon'),
+    ]) {
+      final matching = models.where(
+        (m) =>
+            m.percentageKnown &&
+            !m.name.endsWith('-disabled') &&
+            AntigravityQuotaPool.ofModel(m.name, m.displayName ?? '') == pool,
+      );
+      if (matching.isEmpty) continue;
+      final strictest = matching.reduce(
+        (a, b) => a.percentage <= b.percentage ? a : b,
+      );
+      synthesized.add(
+        AntigravityQuotaGroup(
+          displayName: title,
+          buckets: [
+            AntigravityQuotaBucket(
+              bucketId: '${pool.key}-5h',
+              window: '5h',
+              remainingFraction: (strictest.percentage / 100.0).clamp(0.0, 1.0),
+              resetTime: strictest.resetTime,
+              displayName: '5h limit',
+            ),
+          ],
+        ),
+      );
+    }
+    return synthesized;
+  }
+
+  static List<AntigravityQuotaBucket> _sortUsageBuckets(
+    List<AntigravityQuotaBucket> buckets,
+  ) {
+    int rank(String w) => switch (w) {
+      'weekly' => 0,
+      '5h' => 1,
+      _ => 2,
+    };
+    final copy = [...buckets]
+      ..sort((a, b) => rank(a.window).compareTo(rank(b.window)));
+    return copy;
+  }
+
   /// Extracts pool quota cards for [window] (`5h` or `weekly`).
   List<AntigravityPoolDisplay> poolDisplays(AntigravityQuotaWindow window) {
     final byPool = <AntigravityQuotaPool, Map<String, AntigravityQuotaBucket>>{};
@@ -872,6 +939,25 @@ class AntigravityAutoSwitchConfig {
     'candidate_min_percentage': candidateMinPercentage,
     'sync_external_clients': syncExternalClients,
   };
+}
+
+/// Formats an RFC3339 reset timestamp into `Resets in 3d 19h` / `Resets in 3h 53m`
+/// matching the official Antigravity Usage popover.
+String formatUsageResetIn(String resetTime) {
+  if (resetTime.isEmpty) return '';
+  final dt = DateTime.tryParse(resetTime);
+  if (dt == null) return '';
+  final diff = dt.toUtc().difference(DateTime.now().toUtc());
+  if (diff.inSeconds <= 0) return 'Resets soon';
+  if (diff.inMinutes < 60) return 'Resets in ${math.max(1, diff.inMinutes)}m';
+  if (diff.inHours < 24) {
+    final h = diff.inHours;
+    final m = diff.inMinutes % 60;
+    return m > 0 ? 'Resets in ${h}h ${m}m' : 'Resets in ${h}h';
+  }
+  final d = diff.inDays;
+  final h = diff.inHours % 24;
+  return h > 0 ? 'Resets in ${d}d ${h}h' : 'Resets in ${d}d';
 }
 
 /// Formats an RFC3339 reset timestamp into a concise Chinese relative countdown.

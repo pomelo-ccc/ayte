@@ -16,6 +16,7 @@ import '../../kernel/antigravity/antigravity_account_models.dart';
 import '../../kernel/antigravity/antigravity_accounts.dart';
 import '../../kernel/antigravity/antigravity_oauth.dart';
 import '../../kernel/antigravity/antigravity_switcher.dart';
+import '../../kernel/antigravity/antigravity_usage_widgets.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/codicons.dart';
 import '../../theme/workbench_theme.dart' show themeColors;
@@ -23,8 +24,27 @@ import '../../workspace/editor_launcher.dart' show openExternal;
 import '../../workspace/window_controls.dart';
 import 'settings_widgets.dart';
 
-/// Antigravity Google multi-account manager, real-time quota monitor, and
-/// smart auto-switch panel embedded at the top of Settings → Accounts.
+/// Standalone Settings → Antigravity 账号 page (`SettingsSection.antigravityAccounts`).
+class AntigravityAccountsPage extends StatelessWidget {
+  const AntigravityAccountsPage({super.key, this.store});
+
+  final AntigravityAccounts? store;
+
+  @override
+  Widget build(BuildContext context) {
+    final isZh = Localizations.localeOf(context).languageCode == 'zh';
+    return SettingsPage(
+      title: isZh ? 'Antigravity 账号' : 'Antigravity Accounts',
+      description: isZh
+          ? '管理多个 Google Antigravity 账号，实时查看各模型组 Weekly limit 与 5h limit 配额，支持一键无缝切换与限额自动切号。'
+          : 'Manage Google Antigravity accounts, inspect Weekly and 5h quota limits, and switch accounts seamlessly.',
+      children: [AntigravityAccountsSection(store: store)],
+    );
+  }
+}
+
+/// Antigravity Google multi-account manager, real-time Usage monitor, and
+/// smart auto-switch panel.
 class AntigravityAccountsSection extends StatefulWidget {
   const AntigravityAccountsSection({super.key, this.store});
 
@@ -48,7 +68,19 @@ class _AntigravityAccountsSectionState
   @override
   void initState() {
     super.initState();
-    unawaited(_store.ensureInitialized());
+    unawaited(
+      _store.ensureInitialized().then((_) {
+        final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+        final stale = _store.accounts.any(
+          (a) =>
+              !a.disabled &&
+              nowSec - (a.quota?.lastUpdated ?? 0) > 60,
+        );
+        if (stale) {
+          unawaited(_store.refreshAllQuotas(silent: true));
+        }
+      }),
+    );
   }
 
   @override
@@ -140,7 +172,8 @@ class _AntigravityAccountsSectionState
       barrierLabel: 'Dismiss',
       barrierColor: const Color(0x78000000),
       transitionDuration: Duration.zero,
-      pageBuilder: (context, _, _) => _AddAntigravityAccountDialog(store: _store),
+      pageBuilder: (context, _, _) =>
+          _AddAntigravityAccountDialog(store: _store),
     );
     if (msg != null && msg.isNotEmpty) {
       _showStatus(msg);
@@ -154,7 +187,6 @@ class _AntigravityAccountsSectionState
       builder: (context, _) {
         final all = _store.accounts;
         final filtered = _filtered(all);
-        final window = _store.quotaWindow;
         final auto = _store.autoSwitch;
 
         final proCount = all.where((a) => a.tier == AntigravityTier.pro).length;
@@ -166,10 +198,7 @@ class _AntigravityAccountsSectionState
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            SettingsGroup(
-              title: 'Antigravity 账号与配额管理',
-              description:
-                  '一键切换 Google Antigravity 账号，实时查看 Gemini / Claude / GPT 5 小时与周配额，数据独立保存在 ~/.ayte/antigravity_accounts',
+            SettingsCard(
               children: [
                 Padding(
                   padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
@@ -183,7 +212,7 @@ class _AntigravityAccountsSectionState
                         crossAxisAlignment: WrapCrossAlignment.center,
                         children: [
                           SizedBox(
-                            width: 220,
+                            width: 240,
                             child: IdeInputBox(
                               controller: _searchController,
                               placeholder: '搜索邮箱、名称或备注...',
@@ -193,11 +222,6 @@ class _AntigravityAccountsSectionState
                           Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              _WindowSegmentedToggle(
-                                current: window,
-                                onChanged: _store.setQuotaWindow,
-                              ),
-                              const SizedBox(width: 8),
                               IdeButton(
                                 label: '添加账号',
                                 icon: Codicons.add,
@@ -205,7 +229,7 @@ class _AntigravityAccountsSectionState
                               ),
                               const SizedBox(width: 6),
                               IdeButton(
-                                label: '刷新配额',
+                                label: '刷新全部配额',
                                 icon: Codicons.refresh,
                                 spinning: _store.isRefreshingAll,
                                 secondary: true,
@@ -235,15 +259,6 @@ class _AntigravityAccountsSectionState
                               selected: _tierFilter == null,
                               onTap: () => setState(() => _tierFilter = null),
                             ),
-                            if (proCount > 0 ||
-                                _tierFilter == AntigravityTier.pro)
-                              _FilterChip(
-                                label: 'PRO ($proCount)',
-                                selected: _tierFilter == AntigravityTier.pro,
-                                onTap: () => setState(
-                                  () => _tierFilter = AntigravityTier.pro,
-                                ),
-                              ),
                             if (ultraCount > 0 ||
                                 _tierFilter == AntigravityTier.ultra)
                               _FilterChip(
@@ -251,6 +266,15 @@ class _AntigravityAccountsSectionState
                                 selected: _tierFilter == AntigravityTier.ultra,
                                 onTap: () => setState(
                                   () => _tierFilter = AntigravityTier.ultra,
+                                ),
+                              ),
+                            if (proCount > 0 ||
+                                _tierFilter == AntigravityTier.pro)
+                              _FilterChip(
+                                label: 'PRO ($proCount)',
+                                selected: _tierFilter == AntigravityTier.pro,
+                                onTap: () => setState(
+                                  () => _tierFilter = AntigravityTier.pro,
                                 ),
                               ),
                             if (freeCount > 0 ||
@@ -344,7 +368,6 @@ class _AntigravityAccountsSectionState
                       isActive: account.id == _store.currentAccountId,
                       isSwitching: _store.switchingId == account.id,
                       isRefreshing: _store.isRefreshing(account.id),
-                      window: window,
                       onSwitch: () => unawaited(_switchAccount(account)),
                       onRefresh: () => unawaited(_store.refreshQuota(account.id)),
                       onEditLabel: () => unawaited(_editLabel(account)),
@@ -362,7 +385,7 @@ class _AntigravityAccountsSectionState
                 SettingsRow(
                   label: '限额 / 低配额自动切换备用账号',
                   description:
-                      '当前账号在对话中触发额度耗尽或低于保留阈值时，自动切换到配额最高的可用备用账号继续执行',
+                      '当前账号在对话中触发额度耗尽时，自动切换到剩余配额充足的备用账号继续执行',
                   trailing: SettingsSwitch(
                     value: auto.enabled,
                     semanticLabel: '限额自动切换备用账号',
@@ -426,7 +449,6 @@ class _AntigravityAccountTile extends StatelessWidget {
     required this.isActive,
     required this.isSwitching,
     required this.isRefreshing,
-    required this.window,
     required this.onSwitch,
     required this.onRefresh,
     required this.onEditLabel,
@@ -438,7 +460,6 @@ class _AntigravityAccountTile extends StatelessWidget {
   final bool isActive;
   final bool isSwitching;
   final bool isRefreshing;
-  final AntigravityQuotaWindow window;
   final VoidCallback onSwitch;
   final VoidCallback onRefresh;
   final VoidCallback onEditLabel;
@@ -447,7 +468,7 @@ class _AntigravityAccountTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final pools = account.quota?.poolDisplays(window) ?? const [];
+    final usageGroups = account.quota?.resolvedUsageGroups ?? const [];
     final tier = account.tier;
     final (Color tierColor, String tierText) = switch (tier) {
       AntigravityTier.ultra => (const Color(0xFF9B6BFF), 'ULTRA'),
@@ -457,7 +478,7 @@ class _AntigravityAccountTile extends StatelessWidget {
     };
 
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -479,20 +500,15 @@ class _AntigravityAccountTile extends StatelessWidget {
                 ),
               ),
               if (account.name case final name?
-                  when name.trim().isNotEmpty && name.trim() != account.email) ...[
+                  when name.trim().isNotEmpty &&
+                      name.trim() != account.email) ...[
                 const SizedBox(width: 6),
-                Text(
-                  '(${name.trim()})',
-                  style: SettingsText.description,
-                ),
+                Text('(${name.trim()})', style: SettingsText.description),
               ],
               if (account.customLabel case final label?
                   when label.trim().isNotEmpty) ...[
                 const SizedBox(width: 6),
-                _Badge(
-                  text: label.trim(),
-                  color: AppColors.accent,
-                ),
+                _Badge(text: label.trim(), color: AppColors.accent),
               ],
               const SizedBox(width: 6),
               _Badge(text: tierText, color: tierColor),
@@ -543,13 +559,14 @@ class _AntigravityAccountTile extends StatelessWidget {
               ),
             ],
           ),
-          if (pools.isNotEmpty) ...[
-            const SizedBox(height: 10),
+          if (usageGroups.isNotEmpty) ...[
+            const SizedBox(height: 12),
             Wrap(
-              spacing: 8,
-              runSpacing: 8,
+              spacing: 10,
+              runSpacing: 10,
               children: [
-                for (final p in pools) _QuotaPoolBar(display: p),
+                for (final group in usageGroups)
+                  _UsageGroupCard(group: group),
               ],
             ),
           ] else if (account.disabledReason case final reason?
@@ -570,82 +587,45 @@ class _AntigravityAccountTile extends StatelessWidget {
   }
 }
 
-class _QuotaPoolBar extends StatelessWidget {
-  const _QuotaPoolBar({required this.display});
+/// Renders one `AntigravityQuotaGroup` (`Gemini Models`, `Claude and GPT models`,
+/// `Gemini 4 Argon`, etc.) with both `Weekly limit` and `5h limit` + circular
+/// ring gauges matching the official Antigravity `Usage` design.
+class _UsageGroupCard extends StatelessWidget {
+  const _UsageGroupCard({required this.group});
 
-  final AntigravityPoolDisplay display;
+  final AntigravityQuotaGroup group;
 
   @override
   Widget build(BuildContext context) {
-    final pct = display.percentage.clamp(0, 100);
-    final barColor = pct >= 60
-        ? const Color(0xFF22A35A)
-        : pct >= 20
-        ? const Color(0xFFD98B1C)
-        : const Color(0xFFDC3E3E);
-    final resetLabel = formatQuotaResetTime(display.resetTime);
-    final title = display.windowLabel != null
-        ? '${display.pool.shortLabel} (${display.windowLabel})'
-        : display.pool.shortLabel;
-
     return Container(
-      width: 195,
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      width: 268,
+      padding: const EdgeInsets.fromLTRB(13, 11, 13, 9),
       decoration: BoxDecoration(
         color: SettingsColors.hover,
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(10),
         border: Border.all(color: SettingsColors.stroke),
       ),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Row(
-            children: [
-              Expanded(
-                child: Text(
-                  title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 11.5,
-                    fontWeight: FontWeight.w500,
-                    color: SettingsColors.textSecondary,
-                  ),
-                ),
-              ),
-              Text(
-                '$pct%',
-                style: TextStyle(
-                  fontSize: 11.5,
-                  fontWeight: FontWeight.w600,
-                  color: barColor,
-                  fontFeatures: const [FontFeature.tabularFigures()],
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 5),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(3),
-            child: LinearProgressIndicator(
-              value: pct / 100.0,
-              minHeight: 4.5,
-              backgroundColor: SettingsColors.stroke,
-              valueColor: AlwaysStoppedAnimation<Color>(barColor),
+          Text(
+            group.displayName,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 12.5,
+              fontWeight: FontWeight.w600,
+              color: SettingsColors.textPrimary,
             ),
           ),
-          if (resetLabel.isNotEmpty) ...[
-            const SizedBox(height: 4),
-            Text(
-              resetLabel,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: 10.5,
-                color: SettingsColors.textTertiary,
-              ),
+          const SizedBox(height: 4),
+          for (final bucket in group.buckets)
+            AntigravityUsageBucketRow(
+              bucket: bucket,
+              primaryColor: SettingsColors.textPrimary,
+              secondaryColor: SettingsColors.textSecondary,
+              trackColor: SettingsColors.stroke,
             ),
-          ],
         ],
       ),
     );
@@ -727,64 +707,6 @@ class _IconAction extends StatelessWidget {
                   ),
           ),
         ),
-      ),
-    );
-  }
-}
-
-class _WindowSegmentedToggle extends StatelessWidget {
-  const _WindowSegmentedToggle({
-    required this.current,
-    required this.onChanged,
-  });
-
-  final AntigravityQuotaWindow current;
-  final ValueChanged<AntigravityQuotaWindow> onChanged;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(2),
-      decoration: BoxDecoration(
-        color: SettingsColors.hover,
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: SettingsColors.stroke),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          for (final w in AntigravityQuotaWindow.values)
-            GestureDetector(
-              onTap: () => onChanged(w),
-              child: MouseRegion(
-                cursor: SystemMouseCursors.click,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 8,
-                    vertical: 3,
-                  ),
-                  decoration: BoxDecoration(
-                    color: current == w
-                        ? SettingsColors.card
-                        : Colors.transparent,
-                    borderRadius: BorderRadius.circular(4),
-                  ),
-                  child: Text(
-                    w.label,
-                    style: TextStyle(
-                      fontSize: 11.5,
-                      fontWeight: current == w
-                          ? FontWeight.w600
-                          : FontWeight.w400,
-                      color: current == w
-                          ? SettingsColors.textPrimary
-                          : SettingsColors.textSecondary,
-                    ),
-                  ),
-                ),
-              ),
-            ),
-        ],
       ),
     );
   }
@@ -920,7 +842,7 @@ class _EditLabelDialogState extends State<_EditLabelDialog> {
               const SizedBox(height: 12),
               IdeInputBox(
                 controller: _controller,
-                placeholder: '例如：主力 Pro / 备用号',
+                placeholder: '例如：主力 Ultra / 备用 Pro',
                 autofocus: true,
                 onSubmitted: (v) => Navigator.of(context).pop(v),
               ),

@@ -721,6 +721,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
     }
 
     _activeTurn = null;
+    AntigravityAccounts.instance.scheduleActiveQuotaRefresh();
 
     _emit({
       'type': 'system',

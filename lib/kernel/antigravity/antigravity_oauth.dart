@@ -34,10 +34,10 @@ abstract final class AntigravityOAuth {
   static ({String clientId, String clientSecret})? _cachedClient;
 
   static final RegExp _clientIdRegex = RegExp(
-    r'\d{10,15}-[a-z0-9]{20,40}\.[a-z]+\.[a-z]+\.com',
+    r'\d{12,14}-[a-z0-9]{32}\.[a-z]+\.[a-z]+\.com',
   );
   static final RegExp _clientSecretRegex = RegExp(
-    r'[A-Z]{6}-[A-Za-z0-9_\-]{24,36}',
+    r'[A-Z]{6}-[A-Za-z0-9_\-]{28}',
   );
 
   /// Resolves the installed-app OAuth client pair from env vars, local cache,
@@ -70,7 +70,7 @@ abstract final class AntigravityOAuth {
         if (decoded is Map) {
           final id = '${decoded['client_id'] ?? ''}'.trim();
           final sec = '${decoded['client_secret'] ?? ''}'.trim();
-          if (id.isNotEmpty && sec.isNotEmpty) {
+          if (id.isNotEmpty && sec.length == 35) {
             return _cachedClient = (clientId: id, clientSecret: sec);
           }
         }

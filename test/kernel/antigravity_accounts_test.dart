@@ -192,6 +192,19 @@ void main() {
           (AntigravityQuotaPool.thirdParty, 49),
         ],
       );
+
+      final usageGroups = store.accounts[0].quota!.resolvedUsageGroups;
+      expect(usageGroups, hasLength(2));
+      expect(usageGroups[0].displayName, 'Gemini Models');
+      expect(
+        usageGroups[0].buckets.map((b) => (b.window, b.percentage)).toList(),
+        [('weekly', 62), ('5h', 88)],
+      );
+      expect(usageGroups[1].displayName, 'Claude and GPT models');
+      expect(
+        usageGroups[1].buckets.map((b) => (b.window, b.percentage)).toList(),
+        [('weekly', 49), ('5h', 100)],
+      );
     });
   });
 }

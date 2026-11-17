@@ -31,6 +31,7 @@ enum SettingsSection {
   general,
   appearance,
   models,
+  antigravityAccounts,
   usage,
   network,
   ssh,
@@ -53,6 +54,7 @@ enum SettingsCategory {
     SettingsSection.general,
     SettingsSection.appearance,
     SettingsSection.models,
+    SettingsSection.antigravityAccounts,
     SettingsSection.usage,
     SettingsSection.network,
     SettingsSection.ssh,
@@ -257,6 +259,7 @@ class SettingsDialogState extends State<SettingsDialog> {
     SettingsSection.appearance => Codicons.symbolColor,
     SettingsSection.models =>
       ChannelSetup.channelBuild ? Codicons.person : Codicons.sparkle,
+    SettingsSection.antigravityAccounts => Codicons.account,
     SettingsSection.usage => SvgIcons.usage,
     SettingsSection.network => Codicons.radioTower,
     SettingsSection.ssh => Codicons.remote,
@@ -264,7 +267,7 @@ class SettingsDialogState extends State<SettingsDialog> {
     SettingsSection.browser => Codicons.globe,
     SettingsSection.notifications => Codicons.bell,
     SettingsSection.stash => Codicons.note,
-    SettingsSection.accounts => Codicons.account,
+    SettingsSection.accounts => Codicons.sourceControl,
     SettingsSection.customize => Codicons.plug,
     SettingsSection.language => Codicons.globe,
     SettingsSection.keyboard => Codicons.keyboard,
@@ -283,6 +286,7 @@ class SettingsDialogState extends State<SettingsDialog> {
 
   static String label(BuildContext context, SettingsSection section) {
     final l10n = context.l10n;
+    final isZh = Localizations.localeOf(context).languageCode == 'zh';
     return switch (section) {
       SettingsSection.general => l10n.settingsSectionGeneral,
       SettingsSection.appearance => l10n.settingsSectionAppearance,
@@ -290,6 +294,8 @@ class SettingsDialogState extends State<SettingsDialog> {
         ChannelSetup.channelBuild
             ? l10n.channelAccountTitle
             : l10n.settingsSectionModels,
+      SettingsSection.antigravityAccounts =>
+        isZh ? 'Antigravity 账号' : 'Antigravity Accounts',
       SettingsSection.usage => l10n.settingsSectionUsage,
       SettingsSection.network => l10n.settingsSectionNetwork,
       SettingsSection.ssh => l10n.settingsSectionSsh,
@@ -297,7 +303,7 @@ class SettingsDialogState extends State<SettingsDialog> {
       SettingsSection.browser => l10n.settingsSectionBrowser,
       SettingsSection.notifications => l10n.settingsSectionNotifications,
       SettingsSection.stash => l10n.settingsSectionStash,
-      SettingsSection.accounts => l10n.settingsSectionAccounts,
+      SettingsSection.accounts => isZh ? 'Git 账户' : 'Git Accounts',
       SettingsSection.customize => l10n.settingsSectionCustomize,
       SettingsSection.language => l10n.settingsSectionLanguage,
       SettingsSection.keyboard => l10n.settingsSectionKeyboard,
@@ -317,6 +323,8 @@ class SettingsDialogState extends State<SettingsDialog> {
         SettingsSection.mobile => context.l10n.settingsMobileKeywords,
         SettingsSection.browser => context.l10n.settingsBrowserKeywords,
         SettingsSection.customize => context.l10n.settingsCustomizeKeywords,
+        SettingsSection.antigravityAccounts =>
+          'google antigravity account oauth quota 配额 切号 账号管理',
         SettingsSection.accounts => context.l10n.settingsAccountsKeywords,
         _ => '',
       };

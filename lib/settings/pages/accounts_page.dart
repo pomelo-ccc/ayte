@@ -15,7 +15,6 @@ import '../../l10n/l10n.dart';
 import '../../theme/codicons.dart';
 import '../../theme/workbench_theme.dart' show themeColors;
 import '../../workspace/editor_launcher.dart' show openExternal;
-import 'antigravity_accounts_section.dart';
 import 'model_dialogs.dart';
 import 'settings_widgets.dart';
 
@@ -36,7 +35,7 @@ class AccountsSettingsPage extends StatelessWidget {
       return SettingsPage(
         title: l10n.settingsSectionAccounts,
         description: l10n.accountsDescription,
-        children: const [AntigravityAccountsSection()],
+        children: const [],
       );
     }
     return ListenableBuilder(
@@ -45,7 +44,6 @@ class AccountsSettingsPage extends StatelessWidget {
         title: l10n.settingsSectionAccounts,
         description: l10n.accountsDescription,
         children: [
-          const AntigravityAccountsSection(),
           if (accounts.accounts.isNotEmpty)
             SettingsGroup(
               title: l10n.accountsSignedIn,

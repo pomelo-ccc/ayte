@@ -441,12 +441,14 @@ class GeneralSettingsPage extends StatelessWidget {
                   listenable: Listenable.merge([
                     NotchDropzone.islandEnabled,
                     NotchDropzone.islandMinimized,
+                    NotchDropzone.pipEnabled,
                   ]),
                   builder: (context, _) {
                     final isZh =
                         Localizations.localeOf(context).languageCode == 'zh';
                     final islandOn = NotchDropzone.islandEnabled.value;
                     final islandMin = NotchDropzone.islandMinimized.value;
+                    final pipOn = NotchDropzone.pipEnabled.value;
                     return Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
@@ -473,6 +475,17 @@ class GeneralSettingsPage extends StatelessWidget {
                             onChanged: (min) =>
                                 NotchDropzone.islandMinimized.value = min,
                           ),
+                        SettingsSwitchRow(
+                          label: isZh
+                              ? '右上角画中画盯盘小窗'
+                              : 'Picture-in-Picture Floating Monitor',
+                          description: isZh
+                              ? '开启右上角悬浮画中画小窗，在切换到其他应用时实时查看当前对话执行进度'
+                              : 'Show a floating picture-in-picture monitor in the top-right corner while working in other apps',
+                          value: pipOn,
+                          onChanged: (on) =>
+                              NotchDropzone.pipEnabled.value = on,
+                        ),
                       ],
                     );
                   },

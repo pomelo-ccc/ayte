@@ -29,6 +29,7 @@ import '../workspace/workspace.dart';
 import 'app_locale.dart';
 import 'pages/about_page.dart';
 import 'pages/accounts_page.dart';
+import 'pages/antigravity_accounts_section.dart';
 import 'pages/appearance_page.dart';
 import 'pages/browser_page.dart';
 import 'pages/channel_account_page.dart';
@@ -184,6 +185,8 @@ class AppSettings {
           providers: ModelProviders.current,
           workspace: workspace,
         );
+      case SettingsSection.antigravityAccounts:
+        return const AntigravityAccountsPage();
       case SettingsSection.usage:
         return UsageSettingsPage(workspace: workspace);
       case SettingsSection.network:

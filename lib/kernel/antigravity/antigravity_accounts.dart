@@ -30,6 +30,7 @@ class AntigravityAccounts extends ChangeNotifier {
   bool _initialized = false;
   Future<void>? _initFuture;
   Timer? _refreshTimer;
+  Timer? _postTurnRefreshDebounce;
 
   final List<AntigravityAccount> _accounts = [];
   String? _currentAccountId;
@@ -96,6 +97,7 @@ class AntigravityAccounts extends ChangeNotifier {
       await _loadFromDisk(dir);
       await _reconcileActiveWithKeyring();
       _startBackgroundRefreshTimer();
+      unawaited(refreshAllQuotas(silent: true));
     } finally {
       _initialized = true;
     }
@@ -268,8 +270,22 @@ class AntigravityAccounts extends ChangeNotifier {
 
   void _startBackgroundRefreshTimer() {
     _refreshTimer?.cancel();
-    _refreshTimer = Timer.periodic(const Duration(minutes: 15), (_) {
+    _refreshTimer = Timer.periodic(const Duration(minutes: 10), (_) {
       unawaited(refreshAllQuotas(silent: true));
+    });
+  }
+
+  /// Schedules a debounced refresh of the active account's quota (e.g. right
+  /// after an agent turn completes or when opening the Usage popover).
+  void scheduleActiveQuotaRefresh({
+    Duration delay = const Duration(seconds: 2),
+  }) {
+    _postTurnRefreshDebounce?.cancel();
+    _postTurnRefreshDebounce = Timer(delay, () {
+      final activeId = _currentAccountId ?? _accounts.firstOrNull?.id;
+      if (activeId != null) {
+        unawaited(refreshQuota(activeId));
+      }
     });
   }
 

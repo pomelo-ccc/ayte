@@ -1,21 +1,24 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
 import '../../ide/ide_hover.dart';
-import '../../ide/ide_menu.dart';
 import '../../ide/ide_spinning.dart';
 import '../../kernel/antigravity/antigravity_account_models.dart';
 import '../../kernel/antigravity/antigravity_accounts.dart';
 import '../../kernel/antigravity/antigravity_cli.dart';
+import '../../kernel/antigravity/antigravity_usage_widgets.dart';
 import '../../settings/settings_dialog.dart'
     show SettingsOpener, SettingsSection;
 import '../../theme/app_theme.dart';
 import '../../theme/codicons.dart';
+import '../../theme/workbench_theme.dart' show themeColors;
 import '../widgets/hover_builder.dart';
 
 /// Compact composer-toolbar pill showing the active Antigravity Google account
-/// and remaining quota for [modelId], with a 1-click account switcher menu.
+/// and current model pool quota, opening an official-style `Usage` + 1-click
+/// Account Switcher popover when clicked.
 class AntigravityAccountPicker extends StatefulWidget {
   const AntigravityAccountPicker({super.key, required this.modelId});
 
@@ -35,68 +38,64 @@ class _AntigravityAccountPickerState extends State<AntigravityAccountPicker> {
     unawaited(_store.ensureInitialized());
   }
 
-  Color _quotaColor(int pct) => pct >= 60
-      ? const Color(0xFF22A35A)
-      : pct >= 20
-      ? const Color(0xFFD98B1C)
-      : const Color(0xFFDC3E3E);
-
-  void _openMenu(BuildContext pillContext) {
-    final box = pillContext.findRenderObject() as RenderBox?;
-    if (box == null) return;
-    final rect = box.localToGlobal(Offset.zero) & box.size;
-    final openSettings = SettingsOpener.maybeOf(pillContext);
-    final bareModel = AntigravityModels.bareModelId(widget.modelId);
-
-    unawaited(
-      showIdeMenu(
-        pillContext,
-        anchor: rect,
-        entries: [
-          if (_store.accounts.isEmpty)
-            const IdeMenuAction('暂无已添加账号', enabled: false)
-          else
-            for (final acc in _store.accounts)
-              IdeMenuAction(
-                _menuLabelFor(acc, bareModel),
-                checked: acc.id == _store.currentAccountId,
-                enabled: !acc.disabled && _store.switchingId == null,
-                onSelected: () {
-                  if (acc.id != _store.currentAccountId) {
-                    unawaited(_store.switchAccount(acc.id));
-                  }
-                },
-              ),
-          const IdeMenuSeparator(),
-          IdeMenuAction(
-            _store.isRefreshingAll ? '正在刷新配额...' : '刷新全部账号配额',
-            enabled: !_store.isRefreshingAll && _store.accounts.isNotEmpty,
-            onSelected: () => unawaited(_store.refreshAllQuotas()),
-          ),
-          if (openSettings != null)
-            IdeMenuAction(
-              '管理账号与配额...',
-              onSelected: () => openSettings(SettingsSection.accounts),
-            ),
-        ],
-      ),
-    );
+  /// Finds the `5h` and `weekly` buckets matching [bareModel] on [account].
+  ({AntigravityQuotaBucket? fiveHour, AntigravityQuotaBucket? weekly})
+  _bucketsForModel(AntigravityAccount? account, String bareModel) {
+    final groups = account?.quota?.resolvedUsageGroups ?? const [];
+    final pool =
+        AntigravityQuotaPool.ofModel(bareModel) ?? AntigravityQuotaPool.gemini;
+    AntigravityQuotaBucket? fiveHour;
+    AntigravityQuotaBucket? weekly;
+    for (final g in groups) {
+      for (final b in g.buckets) {
+        if (AntigravityQuotaPool.classify(b.bucketId, g.displayName) != pool) {
+          continue;
+        }
+        if (b.window == '5h') fiveHour = b;
+        if (b.window == 'weekly') weekly = b;
+      }
+    }
+    return (fiveHour: fiveHour, weekly: weekly);
   }
 
-  String _menuLabelFor(AntigravityAccount acc, String bareModel) {
-    final pct =
-        acc.quota?.effectivePercentageForModel(bareModel) ??
-        acc.quota?.lowestPrimaryPercentage;
-    final tier = acc.tier;
-    final parts = <String>[
-      acc.customLabel?.trim().isNotEmpty == true
-          ? '${acc.email} (${acc.customLabel!.trim()})'
-          : acc.email,
-      if (tier != AntigravityTier.unknown) tier.badge,
-      if (pct != null) '$pct%',
-      if (acc.disabled) '已停用',
-    ];
-    return parts.join(' · ');
+  void _openUsagePopover(BuildContext pillContext) {
+    final box = pillContext.findRenderObject() as RenderBox?;
+    if (box == null) return;
+    final anchor = box.localToGlobal(Offset.zero) & box.size;
+    final openSettings = SettingsOpener.maybeOf(pillContext);
+
+    // Refresh active account quota if older than 45 seconds.
+    if (_store.currentAccount case final active?) {
+      final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final last = active.quota?.lastUpdated ?? 0;
+      if (nowSec - last > 45) {
+        unawaited(_store.refreshQuota(active.id));
+      }
+    }
+
+    unawaited(
+      showGeneralDialog<void>(
+        context: pillContext,
+        barrierDismissible: true,
+        barrierLabel: 'Dismiss',
+        barrierColor: Colors.transparent,
+        transitionDuration: const Duration(milliseconds: 120),
+        pageBuilder: (dialogCtx, _, _) => _AntigravityUsagePopover(
+          anchor: anchor,
+          store: _store,
+          onManageAccounts: openSettings == null
+              ? null
+              : () {
+                  Navigator.of(dialogCtx).pop();
+                  openSettings(SettingsSection.antigravityAccounts);
+                },
+        ),
+        transitionBuilder: (context, anim, _, child) => FadeTransition(
+          opacity: CurvedAnimation(parent: anim, curve: Curves.easeOut),
+          child: child,
+        ),
+      ),
+    );
   }
 
   @override
@@ -109,9 +108,27 @@ class _AntigravityAccountPickerState extends State<AntigravityAccountPicker> {
       builder: (context, _) {
         final active = _store.currentAccount;
         final bareModel = AntigravityModels.bareModelId(widget.modelId);
-        final pct =
-            active?.quota?.effectivePercentageForModel(bareModel) ??
-            active?.quota?.lowestPrimaryPercentage;
+        final (:fiveHour, :weekly) = _bucketsForModel(active, bareModel);
+        final primaryBucket = fiveHour ?? weekly;
+        final strictestFraction = switch ((fiveHour, weekly)) {
+          (final f?, final w?) => math.min(
+            f.remainingFraction,
+            w.remainingFraction,
+          ),
+          (final f?, null) => f.remainingFraction,
+          (null, final w?) => w.remainingFraction,
+          (null, null) => null,
+        };
+
+        String? quotaSummary;
+        if (fiveHour != null && weekly != null) {
+          quotaSummary = fiveHour.percentage == 100 && weekly.percentage == 100
+              ? '100%'
+              : '5h ${fiveHour.percentage}% · W ${weekly.percentage}%';
+        } else if (primaryBucket != null) {
+          quotaSummary = '${primaryBucket.percentage}%';
+        }
+
         final label = active == null ? '添加账号' : active.shortLabel;
         final busy = _store.switchingId != null;
 
@@ -119,11 +136,11 @@ class _AntigravityAccountPickerState extends State<AntigravityAccountPicker> {
           builder: (pillCtx) => IdeHover(
             message: active == null
                 ? '添加或管理 Antigravity 账号'
-                : '当前账号：${active.email}${pct != null ? ' · 当前模型池剩余 $pct%' : ''}（点击快速切换）',
+                : '当前账号：${active.email}（点击查看 Usage 详情或一键切号）',
             child: HoverBuilder(
               cursor: SystemMouseCursors.click,
               builder: (context, hovered) => GestureDetector(
-                onTap: () => _openMenu(pillCtx),
+                onTap: () => _openUsagePopover(pillCtx),
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 120),
                   height: 22,
@@ -153,7 +170,7 @@ class _AntigravityAccountPickerState extends State<AntigravityAccountPicker> {
                         ),
                       const SizedBox(width: 4),
                       ConstrainedBox(
-                        constraints: const BoxConstraints(maxWidth: 115),
+                        constraints: const BoxConstraints(maxWidth: 110),
                         child: Text(
                           label,
                           maxLines: 1,
@@ -166,23 +183,23 @@ class _AntigravityAccountPickerState extends State<AntigravityAccountPicker> {
                           ),
                         ),
                       ),
-                      if (pct != null) ...[
+                      if (quotaSummary != null &&
+                          strictestFraction != null) ...[
                         const SizedBox(width: 5),
-                        Container(
-                          width: 5.5,
-                          height: 5.5,
-                          decoration: BoxDecoration(
-                            color: _quotaColor(pct),
-                            shape: BoxShape.circle,
-                          ),
+                        AntigravityQuotaRing(
+                          fraction: strictestFraction,
+                          size: 12,
+                          strokeWidth: 1.7,
                         ),
-                        const SizedBox(width: 3),
+                        const SizedBox(width: 4),
                         Text(
-                          '$pct%',
+                          quotaSummary,
                           style: TextStyle(
                             fontSize: 11,
                             fontWeight: FontWeight.w500,
-                            color: _quotaColor(pct),
+                            color: hovered
+                                ? AppColors.text
+                                : AppColors.textMuted,
                             fontFeatures: const [FontFeature.tabularFigures()],
                           ),
                         ),
@@ -201,6 +218,326 @@ class _AntigravityAccountPickerState extends State<AntigravityAccountPicker> {
           ),
         );
       },
+    );
+  }
+}
+
+class _AntigravityUsagePopover extends StatelessWidget {
+  const _AntigravityUsagePopover({
+    required this.anchor,
+    required this.store,
+    required this.onManageAccounts,
+  });
+
+  final Rect anchor;
+  final AntigravityAccounts store;
+  final VoidCallback? onManageAccounts;
+
+  @override
+  Widget build(BuildContext context) {
+    final screen = MediaQuery.sizeOf(context);
+    const width = 320.0;
+    final left = anchor.left
+        .clamp(12.0, math.max(12.0, screen.width - width - 12.0))
+        .toDouble();
+    final bottom = (screen.height - anchor.top + 8.0)
+        .clamp(12.0, math.max(12.0, screen.height - 80.0))
+        .toDouble();
+    final dark = themeColors.dark;
+    final bg = dark ? const Color(0xFF1E222A) : Colors.white;
+    final border = dark
+        ? Colors.white.withValues(alpha: 0.10)
+        : Colors.black.withValues(alpha: 0.10);
+    final titleColor = dark ? const Color(0xFFF3F4F6) : const Color(0xFF111827);
+    final subColor = dark ? const Color(0xFF9CA3AF) : const Color(0xFF4B5563);
+    final trackColor = dark
+        ? Colors.white.withValues(alpha: 0.16)
+        : Colors.black.withValues(alpha: 0.14);
+
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onTap: () => Navigator.of(context).pop(),
+          ),
+        ),
+        Positioned(
+          left: left,
+          bottom: bottom,
+          width: width,
+          child: Material(
+            color: Colors.transparent,
+            child: ListenableBuilder(
+              listenable: store,
+              builder: (context, _) {
+                final active = store.currentAccount;
+                final groups = active?.quota?.resolvedUsageGroups ?? const [];
+                final refreshing =
+                    store.isRefreshingAll ||
+                    (active != null && store.isRefreshing(active.id));
+
+                return Container(
+                  constraints: BoxConstraints(
+                    maxHeight: math.min(520, screen.height - 48),
+                  ),
+                  decoration: BoxDecoration(
+                    color: bg,
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: border),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: dark ? 0.42 : 0.12),
+                        blurRadius: 24,
+                        offset: const Offset(0, 8),
+                      ),
+                    ],
+                  ),
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Row(
+                          children: [
+                            Text(
+                              'Usage',
+                              style: TextStyle(
+                                fontSize: 13.5,
+                                fontWeight: FontWeight.w600,
+                                color: subColor,
+                              ),
+                            ),
+                            if (active != null &&
+                                active.tier != AntigravityTier.unknown) ...[
+                              const SizedBox(width: 6),
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 5.5,
+                                  vertical: 1,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: titleColor.withValues(alpha: 0.07),
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                                child: Text(
+                                  active.tier.badge,
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.w600,
+                                    color: subColor,
+                                  ),
+                                ),
+                              ),
+                            ],
+                            const Spacer(),
+                            GestureDetector(
+                              onTap: refreshing
+                                  ? null
+                                  : () {
+                                      if (active != null) {
+                                        unawaited(store.refreshQuota(active.id));
+                                      } else {
+                                        unawaited(store.refreshAllQuotas());
+                                      }
+                                    },
+                              child: MouseRegion(
+                                cursor: SystemMouseCursors.click,
+                                child: Padding(
+                                  padding: const EdgeInsets.all(2),
+                                  child: refreshing
+                                      ? IdeSpinning(
+                                          Icon(
+                                            Codicons.sync,
+                                            size: 13,
+                                            color: subColor,
+                                          ),
+                                        )
+                                      : Icon(
+                                          Codicons.refresh,
+                                          size: 13,
+                                          color: subColor,
+                                        ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        if (groups.isNotEmpty)
+                          AntigravityUsageGroupsStack(
+                            groups: groups,
+                            titleColor: titleColor,
+                            secondaryColor: subColor,
+                            trackColor: trackColor,
+                          )
+                        else
+                          Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                            child: Text(
+                              refreshing ? '正在同步实时配额...' : '暂无配额数据，点击右上角刷新',
+                              style: TextStyle(fontSize: 12, color: subColor),
+                            ),
+                          ),
+                        if (store.accounts.length > 1) ...[
+                          Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 10),
+                            child: Divider(height: 1, color: border),
+                          ),
+                          Text(
+                            '切换账号',
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w600,
+                              color: subColor,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          for (final acc in store.accounts)
+                            if (!acc.disabled)
+                              _PopoverAccountRow(
+                                account: acc,
+                                isActive: acc.id == store.currentAccountId,
+                                titleColor: titleColor,
+                                subColor: subColor,
+                                onTap: () {
+                                  if (acc.id != store.currentAccountId) {
+                                    unawaited(store.switchAccount(acc.id));
+                                  }
+                                },
+                              ),
+                        ],
+                        if (onManageAccounts != null) ...[
+                          Padding(
+                            padding: const EdgeInsets.only(top: 8, bottom: 4),
+                            child: Divider(height: 1, color: border),
+                          ),
+                          HoverBuilder(
+                            cursor: SystemMouseCursors.click,
+                            builder: (context, hovered) => GestureDetector(
+                              onTap: onManageAccounts,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 6,
+                                  vertical: 6,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: hovered
+                                      ? titleColor.withValues(alpha: 0.05)
+                                      : Colors.transparent,
+                                  borderRadius: BorderRadius.circular(6),
+                                ),
+                                child: Row(
+                                  children: [
+                                    Icon(
+                                      Codicons.settingsGear,
+                                      size: 13,
+                                      color: subColor,
+                                    ),
+                                    const SizedBox(width: 7),
+                                    Text(
+                                      '管理 Antigravity 账号...',
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        color: titleColor,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _PopoverAccountRow extends StatelessWidget {
+  const _PopoverAccountRow({
+    required this.account,
+    required this.isActive,
+    required this.titleColor,
+    required this.subColor,
+    required this.onTap,
+  });
+
+  final AntigravityAccount account;
+  final bool isActive;
+  final Color titleColor;
+  final Color subColor;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final pct = account.quota?.lowestPrimaryPercentage;
+    return HoverBuilder(
+      cursor: SystemMouseCursors.click,
+      builder: (context, hovered) => GestureDetector(
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 5.5),
+          decoration: BoxDecoration(
+            color: hovered
+                ? titleColor.withValues(alpha: 0.05)
+                : Colors.transparent,
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Row(
+            children: [
+              SizedBox(
+                width: 16,
+                child: isActive
+                    ? Icon(Codicons.check, size: 13, color: titleColor)
+                    : null,
+              ),
+              const SizedBox(width: 4),
+              Expanded(
+                child: Text(
+                  account.customLabel?.trim().isNotEmpty == true
+                      ? '${account.email} (${account.customLabel!.trim()})'
+                      : account.email,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: isActive ? FontWeight.w600 : FontWeight.w400,
+                    color: titleColor,
+                  ),
+                ),
+              ),
+              if (account.tier != AntigravityTier.unknown) ...[
+                const SizedBox(width: 6),
+                Text(
+                  account.tier.badge,
+                  style: TextStyle(
+                    fontSize: 10.5,
+                    fontWeight: FontWeight.w500,
+                    color: subColor,
+                  ),
+                ),
+              ],
+              if (pct != null) ...[
+                const SizedBox(width: 6),
+                AntigravityQuotaRing(
+                  fraction: pct / 100.0,
+                  size: 13,
+                  strokeWidth: 1.8,
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
