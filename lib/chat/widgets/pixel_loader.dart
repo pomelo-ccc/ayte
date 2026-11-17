@@ -437,8 +437,8 @@ class ByteBarsPainter extends CustomPainter {
   final Color color;
   final bool still;
 
-  /// Resting heights matching the Ayte App Icon silhouette.
-  static const restHeights = [0.44, 0.92, 0.56, 0.74];
+  /// Resting heights matching the Ayte App Icon silhouette (ascending peak on bar 3).
+  static const restHeights = [0.42, 0.65, 0.94, 0.76];
 
   /// Computes normalized heights `[h0, h1, h2, h3]` in `0.20..0.98` for [style]
   /// at continuous [phase] (in radians).
@@ -614,10 +614,10 @@ class ByteBarsPainter extends CustomPainter {
         style == PixelLoaderStyle.checker || style == PixelLoaderStyle.breathe;
     final baseBottom = snap(centerY + maxH * 0.44);
 
-    const blueTop = Color(0xFF5A8DEE);
-    const blueBot = Color(0xFF396FD3);
-    const orangeTop = Color(0xFFF0833A);
-    const orangeBot = Color(0xFFD96226);
+    const cyanTop = Color(0xFF38BDF8);
+    const indigoBot = Color(0xFF4F46E5);
+    const emeraldTop = Color(0xFF34D399);
+    const emeraldBot = Color(0xFF059669);
 
     for (var i = 0; i < 4; i++) {
       final h = (maxH * heights[i]).clamp(barW, maxH);
@@ -626,7 +626,7 @@ class ByteBarsPainter extends CustomPainter {
       if (symmetric) {
         topY = centerY - h / 2;
       } else {
-        final bottom = i == 1 ? baseBottom + 0.5 : baseBottom;
+        final bottom = i == 2 ? baseBottom + 0.5 : baseBottom;
         topY = (bottom - h).clamp(
           centerY - maxH * 0.50,
           bottom - barW,
@@ -634,15 +634,15 @@ class ByteBarsPainter extends CustomPainter {
       }
       final rect = Rect.fromLTWH(x, topY, barW, h);
       final rrect = RRect.fromRectAndRadius(rect, Radius.circular(barW / 2));
-      final isHero = i == 1;
+      final isHero = i == 2;
       final paint = Paint()
         ..isAntiAlias = true
         ..shader = LinearGradient(
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
           colors: isHero
-              ? const [orangeTop, orangeBot]
-              : const [blueTop, blueBot],
+              ? const [emeraldTop, emeraldBot]
+              : const [cyanTop, indigoBot],
         ).createShader(rect);
       canvas.drawRRect(rrect, paint);
     }

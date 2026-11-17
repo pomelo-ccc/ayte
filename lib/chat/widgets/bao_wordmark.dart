@@ -29,11 +29,11 @@ class _WordmarkPainter extends CustomPainter {
   final Color color;
   final double cell;
 
-  /// The mark: Ayte's 4 asymmetric wave bars (S4-P1 rhythm), a dot to its cells.
+  /// The mark: Ayte's 4 ascending levitation wave bars, a dot to its cells.
   static const _mark = [
-    '..#....',
-    '..#...#',
-    '..#...#',
+    '....#..',
+    '....#.#',
+    '..#.#.#',
     '#.#.#.#',
     '#.#.#.#',
     '..#.#.#',
@@ -42,12 +42,12 @@ class _WordmarkPainter extends CustomPainter {
   /// 5 × 5 capitals, sitting on the mark's bottom row; set wide, a small
   /// label rather than a title.
   static const _glyphs = {
-    'B': ['####.', '#...#', '####.', '#...#', '####.'],
+    'A': ['.###.', '#...#', '#####', '#...#', '#...#'],
     'Y': ['#...#', '.#.#.', '..#..', '..#..', '..#..'],
     'T': ['#####', '..#..', '..#..', '..#..', '..#..'],
     'E': ['#####', '#....', '####.', '#....', '#####'],
   };
-  static const _word = 'BYTE';
+  static const _word = 'AYTE';
   static const _glyphW = 5, _glyphH = 5, _tracking = 2;
 
   /// Between the mark and the name.

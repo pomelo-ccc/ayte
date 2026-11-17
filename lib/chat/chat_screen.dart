@@ -2605,18 +2605,18 @@ class _ByteStudioGlyphPainter extends CustomPainter {
   final Color borderColor;
   final Color surfaceColor;
 
-  static const _heights = <double>[0.46, 1.00, 0.62, 0.78];
+  static const _heights = <double>[0.42, 0.65, 1.00, 0.78];
 
   @override
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, 36);
 
-    // Subtle concentric architectural rings & warm ambient aura.
+    // Subtle concentric architectural rings & aurora ambient aura.
     final auraPaint = Paint()
       ..shader = RadialGradient(
         colors: [
-          const Color(0xFFD97757).withValues(alpha: dark ? 0.14 : 0.10),
-          const Color(0xFF2860E8).withValues(alpha: dark ? 0.06 : 0.04),
+          const Color(0xFF10B981).withValues(alpha: dark ? 0.16 : 0.11),
+          const Color(0xFF4F46E5).withValues(alpha: dark ? 0.08 : 0.05),
           Colors.transparent,
         ],
         stops: const [0.0, 0.55, 1.0],
@@ -2679,9 +2679,9 @@ class _ByteStudioGlyphPainter extends CustomPainter {
         ..shader = LinearGradient(
           begin: Alignment.bottomCenter,
           end: Alignment.topCenter,
-          colors: i == 1
-              ? const [Color(0xFFD95B2B), Color(0xFFFF8F66)]
-              : const [Color(0xFF2860E8), Color(0xFF5A92FF)],
+          colors: i == 2
+              ? const [Color(0xFF059669), Color(0xFF34D399)]
+              : const [Color(0xFF4F46E5), Color(0xFF38BDF8)],
         ).createShader(rect);
       canvas.drawRRect(rrect, paint);
     }

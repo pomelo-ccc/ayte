@@ -1,29 +1,29 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="290 235 444 530" fill="none">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="286 234 444 530" fill="none">
   <defs>
     <linearGradient id="bar1" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#60A5FA" />
-      <stop offset="48%" stop-color="#3B82F6" />
-      <stop offset="100%" stop-color="#1D4ED8" />
+      <stop offset="0%" stop-color="#7DD3FC" />
+      <stop offset="48%" stop-color="#38BDF8" />
+      <stop offset="100%" stop-color="#4338CA" />
     </linearGradient>
     <linearGradient id="bar2" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#FF944D" />
-      <stop offset="42%" stop-color="#F96B16" />
-      <stop offset="78%" stop-color="#EA580C" />
-      <stop offset="100%" stop-color="#B93808" />
+      <stop offset="0%" stop-color="#67E8F9" />
+      <stop offset="45%" stop-color="#0EA5E9" />
+      <stop offset="100%" stop-color="#3730A3" />
     </linearGradient>
     <linearGradient id="bar3" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#38BDF8" />
-      <stop offset="45%" stop-color="#2563EB" />
-      <stop offset="100%" stop-color="#1E3A8A" />
+      <stop offset="0%" stop-color="#A7F3D0" />
+      <stop offset="28%" stop-color="#34D399" />
+      <stop offset="68%" stop-color="#10B981" />
+      <stop offset="100%" stop-color="#047857" />
     </linearGradient>
     <linearGradient id="bar4" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#38BDF8" />
-      <stop offset="50%" stop-color="#2563EB" />
-      <stop offset="100%" stop-color="#1D4ED8" />
+      <stop offset="0%" stop-color="#7DD3FC" />
+      <stop offset="50%" stop-color="#3B82F6" />
+      <stop offset="100%" stop-color="#4F46E5" />
     </linearGradient>
   </defs>
-  <rect x="303" y="428.5" width="62" height="215" rx="31" fill="url(#bar1)" />
-  <rect x="419" y="247" width="66" height="462" rx="33" fill="url(#bar2)" />
-  <rect x="539" y="395" width="62" height="278" rx="31" fill="url(#bar3)" />
-  <rect x="657" y="296" width="62" height="376" rx="31" fill="url(#bar4)" />
+  <rect x="298" y="452" width="64" height="196" rx="32" fill="url(#bar1)" />
+  <rect x="414" y="364" width="64" height="304" rx="32" fill="url(#bar2)" />
+  <rect x="530" y="246" width="68" height="468" rx="34" fill="url(#bar3)" />
+  <rect x="650" y="318" width="64" height="364" rx="32" fill="url(#bar4)" />
 </svg>

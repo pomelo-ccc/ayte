@@ -53,6 +53,24 @@ if [[ -f "$EXT_PLIST" ]]; then
   /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier dev.ayte.desktop.FinderExtension" "$EXT_PLIST"
 fi
 
+rm -f "$STAGE_DIR/Ayte.app/Contents/Resources/Assets.car"
+ICONSET_DIR="$STAGE_DIR/AppIcon.iconset"
+mkdir -p "$ICONSET_DIR"
+APPICON_SRC="$REPO/macos/Runner/Assets.xcassets/AppIcon.appiconset"
+if [[ -d "$APPICON_SRC" ]]; then
+  cp "$APPICON_SRC/app_icon_16.png"   "$ICONSET_DIR/icon_16x16.png"
+  cp "$APPICON_SRC/app_icon_32.png"   "$ICONSET_DIR/icon_16x16@2x.png"
+  cp "$APPICON_SRC/app_icon_32.png"   "$ICONSET_DIR/icon_32x32.png"
+  cp "$APPICON_SRC/app_icon_64.png"   "$ICONSET_DIR/icon_32x32@2x.png"
+  cp "$APPICON_SRC/app_icon_128.png"  "$ICONSET_DIR/icon_128x128.png"
+  cp "$APPICON_SRC/app_icon_256.png"  "$ICONSET_DIR/icon_128x128@2x.png"
+  cp "$APPICON_SRC/app_icon_256.png"  "$ICONSET_DIR/icon_256x256.png"
+  cp "$APPICON_SRC/app_icon_512.png"  "$ICONSET_DIR/icon_256x256@2x.png"
+  cp "$APPICON_SRC/app_icon_512.png"  "$ICONSET_DIR/icon_512x512.png"
+  cp "$APPICON_SRC/app_icon_1024.png" "$ICONSET_DIR/icon_512x512@2x.png"
+  iconutil -c icns "$ICONSET_DIR" -o "$STAGE_DIR/Ayte.app/Contents/Resources/AppIcon.icns"
+fi
+
 rm -rf "$STAGE_DIR/Ayte.app/Contents/Frameworks/App.framework"
 cp -R "$REPO/build/macos/Build/Products/Release/App.framework" "$STAGE_DIR/Ayte.app/Contents/Frameworks/"
 "$CLANG" -isysroot "$SDK_ROOT" -dynamiclib -fobjc-arc -framework Cocoa -framework Carbon \
