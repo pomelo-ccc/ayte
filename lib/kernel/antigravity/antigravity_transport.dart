@@ -7,6 +7,7 @@ import 'package:path/path.dart' as p;
 
 import '../../network/network_proxy_io.dart';
 import '../claude_code/claude_code_transport.dart';
+import 'antigravity_accounts.dart';
 import 'antigravity_cli.dart';
 
 /// Starts a session on the Antigravity CLI (`agy`).
@@ -77,6 +78,15 @@ class AntigravityTransport implements ClaudeCodeTransport {
     if (!Directory(launch.cwd).existsSync()) {
       throw ClaudeFolderGone(launch.cwd);
     }
+    unawaited(AntigravityAccounts.instance.ensureInitialized());
+    AntigravityAccounts.onActiveAccountSwitched ??= (_) async {
+      for (final transport in [..._live]) {
+        transport._needsAccountRespawn = true;
+        if (transport._activeTurn == null) {
+          await transport._stopProcess(notifyActiveTurn: false);
+        }
+      }
+    };
     final cli = await LocalAntigravity.locate();
     final proxy = await NetworkProxy.instance.environment();
     return AntigravityTransport._(
@@ -122,6 +132,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
   final Set<int> _completedToolSteps = {};
 
   bool _interrupted = false;
+  bool _needsAccountRespawn = false;
   int _turnCounter = 0;
   int _lastTotalTokens = 0;
   int _lastAutoCompactTurn = -10;
@@ -453,11 +464,13 @@ class AntigravityTransport implements ClaudeCodeTransport {
 
   Future<({Process process, bool reused})> _ensureProcess() async {
     if (_process != null &&
+        !_needsAccountRespawn &&
         _spawnedModel == _model &&
         _spawnedModeFlag == _effectiveModeFlag &&
         _spawnedEffort == _effort) {
       return (process: _process!, reused: true);
     }
+    _needsAccountRespawn = false;
     await _stopProcess(notifyActiveTurn: false);
 
     final args = _buildArguments();
@@ -629,14 +642,53 @@ class AntigravityTransport implements ClaudeCodeTransport {
     }
 
     try {
-      final retry = await runOnce(turn);
+      var active = turn;
+      final retry = await runOnce(active);
       if (retry && !_interrupted && !_closed) {
-        final freshTurn = _ActiveTurn(
+        active = _ActiveTurn(
           transport: this,
           turnId: turnId,
           onConversationBound: turn.onConversationBound,
         );
-        await runOnce(freshTurn);
+        await runOnce(active);
+      }
+      if (active.hitQuotaLimit && !_interrupted && !_closed) {
+        final switched = await AntigravityAccounts.instance.tryAutoFailover(
+          modelId: _model,
+        );
+        if (switched != null) {
+          await _stopProcess(notifyActiveTurn: false);
+          _emit({
+            'type': 'assistant',
+            'uuid': 'agy-failover-$turnId',
+            'message': {
+              'id': 'agy-failover-$turnId',
+              'model': _model,
+              'role': 'assistant',
+              'content': [
+                {
+                  'type': 'text',
+                  'text':
+                      '> ⚡ 当前账号触发配额上限，已自动切换至备用账号 **${switched.email}** 继续执行。\n',
+                },
+              ],
+            },
+          });
+          final failoverTurn = _ActiveTurn(
+            transport: this,
+            turnId: turnId,
+            allowAutoFailover: false,
+            onConversationBound: turn.onConversationBound,
+          );
+          await runOnce(failoverTurn);
+        } else {
+          _emit({
+            'type': 'result',
+            'subtype': 'error',
+            'is_error': true,
+            'result': active.deferredQuotaError ?? 'Antigravity CLI 配额已达上限',
+          });
+        }
       }
     } on ProcessException catch (error) {
       _activeTurn = null;
@@ -1064,17 +1116,21 @@ class _ActiveTurn {
     required this.turnId,
     required this.onConversationBound,
     this.silent = false,
+    this.allowAutoFailover = true,
   });
 
   final AntigravityTransport transport;
   final int turnId;
   final void Function(String convId) onConversationBound;
   final bool silent;
+  final bool allowAutoFailover;
   final Completer<void> done = Completer<void>();
 
   final List<String> stderrLines = [];
   bool gotResult = false;
   bool gotError = false;
+  bool hitQuotaLimit = false;
+  String? deferredQuotaError;
   bool receivedAnyEvent = false;
   bool reusedProcess = false;
   bool needsFreshRetry = false;
@@ -1439,6 +1495,28 @@ class _ActiveTurn {
             done.complete();
           }
           return;
+        }
+
+        if (isError &&
+            allowAutoFailover &&
+            !streamedAnyResponse &&
+            !transport._interrupted &&
+            AntigravityAccounts.instance.autoSwitch.enabled) {
+          final combinedErr = '$errorText $responseText'.toLowerCase();
+          if (combinedErr.contains('resource_exhausted') ||
+              combinedErr.contains('quota') ||
+              combinedErr.contains('rate limit') ||
+              combinedErr.contains('too many requests') ||
+              combinedErr.contains('429')) {
+            hitQuotaLimit = true;
+            deferredQuotaError = errorText.isNotEmpty
+                ? errorText
+                : responseText;
+            if (!done.isCompleted) {
+              done.complete();
+            }
+            return;
+          }
         }
 
         if (!streamedAnyResponse) {

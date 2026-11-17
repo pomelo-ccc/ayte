@@ -13,7 +13,10 @@ import '../../ide/ide_menu.dart';
 import '../../icons/brand_logos.dart';
 import '../../icons/project_icon.dart';
 import '../../icons/project_icon_picker.dart';
+import '../../kernel/antigravity/antigravity_account_models.dart';
+import '../../kernel/antigravity/antigravity_accounts.dart';
 import '../../kernel/antigravity/antigravity_cli.dart';
+import '../settings_dialog.dart' show SettingsOpener, SettingsSection;
 import '../../kernel/claude_code/claude_haiku.dart';
 import '../../l10n/l10n.dart';
 import '../../models/codex/codex_api.dart' show codexClientVersion;
@@ -227,7 +230,11 @@ class _ModelsSettingsPageState extends State<ModelsSettingsPage> {
 
   @override
   Widget build(BuildContext context) => ListenableBuilder(
-    listenable: Listenable.merge([_providers, _magpie]),
+    listenable: Listenable.merge([
+      _providers,
+      _magpie,
+      AntigravityAccounts.instance,
+    ]),
     builder: (context, _) {
       final open = _providers.provider(_open);
       if (open != null) {
@@ -448,9 +455,16 @@ class _ModelsSettingsPageState extends State<ModelsSettingsPage> {
                   antigravityBuiltinProviderId,
                   size: 16,
                 ),
-                name: 'Antigravity CLI（跟随本机配置）',
+                name: 'Antigravity CLI',
                 badge: l10n.modelsBuiltinBadge,
-                detail: '使用你在终端中配置的 Antigravity CLI (agy) 账号与设置',
+                detail: switch (AntigravityAccounts.instance.currentAccount) {
+                  final acc? => [
+                    '当前账号：${acc.email}',
+                    if (acc.tier != AntigravityTier.unknown) acc.tier.badge,
+                    '共 ${AntigravityAccounts.instance.accounts.length} 个账号（点击管理）',
+                  ].join(' · '),
+                  null => '使用本机 Antigravity CLI (agy) 账号（点击管理多账号与配额）',
+                },
                 status: _providers.antigravityHidden
                     ? _Status.off
                     : _Status.ready,
@@ -458,6 +472,10 @@ class _ModelsSettingsPageState extends State<ModelsSettingsPage> {
                 switchLabel: l10n.modelsEnableProvider('Antigravity CLI'),
                 onEnabled: (value) =>
                     unawaited(_providers.setAntigravityHidden(!value)),
+                onOpen: switch (SettingsOpener.maybeOf(context)) {
+                  final open? => () => open(SettingsSection.accounts),
+                  null => null,
+                },
               ),
             // The newest at a site BaoCode lists first (one imported later
             // takes the place of one before); the rest in their order.
