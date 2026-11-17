@@ -1,29 +1,27 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="286 234 444 530" fill="none">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="256 232 498 516" fill="none">
   <defs>
-    <linearGradient id="bar1" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#7DD3FC" />
-      <stop offset="48%" stop-color="#38BDF8" />
-      <stop offset="100%" stop-color="#4338CA" />
+    <linearGradient id="ayteRing" x1="290" y1="344" x2="640" y2="724" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="55%" stop-color="#6366F1" />
+      <stop offset="100%" stop-color="#EC4899" />
     </linearGradient>
-    <linearGradient id="bar2" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#67E8F9" />
-      <stop offset="45%" stop-color="#0EA5E9" />
-      <stop offset="100%" stop-color="#3730A3" />
+    <linearGradient id="ayteStem" x1="622" y1="340" x2="622" y2="736" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FB7185" />
+      <stop offset="55%" stop-color="#A855F7" />
+      <stop offset="100%" stop-color="#6366F1" />
     </linearGradient>
-    <linearGradient id="bar3" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#A7F3D0" />
-      <stop offset="28%" stop-color="#34D399" />
-      <stop offset="68%" stop-color="#10B981" />
-      <stop offset="100%" stop-color="#047857" />
-    </linearGradient>
-    <linearGradient id="bar4" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#7DD3FC" />
-      <stop offset="50%" stop-color="#3B82F6" />
-      <stop offset="100%" stop-color="#4F46E5" />
-    </linearGradient>
+    <radialGradient id="ayteDot" cx="692" cy="270" r="52" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FEF08A" />
+      <stop offset="55%" stop-color="#F59E0B" />
+      <stop offset="100%" stop-color="#D97706" />
+    </radialGradient>
   </defs>
-  <rect x="298" y="452" width="64" height="196" rx="32" fill="url(#bar1)" />
-  <rect x="414" y="364" width="64" height="304" rx="32" fill="url(#bar2)" />
-  <rect x="530" y="246" width="68" height="468" rx="34" fill="url(#bar3)" />
-  <rect x="650" y="318" width="64" height="364" rx="32" fill="url(#bar4)" />
+  <path
+    fill-rule="evenodd"
+    clip-rule="evenodd"
+    d="M466 340C575.352 340 664 428.648 664 538C664 647.352 575.352 736 466 736C356.648 736 268 647.352 268 538C268 428.648 356.648 340 466 340ZM466 424C403.04 424 352 475.04 352 538C352 600.96 403.04 652 466 652C528.96 652 580 600.96 580 538C580 475.04 528.96 424 466 424Z"
+    fill="url(#ayteRing)"
+  />
+  <rect x="580" y="340" width="84" height="396" rx="42" fill="url(#ayteStem)" />
+  <circle cx="704" cy="282" r="38" fill="url(#ayteDot)" />
 </svg>
