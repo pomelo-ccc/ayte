@@ -4,7 +4,6 @@ import 'package:flutter/material.dart';
 
 import '../../channel/channel_setup.dart' show ChannelSetup;
 import '../../ide/ide_dialog.dart';
-import '../../kernel/agent_kernel.dart';
 import '../../kernel/kernel_types.dart';
 import '../../l10n/l10n.dart';
 import '../../models/model_provider.dart' show parseModelRef;
@@ -59,9 +58,7 @@ class SessionModelPicker extends StatelessWidget {
         group.label,
       model.label,
       for (final setting in session.modelSettings(model.id))
-        if (setting.selected case final selected?
-            when setting.kind != KernelChoiceKind.context ||
-                selected != setting.options.first)
+        if (setting.selected case final selected?)
           selected.label,
     ].join(' · ');
   }

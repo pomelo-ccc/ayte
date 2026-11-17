@@ -8,7 +8,9 @@ import '../l10n/l10n.dart';
 import 'model_provider.dart';
 import 'model_providers.dart';
 
-const _agyFlashRef = '@$antigravityBuiltinProviderId/gemini-3.8-flash-low';
+const _agyFlashRef = '@$antigravityBuiltinProviderId/gemini-3.8-flash';
+const _agyFlashLegacyRef =
+    '@$antigravityBuiltinProviderId/gemini-3.8-flash-low';
 
 /// The choices of an auxiliary model, as Settings → Models gives them:
 /// [autoLabel] first (automatic: [auto]), Antigravity CLI Flash when offered,
@@ -31,8 +33,8 @@ List<IdeMenuEntry> auxiliaryModelEntries(
   const IdeMenuSeparator(),
   if (providers.antigravityOffered)
     IdeMenuAction(
-      'Antigravity CLI · Gemini 3.8 Flash (Low)',
-      checked: current == _agyFlashRef,
+      'Antigravity CLI · Gemini 3.8 Flash',
+      checked: current == _agyFlashRef || current == _agyFlashLegacyRef,
       onSelected: () => onPick(_agyFlashRef),
     ),
   for (final provider in providers.enabled)
@@ -57,7 +59,8 @@ String? actionsModelName(AppLocalizations l10n, ModelProviders providers) {
   return switch (value) {
     null => null,
     ModelProviders.followAuxiliary => l10n.aiModelAuxiliary,
-    _agyFlashRef => 'Antigravity CLI · Gemini 3.8 Flash (Low)',
+    _agyFlashRef || _agyFlashLegacyRef =>
+      'Antigravity CLI · Gemini 3.8 Flash',
     builtinProviderId => l10n.aiModelAuxiliary,
     _ => switch (providers.resolve(value)) {
       (final provider, final model) =>

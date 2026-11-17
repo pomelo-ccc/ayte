@@ -27,131 +27,128 @@ abstract final class AntigravityPathSetting {
   static String? Function() current = () => null;
 }
 
-/// A model offered by Antigravity CLI (`agy --output-format json models`).
+/// Canonical reasoning effort tiers supported by `agy --effort`.
+const antigravityEffortOrder = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+/// A deduplicated model family offered by Antigravity CLI (`agy`).
 class AntigravityModel {
   const AntigravityModel({
     required this.id,
     required this.label,
+    this.cliModelId,
     this.description = '',
+    this.effortLevels = const [],
+    this.defaultEffort,
+    this.contextOptions = const [200000, 400000, 1000000],
+    this.defaultContext = 1000000,
   });
 
+  /// Canonical family id (e.g. `gemini-4-carbon`, `claude-opus-5-5`).
   final String id;
+
+  /// Actual `--model` flag value passed to `agy` (`id` by default, or an
+  /// explicit single-tier id such as `gpt-oss-120b-medium`).
+  final String? cliModelId;
+
+  /// Clean display name without `(Low)` / `(Medium)` / `(High)` suffix.
   final String label;
+
+  /// Short capability summary shown in descriptions.
   final String description;
+
+  /// Supported `--effort` levels when 2+ levels are available.
+  final List<String> effortLevels;
+
+  /// Default effort level when [effortLevels] is non-empty.
+  final String? defaultEffort;
+
+  /// Selectable context window capacities (in tokens).
+  final List<int> contextOptions;
+
+  /// Default context window capacity (in tokens).
+  final int defaultContext;
+
+  String get effectiveCliModel => cliModelId ?? id;
 }
 
-/// Built-in and dynamically queried models of Antigravity CLI (`agy`).
+/// Built-in and dynamically queried model families of Antigravity CLI (`agy`).
 abstract final class AntigravityModels {
   static const List<AntigravityModel> defaults = [
     AntigravityModel(
-      id: 'gemini-4-carbon-high',
-      label: 'Gemini 4 Carbon (High)',
-      description: 'Antigravity CLI · High effort',
+      id: 'gemini-4-carbon',
+      label: 'Gemini 4 Carbon',
+      description: '1M context · Frontier deep reasoning',
+      effortLevels: ['low', 'medium', 'high'],
+      defaultEffort: 'high',
+      contextOptions: [200000, 400000, 1000000],
+      defaultContext: 1000000,
     ),
     AntigravityModel(
-      id: 'gemini-4-carbon-medium',
-      label: 'Gemini 4 Carbon (Medium)',
-      description: 'Antigravity CLI · Medium effort',
+      id: 'gemini-4-argon',
+      label: 'Gemini 4 Argon',
+      description: '1M context · Frontier reasoning & coding',
+      effortLevels: ['low', 'medium', 'high'],
+      defaultEffort: 'high',
+      contextOptions: [200000, 400000, 1000000],
+      defaultContext: 1000000,
     ),
     AntigravityModel(
-      id: 'gemini-4-carbon-low',
-      label: 'Gemini 4 Carbon (Low)',
-      description: 'Antigravity CLI · Low effort',
-    ),
-    AntigravityModel(
-      id: 'gemini-4-argon-high',
-      label: 'Gemini 4 Argon (High)',
-      description: 'Antigravity CLI · High effort',
-    ),
-    AntigravityModel(
-      id: 'gemini-4-argon-medium',
-      label: 'Gemini 4 Argon (Medium)',
-      description: 'Antigravity CLI · Medium effort',
-    ),
-    AntigravityModel(
-      id: 'gemini-4-argon-low',
-      label: 'Gemini 4 Argon (Low)',
-      description: 'Antigravity CLI · Low effort',
-    ),
-    AntigravityModel(
-      id: 'gemini-4-hydrogen-xhigh',
-      label: 'Gemini 4 Hydrogen (XHigh)',
-      description: 'Antigravity CLI · Extra-high effort',
-    ),
-    AntigravityModel(
-      id: 'gemini-4-hydrogen-high',
-      label: 'Gemini 4 Hydrogen (High)',
-      description: 'Antigravity CLI · High effort',
-    ),
-    AntigravityModel(
-      id: 'gemini-4-hydrogen-medium',
-      label: 'Gemini 4 Hydrogen (Medium)',
-      description: 'Antigravity CLI · Medium effort',
-    ),
-    AntigravityModel(
-      id: 'gemini-4-hydrogen-low',
-      label: 'Gemini 4 Hydrogen (Low)',
-      description: 'Antigravity CLI · Low effort',
+      id: 'gemini-4-hydrogen',
+      label: 'Gemini 4 Hydrogen',
+      description: '1M context · High-speed agentic engine',
+      effortLevels: ['low', 'medium', 'high', 'xhigh'],
+      defaultEffort: 'high',
+      contextOptions: [200000, 400000, 1000000],
+      defaultContext: 1000000,
     ),
     AntigravityModel(
       id: 'gemini-pro-orchestrator',
       label: 'Orchestrator (Carbon)',
-      description: 'Antigravity CLI · Orchestrator',
+      description: '1M context · Carbon planner + Hydrogen executor',
+      contextOptions: [200000, 400000, 1000000],
+      defaultContext: 1000000,
     ),
     AntigravityModel(
       id: 'gemini-pro-orchestrator-argon',
       label: 'Orchestrator (Argon)',
-      description: 'Antigravity CLI · Orchestrator',
+      description: '1M context · Argon planner + Hydrogen executor',
+      contextOptions: [200000, 400000, 1000000],
+      defaultContext: 1000000,
     ),
     AntigravityModel(
-      id: 'gemini-3.8-flash-high',
-      label: 'Gemini 3.8 Flash (High)',
-      description: 'Antigravity CLI · Fast & high effort',
+      id: 'gemini-3.8-flash',
+      label: 'Gemini 3.8 Flash',
+      description: '1M context · Low-latency coding & sub-tasks',
+      effortLevels: ['low', 'medium', 'high'],
+      defaultEffort: 'high',
+      contextOptions: [200000, 400000, 1000000],
+      defaultContext: 1000000,
     ),
     AntigravityModel(
-      id: 'gemini-3.8-flash-medium',
-      label: 'Gemini 3.8 Flash (Medium)',
-      description: 'Antigravity CLI · Fast & medium effort',
+      id: 'claude-opus-5-5',
+      label: 'Claude Opus 5.5',
+      description: 'Up to 1M context · Anthropic flagship reasoning',
+      effortLevels: ['low', 'medium', 'high'],
+      defaultEffort: 'high',
+      contextOptions: [200000, 400000, 1000000],
+      defaultContext: 200000,
     ),
     AntigravityModel(
-      id: 'gemini-3.8-flash-low',
-      label: 'Gemini 3.8 Flash (Low)',
-      description: 'Antigravity CLI · Fast & low effort',
+      id: 'claude-sonnet-5-5',
+      label: 'Claude Sonnet 5.5',
+      description: 'Up to 1M context · Balanced Anthropic coding model',
+      effortLevels: ['low', 'medium', 'high'],
+      defaultEffort: 'medium',
+      contextOptions: [200000, 400000, 1000000],
+      defaultContext: 200000,
     ),
     AntigravityModel(
-      id: 'claude-opus-5-5-high',
-      label: 'Claude Opus 5.5 (High)',
-      description: 'Antigravity CLI · High effort',
-    ),
-    AntigravityModel(
-      id: 'claude-opus-5-5-medium',
-      label: 'Claude Opus 5.5 (Medium)',
-      description: 'Antigravity CLI · Medium effort',
-    ),
-    AntigravityModel(
-      id: 'claude-opus-5-5-low',
-      label: 'Claude Opus 5.5 (Low)',
-      description: 'Antigravity CLI · Low effort',
-    ),
-    AntigravityModel(
-      id: 'claude-sonnet-5-5-high',
-      label: 'Claude Sonnet 5.5 (High)',
-      description: 'Antigravity CLI · High effort',
-    ),
-    AntigravityModel(
-      id: 'claude-sonnet-5-5-medium',
-      label: 'Claude Sonnet 5.5 (Medium)',
-      description: 'Antigravity CLI · Medium effort',
-    ),
-    AntigravityModel(
-      id: 'claude-sonnet-5-5-low',
-      label: 'Claude Sonnet 5.5 (Low)',
-      description: 'Antigravity CLI · Low effort',
-    ),
-    AntigravityModel(
-      id: 'gpt-oss-120b-medium',
-      label: 'GPT-OSS 120B (Medium)',
-      description: 'Antigravity CLI · Open-weight model',
+      id: 'gpt-oss-120b',
+      cliModelId: 'gpt-oss-120b-medium',
+      label: 'GPT-OSS 120B',
+      description: '128K context · Open-weight reasoning model',
+      contextOptions: [64000, 128000],
+      defaultContext: 128000,
     ),
   ];
 
@@ -159,41 +156,123 @@ abstract final class AntigravityModels {
 
   static List<AntigravityModel> get current => _current;
 
-  static final Set<String> _knownIds = {
-    for (final m in defaults) m.id,
-  };
+  static final RegExp _effortIdSuffix = RegExp(
+    r'-(low|medium|high|xhigh|max)$',
+    caseSensitive: false,
+  );
+  static final RegExp _effortLabelSuffix = RegExp(
+    r'\s*\((Low|Medium|High|XHigh|Max)\)$',
+    caseSensitive: false,
+  );
+
+  /// Strips `@antigravity-cli/` prefix if present.
+  static String stripPrefix(String? model) {
+    if (model == null || model.isEmpty) return '';
+    const prefix = '@$antigravityBuiltinProviderId/';
+    return model.startsWith(prefix) ? model.substring(prefix.length) : model;
+  }
+
+  /// Splits a raw variant ID like `gemini-4-carbon-high` into
+  /// `(familyId: 'gemini-4-carbon', effort: 'high')`.
+  static ({String familyId, String? effort}) splitVariantId(String rawId) {
+    final trimmed = stripPrefix(rawId).trim();
+    final match = _effortIdSuffix.firstMatch(trimmed);
+    if (match == null) return (familyId: trimmed, effort: null);
+    return (
+      familyId: trimmed.substring(0, match.start),
+      effort: match.group(1)!.toLowerCase(),
+    );
+  }
+
+  /// Looks up the [AntigravityModel] family matching [model] (accepts both
+  /// `@antigravity-cli/<id>`, family IDs like `gemini-4-carbon`, and legacy
+  /// variant IDs like `gemini-4-carbon-medium`).
+  static AntigravityModel? of(String? model) {
+    final bare = stripPrefix(model);
+    if (bare.isEmpty) return null;
+    if (bare == 'default') return _current.first;
+    for (final m in _current) {
+      if (m.id == bare || m.effectiveCliModel == bare) return m;
+    }
+    final (:familyId, effort: _) = splitVariantId(bare);
+    for (final m in _current) {
+      if (m.id == familyId) return m;
+    }
+    return null;
+  }
+
+  /// Resolves [model] into its canonical [AntigravityModel] and any explicit
+  /// effort suffix carried by a legacy variant string.
+  static ({AntigravityModel model, String? effort})? parseVariant(
+    String? model,
+  ) {
+    final found = of(model);
+    if (found == null) return null;
+    final (:familyId, :effort) = splitVariantId(stripPrefix(model ?? ''));
+    final validEffort =
+        effort != null && found.effortLevels.contains(effort) ? effort : null;
+    return (model: found, effort: validEffort);
+  }
 
   /// Whether [model] is an `@antigravity-cli/<id>` reference or a known
-  /// Antigravity CLI model ID.
+  /// Antigravity CLI model/variant ID.
   static bool isAntigravityModel(String? model) {
     if (model == null || model.isEmpty) return false;
     if (model.startsWith('@$antigravityBuiltinProviderId/')) return true;
-    return _knownIds.contains(model);
+    return of(model) != null;
   }
 
-  /// Strips `@antigravity-cli/` prefix if present.
+  /// Canonical bare family ID (e.g. `gemini-4-carbon`) for UI selection state.
   static String bareModelId(String? model) {
-    final defaultId = _current.first.id;
-    if (model == null || model.isEmpty) return defaultId;
-    const prefix = '@$antigravityBuiltinProviderId/';
-    if (model.startsWith(prefix)) {
-      final bare = model.substring(prefix.length);
-      return bare.isEmpty || bare == 'default' ? defaultId : bare;
-    }
-    if (model == 'default') return defaultId;
-    return model;
+    final found = of(model);
+    if (found != null) return found.id;
+    final bare = stripPrefix(model);
+    if (bare.isEmpty || bare == 'default') return _current.first.id;
+    return splitVariantId(bare).familyId;
   }
 
-  /// Label for [modelId].
-  static String labelOf(String modelId) {
-    final bare = bareModelId(modelId);
-    for (final m in _current) {
-      if (m.id == bare) return m.label;
-    }
+  /// CLI `--model` argument to pass to `agy`.
+  static String cliModelIdOf(String? model) {
+    final found = of(model);
+    if (found != null) return found.effectiveCliModel;
+    final bare = stripPrefix(model);
+    if (bare.isEmpty || bare == 'default') return _current.first.effectiveCliModel;
     return bare;
   }
 
-  /// Updates the cached model list from `agy --output-format json models`.
+  /// Display label for [modelId].
+  static String labelOf(String modelId) {
+    return of(modelId)?.label ?? bareModelId(modelId);
+  }
+
+  /// Context window presets inferred for a dynamically discovered model family.
+  static ({List<int> options, int defaultContext, String summary})
+  _contextProfileFor(String familyId) {
+    final lower = familyId.toLowerCase();
+    if (lower.startsWith('gpt-oss')) {
+      return (
+        options: const [64000, 128000],
+        defaultContext: 128000,
+        summary: '128K context · Open-weight model',
+      );
+    }
+    if (lower.startsWith('claude-')) {
+      return (
+        options: const [200000, 400000, 1000000],
+        defaultContext: 200000,
+        summary: 'Up to 1M context · Anthropic coding model',
+      );
+    }
+    return (
+      options: const [200000, 400000, 1000000],
+      defaultContext: 1000000,
+      summary: '1M context · Google Antigravity',
+    );
+  }
+
+  /// Updates the cached model list from `agy --output-format json models`,
+  /// collapsing `(Low)` / `(Medium)` / `(High)` / `(XHigh)` / `(Max)` rows
+  /// into clean model families with structured effort & context options.
   static void updateFromJson(Object? decoded) {
     if (decoded is! Map) return;
     final command = decoded['command'];
@@ -202,27 +281,81 @@ abstract final class AntigravityModels {
     if (data is! Map) return;
     final rawModels = data['models'];
     if (rawModels is! List || rawModels.isEmpty) return;
-    final parsed = <AntigravityModel>[];
+
+    final groups = <String, _FamilyBuilder>{};
+    final order = <String>[];
+
     for (final item in rawModels) {
-      if (item is Map && item['id'] is String) {
-        final id = (item['id'] as String).trim();
-        final label = (item['label'] as String?)?.trim();
-        if (id.isNotEmpty) {
-          parsed.add(
-            AntigravityModel(
-              id: id,
-              label: label != null && label.isNotEmpty ? label : id,
-              description: 'Antigravity CLI',
-            ),
-          );
-          _knownIds.add(id);
-        }
+      if (item is! Map || item['id'] is! String) continue;
+      final rawId = (item['id'] as String).trim();
+      if (rawId.isEmpty) continue;
+      final rawLabel = ((item['label'] as String?) ?? rawId).trim();
+
+      final (:familyId, :effort) = splitVariantId(rawId);
+      final cleanLabel = effort != null
+          ? rawLabel.replaceFirst(_effortLabelSuffix, '').trim()
+          : rawLabel;
+
+      final builder = groups.putIfAbsent(familyId, () {
+        order.add(familyId);
+        return _FamilyBuilder(familyId: familyId, label: cleanLabel);
+      });
+      builder.rawVariantIds.add(rawId);
+      if (effort != null && !builder.efforts.contains(effort)) {
+        builder.efforts.add(effort);
       }
     }
+
+    if (order.isEmpty) return;
+
+    final byDefaultId = {for (final m in defaults) m.id: m};
+    final parsed = <AntigravityModel>[];
+
+    for (final familyId in order) {
+      final b = groups[familyId]!;
+      final sortedEfforts = [
+        for (final level in antigravityEffortOrder)
+          if (b.efforts.contains(level)) level,
+      ];
+      final preset = byDefaultId[familyId];
+      final profile = _contextProfileFor(familyId);
+      final multiEffort = sortedEfforts.length > 1;
+      final defaultEffort = multiEffort
+          ? (preset?.defaultEffort != null &&
+                    sortedEfforts.contains(preset!.defaultEffort)
+                ? preset.defaultEffort
+                : sortedEfforts.contains('high')
+                ? 'high'
+                : sortedEfforts.first)
+          : null;
+
+      parsed.add(
+        AntigravityModel(
+          id: familyId,
+          cliModelId: multiEffort ? null : b.rawVariantIds.first,
+          label: b.label.isNotEmpty ? b.label : (preset?.label ?? familyId),
+          description: preset?.description ?? profile.summary,
+          effortLevels: multiEffort ? sortedEfforts : const [],
+          defaultEffort: defaultEffort,
+          contextOptions: preset?.contextOptions ?? profile.options,
+          defaultContext: preset?.defaultContext ?? profile.defaultContext,
+        ),
+      );
+    }
+
     if (parsed.isNotEmpty) {
       _current = parsed;
     }
   }
+}
+
+class _FamilyBuilder {
+  _FamilyBuilder({required this.familyId, required this.label});
+
+  final String familyId;
+  final String label;
+  final List<String> rawVariantIds = [];
+  final List<String> efforts = [];
 }
 
 /// Locates and inspects the Antigravity CLI (`agy`) on this machine.

@@ -401,11 +401,9 @@ class _ModelsSettingsPageState extends State<ModelsSettingsPage> {
                           IdeMenuAction(
                             model.label,
                             checked:
-                                current ==
-                                modelRef(
-                                  antigravityBuiltinProviderId,
-                                  model.id,
-                                ),
+                                AntigravityModels.isAntigravityModel(current) &&
+                                AntigravityModels.bareModelId(current) ==
+                                    model.id,
                             onSelected: () => unawaited(
                               _providers.setDefaultModel(
                                 modelRef(

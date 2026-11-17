@@ -144,6 +144,15 @@ Future<(String, int)> _run(
   final combinedPrompt = system.trim().isEmpty
       ? prompt
       : 'System instruction: $system\n\n$prompt';
+  final parsed = AntigravityModels.parseVariant(
+    model ?? 'gemini-3.8-flash-low',
+  );
+  final cliModel =
+      parsed?.model.effectiveCliModel ??
+      AntigravityModels.cliModelIdOf(model ?? 'gemini-3.8-flash');
+  final cliEffort =
+      parsed?.effort ??
+      (parsed?.model.effortLevels.contains('low') == true ? 'low' : null);
   final Process process;
   try {
     process = await Process.start(
@@ -155,7 +164,8 @@ Future<(String, int)> _run(
         '--output-format',
         'json',
         '--model',
-        AntigravityModels.bareModelId(model ?? 'gemini-3.8-flash-low'),
+        cliModel,
+        if (cliEffort != null) ...['--effort', cliEffort],
         combinedPrompt,
       ],
       workingDirectory: switch (tools?.directory) {

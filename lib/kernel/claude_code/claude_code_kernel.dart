@@ -155,15 +155,20 @@ class ClaudeCodeKernel
       _approvals,
       'default',
     );
-    _model = settings[KernelChoiceKind.model.name];
-    if (descriptor.id == antigravityBuiltinProviderId &&
-        !AntigravityModels.isAntigravityModel(_model)) {
+    final rawInitialModel = settings[KernelChoiceKind.model.name];
+    _model = rawInitialModel;
+    String? legacyAgyEffort;
+    if (AntigravityModels.parseVariant(rawInitialModel) case final parsed?) {
+      _model = modelRef(antigravityBuiltinProviderId, parsed.model.id);
+      legacyAgyEffort = parsed.effort;
+    } else if (descriptor.id == antigravityBuiltinProviderId &&
+        _providers.resolve(_model) == null) {
       _model = modelRef(
         antigravityBuiltinProviderId,
         AntigravityModels.current.first.id,
       );
     }
-    _effort = settings[KernelChoiceKind.effort.name];
+    _effort = settings[KernelChoiceKind.effort.name] ?? legacyAgyEffort;
     _window = switch (parseTokens(
       settings[KernelChoiceKind.context.name] ?? '',
     )) {
@@ -183,6 +188,20 @@ class ClaudeCodeKernel
       } else if (key.startsWith(speeds)) {
         _pickedFast[key.substring(speeds.length)] = value == 'fast';
       }
+    }
+    if (_effort != null && _model != null) {
+      _pickedEfforts.putIfAbsent(_model!, () => _effort!);
+    }
+    if (AntigravityModels.of(_model) case final agy?) {
+      final ref = modelRef(antigravityBuiltinProviderId, agy.id);
+      if (_effort != null) {
+        _pickedEfforts.putIfAbsent(ref, () => _effort!);
+      }
+      if (_window case final w? when agy.contextOptions.contains(w)) {
+        _pickedWindows.putIfAbsent(ref, () => w);
+      }
+      _contextWindow = _agyWindowFor(agy, ref);
+      _contextReported = true;
     }
     if (_model case final model? when !_pickedFast.containsKey(model)) {
       _pickedFast[model] = settings[KernelChoiceKind.fast.name] == 'fast';
@@ -376,11 +395,9 @@ class ClaudeCodeKernel
   /// if offered there, else to the first upstream's.
   String? get _model {
     final picked = _pickedModel;
-    if (AntigravityModels.isAntigravityModel(picked) &&
-        _providers.antigravityOffered) {
-      return picked!.startsWith('@$antigravityBuiltinProviderId/')
-          ? picked
-          : modelRef(antigravityBuiltinProviderId, picked);
+    if (AntigravityModels.of(picked) case final agy?
+        when _providers.antigravityOffered) {
+      return modelRef(antigravityBuiltinProviderId, agy.id);
     }
     if (_providers.resolve(picked) != null) return picked;
     if (ClaudeCore.current() == ClaudeCore.antigravity &&
@@ -583,16 +600,13 @@ class ClaudeCodeKernel
         (AntigravityModels.isAntigravityModel(_model) ||
             descriptor.id == antigravityBuiltinProviderId ||
             ClaudeCore.current() == ClaudeCore.antigravity)) {
-      final modelId =
-          _model ??
-          modelRef(
-            antigravityBuiltinProviderId,
-            AntigravityModels.current.first.id,
-          );
+      final agy =
+          AntigravityModels.of(_model) ?? AntigravityModels.current.first;
+      final ref = modelRef(antigravityBuiltinProviderId, agy.id);
       return (
         provider: antigravityBuiltinProviderId,
-        model: modelId,
-        effort: _pickedEfforts[modelId] ?? _effort,
+        model: ref,
+        effort: _agyEffortFor(agy, ref),
       );
     }
     final effort = switch (custom) {
@@ -922,6 +936,12 @@ class ClaudeCodeKernel
   void _applyWindow() {
     if (!_running) return;
     final otherProvider = _providerKey != _launchedProvider;
+    if (!otherProvider &&
+        _providerKey == antigravityBuiltinProviderId &&
+        _autocompact != null) {
+      _launchedWindow = _autocompact;
+      return;
+    }
     if (!otherProvider && _autocompact == _launchedWindow) return;
     if (!otherProvider && _busy) return;
     _teardown();
@@ -3334,25 +3354,30 @@ class ClaudeCodeKernel
         : _pickedWindows[id] == null
         ? _variantOf(id)
         : _variantFor(id, long: _window! > _windows['200k']!);
-    if (sameProvider && AntigravityModels.isAntigravityModel(id)) {
-      _model = id;
-      final effort =
-          recalled != null &&
-              recalled != _appliedEffort &&
-              _effortLevelsOf(id).contains(recalled)
-          ? recalled
-          : null;
-      if (effort != null) _appliedEffort = effort;
+    if (sameProvider && AntigravityModels.of(id) != null) {
+      final agy = AntigravityModels.of(id)!;
+      final ref = modelRef(antigravityBuiltinProviderId, agy.id);
+      _model = ref;
+      final effort = _agyEffortFor(agy, ref, active: false);
+      final window = _agyWindowFor(agy, ref);
+      _effort = effort;
+      _window = window;
+      _contextWindow = window;
+      _contextReported = true;
+      _appliedEffort = effort;
       _change([
-        ('set_model', {'model': AntigravityModels.bareModelId(id)}),
-        if (effort != null)
-          (
-            'apply_flag_settings',
-            {
-              'settings': {'effortLevel': effort},
+        ('set_model', {'model': agy.id}),
+        (
+          'apply_flag_settings',
+          {
+            'settings': {
+              'effortLevel': ?effort,
+              'contextWindow': window,
             },
-          ),
+          },
+        ),
       ]);
+      emitInfoChanged();
       return;
     }
     if (sameProvider && target == null) {
@@ -3409,9 +3434,14 @@ class ClaudeCodeKernel
     final current = model.selected;
     if (current == null) return;
     if (effort.selected case final level?) _pickedEfforts[current] = level;
-    // A provider's model's is noted as it is picked: else it is its own,
-    // as its upstream says (see _windowFor).
     if (_custom != null) return;
+    if (AntigravityModels.of(current) != null) {
+      if (parseTokens(contextSize.selected ?? '') case final window?
+          when window > 0) {
+        _pickedWindows[current] = window;
+      }
+      return;
+    }
     if (_windows[contextSize.selected] case final window?) {
       _pickedWindows[current] = window;
     }
@@ -3457,11 +3487,34 @@ class ClaudeCodeKernel
     _ => info.initialContext,
   };
 
+  int _agyWindowFor(AntigravityModel agy, String ref) =>
+      switch (_pickedWindows[ref]) {
+        final picked? when agy.contextOptions.contains(picked) => picked,
+        _ => agy.defaultContext,
+      };
+
+  String? _agyEffortFor(
+    AntigravityModel agy,
+    String ref, {
+    bool active = true,
+  }) {
+    if (agy.effortLevels.isEmpty) return null;
+    final candidate =
+        _pickedEfforts[ref] ?? (active ? _effort : null) ?? agy.defaultEffort;
+    return agy.effortLevels.contains(candidate) ? candidate : agy.defaultEffort;
+  }
+
   /// The context the session compacts at: a provider's model's, else as
   /// picked (null for the CLI's own).
   int? get _autocompact => switch (_custom) {
     (_, final info) => _windowFor(info),
-    null => _window,
+    null => switch (AntigravityModels.of(_model)) {
+      final agy? => _agyWindowFor(
+        agy,
+        modelRef(antigravityBuiltinProviderId, agy.id),
+      ),
+      null => _window,
+    },
   };
 
   /// Turns the thinking of a provider's model not behind the proxy to
@@ -3482,8 +3535,8 @@ class ClaudeCodeKernel
     if (_providers.resolve(model) case (_, final info)) {
       return info.effortLevels;
     }
-    if (AntigravityModels.isAntigravityModel(model)) {
-      return const ['low', 'medium', 'high'];
+    if (AntigravityModels.of(model) case final agy?) {
+      return agy.effortLevels;
     }
     if (parseModelRef(model) != null) return const [];
     return _variantOf(model)?.effortLevels ?? const [];
@@ -3581,6 +3634,22 @@ class ClaudeCodeKernel
             ),
         ];
       }
+      if (AntigravityModels.of(model) case final agy?
+          when agy.contextOptions.length > 1) {
+        return [
+          for (final tokens in agy.contextOptions)
+            KernelOption(
+              '$tokens',
+              formatTokens(tokens),
+              Icons.notes_rounded,
+              tokens == agy.defaultContext
+                  ? '默认窗口'
+                  : tokens < agy.defaultContext
+                  ? '提前自动压缩，降低延迟与上下文衰减'
+                  : '超长上下文窗口',
+            ),
+        ];
+      }
       if (parseModelRef(model) != null) return const [];
       final most = _modelWindowOf(model);
       final options = [
@@ -3592,6 +3661,10 @@ class ClaudeCodeKernel
     },
     selected: () {
       if (_custom case (_, final info)) return '${_windowFor(info)}';
+      if (AntigravityModels.of(_model) case final agy?) {
+        final ref = modelRef(antigravityBuiltinProviderId, agy.id);
+        return '${_agyWindowFor(agy, ref)}';
+      }
       // Shown as picked until the process restarts with it, as the next
       // message is sent.
       final window = _window != _launchedWindow
@@ -3610,6 +3683,10 @@ class ClaudeCodeKernel
         final picked = _pickedWindows[model];
         return '${info.contextOptions.contains(picked) ? picked : info.initialContext}';
       }
+      if (AntigravityModels.of(model) case final agy?) {
+        final ref = modelRef(antigravityBuiltinProviderId, agy.id);
+        return '${_agyWindowFor(agy, ref)}';
+      }
       final window = _pickedWindows[model] ?? _window;
       return _windows.entries
           .where((entry) => entry.value == window)
@@ -3627,6 +3704,29 @@ class ClaudeCodeKernel
         if (model != _model) {
           _selectModel(model, keep: false);
         } else {
+          emitInfoChanged();
+        }
+        return;
+      }
+      if (AntigravityModels.of(model) case final agy?) {
+        final tokens = parseTokens(id);
+        if (tokens == null || !agy.contextOptions.contains(tokens)) return;
+        final ref = modelRef(antigravityBuiltinProviderId, agy.id);
+        _window = _pickedWindows[ref] = tokens;
+        _contextWindow = tokens;
+        _contextReported = true;
+        if (ref != _model || _providerKeyOf(ref) != _onProvider) {
+          _selectModel(ref, keep: false);
+        } else {
+          _launchedWindow = tokens;
+          _change([
+            (
+              'apply_flag_settings',
+              {
+                'settings': {'contextWindow': tokens},
+              },
+            ),
+          ]);
           emitInfoChanged();
         }
         return;
@@ -3854,6 +3954,10 @@ class ClaudeCodeKernel
     ],
     selected: () {
       if (_custom case (_, final info)) return _effortFor(info);
+      if (AntigravityModels.of(_model) case final agy?) {
+        final ref = modelRef(antigravityBuiltinProviderId, agy.id);
+        return _agyEffortFor(agy, ref);
+      }
       final levels = _currentModel?.effortLevels ?? const <String>[];
       final effort = _running ? _appliedEffort : _effort;
       return levels.contains(effort) ? effort : null;
@@ -3863,6 +3967,10 @@ class ClaudeCodeKernel
       final level = _pickedEfforts[model] ?? _effort;
       if (_providers.resolve(model) case (_, final info)) {
         return info.effortLevels.contains(level) ? level : info.initialEffort;
+      }
+      if (AntigravityModels.of(model) case final agy?) {
+        final ref = modelRef(antigravityBuiltinProviderId, agy.id);
+        return _agyEffortFor(agy, ref, active: false);
       }
       return _effortLevelsOf(model).contains(level) ? level : null;
     },
@@ -3893,6 +4001,27 @@ class ClaudeCodeKernel
           else
             ?_thinkingSettings(id),
         ]);
+        return;
+      }
+      if (AntigravityModels.of(model) case final agy?) {
+        if (!agy.effortLevels.contains(id)) return;
+        final ref = modelRef(antigravityBuiltinProviderId, agy.id);
+        _pickedEfforts[ref] = id;
+        _effort = _appliedEffort = id;
+        if (ref != _model || _providerKeyOf(ref) != _onProvider) {
+          _selectModel(ref, keep: false);
+          return;
+        }
+        _change([
+          ('set_model', {'model': agy.id}),
+          (
+            'apply_flag_settings',
+            {
+              'settings': {'effortLevel': id},
+            },
+          ),
+        ]);
+        emitInfoChanged();
         return;
       }
       // Claude Code's model, picked on another provider's: switched to as

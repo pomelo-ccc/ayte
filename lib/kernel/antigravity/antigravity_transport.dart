@@ -42,12 +42,27 @@ class AntigravityTransport implements ClaudeCodeTransport {
   }) : _sessionId = (launch.resume != null && launch.resume!.isNotEmpty)
            ? launch.resume
            : null,
-       _model = AntigravityModels.bareModelId(launch.model),
+       _model = AntigravityModels.cliModelIdOf(launch.model),
        _permissionMode = launch.permissionMode ?? 'default',
-       _effort = launch.effort,
+       _effort = _resolveInitialEffort(launch.model, launch.effort),
+       _maxContextTokens =
+           launch.autocompact ??
+           AntigravityModels.of(launch.model)?.defaultContext ??
+           1000000,
        _paths = AgentPaths.from(environment) {
     _live.add(this);
     _initSessionState();
+  }
+
+  static String? _resolveInitialEffort(String? rawModel, String? launchEffort) {
+    final parsed = AntigravityModels.parseVariant(rawModel);
+    if (parsed == null) return launchEffort;
+    final info = parsed.model;
+    if (info.effortLevels.isEmpty) return null;
+    if (launchEffort != null && info.effortLevels.contains(launchEffort)) {
+      return launchEffort;
+    }
+    return parsed.effort ?? info.defaultEffort;
   }
 
   static final Set<AntigravityTransport> _live = {};
@@ -93,6 +108,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
   String _model;
   String _permissionMode;
   String? _effort;
+  int _maxContextTokens;
   bool _closed = false;
 
   /// Persistent `agy` process kept alive across turns.
@@ -108,6 +124,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
   bool _interrupted = false;
   int _turnCounter = 0;
   int _lastTotalTokens = 0;
+  int _lastAutoCompactTurn = -10;
 
   /// Queue of user turns to run sequentially.
   Future<void> _turnQueue = Future.value();
@@ -242,8 +259,8 @@ class AntigravityTransport implements ClaudeCodeTransport {
                 'value': m.id,
                 'displayName': m.label,
                 'description': m.description,
-                'supportsEffort': true,
-                'supportedEffortLevels': const ['low', 'medium', 'high'],
+                'supportsEffort': m.effortLevels.isNotEmpty,
+                'supportedEffortLevels': m.effortLevels,
                 'supportsAutoMode': true,
               },
           ],
@@ -280,21 +297,44 @@ class AntigravityTransport implements ClaudeCodeTransport {
         });
       case 'set_model':
         if (request['model'] case final String model) {
-          _model = AntigravityModels.bareModelId(model);
+          final parsed = AntigravityModels.parseVariant(model);
+          _model = parsed?.model.effectiveCliModel ??
+              AntigravityModels.cliModelIdOf(model);
+          if (parsed != null) {
+            if (parsed.model.effortLevels.isEmpty) {
+              _effort = null;
+            } else if (_effort == null ||
+                !parsed.model.effortLevels.contains(_effort)) {
+              _effort = parsed.effort ?? parsed.model.defaultEffort;
+            }
+            if (!parsed.model.contextOptions.contains(_maxContextTokens)) {
+              _maxContextTokens = parsed.model.defaultContext;
+            }
+          }
         }
         respondSuccess();
       case 'apply_flag_settings':
         if (request['settings'] case final Map settings) {
           if (settings['effortLevel'] case final String effort) {
-            _effort = effort;
+            final info = AntigravityModels.of(_model);
+            if (info == null || info.effortLevels.contains(effort)) {
+              _effort = effort;
+            } else if (info.effortLevels.isEmpty) {
+              _effort = null;
+            }
+          }
+          if (settings['contextWindow'] case final num tokens
+              when tokens.toInt() > 0) {
+            _maxContextTokens = tokens.toInt();
           }
         }
         respondSuccess();
       case 'get_settings':
         respondSuccess({
           'applied': {
-            'model': _model,
+            'model': AntigravityModels.bareModelId(_model),
             if (_effort != null) 'effort': _effort,
+            'contextWindow': _maxContextTokens,
           },
         });
       case 'rename_session':
@@ -309,7 +349,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
         }
         respondSuccess();
       case 'get_context_usage':
-        const maxTokens = 1000000;
+        final maxTokens = _maxContextTokens;
         final used = _lastTotalTokens;
         respondSuccess({
           'maxTokens': maxTokens,
@@ -370,7 +410,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
                 final tempFile = File(
                   p.join(
                     Directory.systemTemp.path,
-                    'byte_agy_img_${DateTime.now().millisecondsSinceEpoch}_$imageIndex.$ext',
+                    'ayte_agy_img_${DateTime.now().millisecondsSinceEpoch}_$imageIndex.$ext',
                   ),
                 );
                 await tempFile.writeAsBytes(bytes);
@@ -539,6 +579,17 @@ class AntigravityTransport implements ClaudeCodeTransport {
       'state': 'working',
     });
 
+    final modelInfo = AntigravityModels.of(_model);
+    final nativeMax = modelInfo?.contextOptions.last ?? 1000000;
+    if (_agyConversationId != null &&
+        _maxContextTokens < nativeMax &&
+        _lastTotalTokens >= (_maxContextTokens * 0.90).round() &&
+        turnId - _lastAutoCompactTurn >= 2 &&
+        !prompt.trim().startsWith('/')) {
+      _lastAutoCompactTurn = turnId;
+      await _runAutoCompact(turnId);
+    }
+
     final turn = _ActiveTurn(
       transport: this,
       turnId: turnId,
@@ -624,6 +675,61 @@ class AntigravityTransport implements ClaudeCodeTransport {
       'subtype': 'session_state_changed',
       'state': 'idle',
     });
+  }
+
+  Future<void> _runAutoCompact(int turnId) async {
+    if (_closed || _interrupted) return;
+    final preTokens = _lastTotalTokens;
+    _emit({
+      'type': 'system',
+      'subtype': 'status',
+      'status': 'compacting',
+    });
+    final compactTurn = _ActiveTurn(
+      transport: this,
+      turnId: turnId,
+      silent: true,
+      onConversationBound: _bindConversationId,
+    );
+    final compactPayload = jsonEncode({
+      'event': 'user',
+      'message': const {'role': 'user', 'content': '/compact'},
+    });
+    try {
+      _activeTurn = compactTurn;
+      final (:process, :reused) = await _ensureProcess();
+      compactTurn.reusedProcess = reused;
+      process.stdin.writeln(compactPayload);
+      await process.stdin.flush();
+      await compactTurn.done.future;
+    } on Object {
+      compactTurn.gotError = true;
+    } finally {
+      if (identical(_activeTurn, compactTurn)) {
+        _activeTurn = null;
+      }
+    }
+    if (!compactTurn.gotError) {
+      if (_lastTotalTokens >= preTokens) {
+        _lastTotalTokens = 0;
+      }
+      _emit({
+        'type': 'system',
+        'subtype': 'compact_boundary',
+        'compact_metadata': {
+          'trigger': 'auto',
+          'pre_tokens': preTokens,
+          if (_lastTotalTokens > 0 && _lastTotalTokens < preTokens)
+            'post_tokens': _lastTotalTokens,
+        },
+      });
+    } else {
+      _emit({
+        'type': 'system',
+        'subtype': 'status',
+        'status': null,
+      });
+    }
   }
 
   Map<String, Object?>? _mapUsage(Object? rawUsage) {
@@ -957,15 +1063,18 @@ class _ActiveTurn {
     required this.transport,
     required this.turnId,
     required this.onConversationBound,
+    this.silent = false,
   });
 
   final AntigravityTransport transport;
   final int turnId;
   final void Function(String convId) onConversationBound;
+  final bool silent;
   final Completer<void> done = Completer<void>();
 
   final List<String> stderrLines = [];
   bool gotResult = false;
+  bool gotError = false;
   bool receivedAnyEvent = false;
   bool reusedProcess = false;
   bool needsFreshRetry = false;
@@ -1110,6 +1219,10 @@ class _ActiveTurn {
     if (step['conversation_id'] case final String convId
         when convId.isNotEmpty) {
       onConversationBound(convId);
+    }
+    if (silent) {
+      transport._mapUsage(step['usage']);
+      return;
     }
     final stepIndex = (step['step_index'] as num?)?.round() ?? 0;
     final state = step['state'] as String? ?? '';
@@ -1315,10 +1428,18 @@ class _ActiveTurn {
         }
         final status = result['status'] as String? ?? 'SUCCESS';
         final isError = status != 'SUCCESS';
+        gotError = isError;
         final responseText = '${result['response'] ?? ''}'.trim();
         final errorText = '${result['error'] ?? ''}'.trim();
         final durationSec = (result['duration_seconds'] as num?)?.toDouble();
         final usage = transport._mapUsage(result['usage']);
+
+        if (silent) {
+          if (!done.isCompleted) {
+            done.complete();
+          }
+          return;
+        }
 
         if (!streamedAnyResponse) {
           final fallbackText = !isError && responseText.isNotEmpty
@@ -1361,6 +1482,12 @@ class _ActiveTurn {
           if (durationSec != null)
             'duration_ms': (durationSec * 1000).round(),
           'usage': ?usage,
+          'modelUsage': {
+            AntigravityModels.bareModelId(transport._model): {
+              'contextWindow': transport._maxContextTokens,
+              ...?usage,
+            },
+          },
         });
 
         if (!done.isCompleted) {
@@ -1380,6 +1507,11 @@ class _ActiveTurn {
     if (done.isCompleted) return;
     if (reusedProcess && !receivedAnyEvent && !transport._interrupted) {
       needsFreshRetry = true;
+      done.complete();
+      return;
+    }
+    if (silent) {
+      gotError = exitCode != 0;
       done.complete();
       return;
     }
