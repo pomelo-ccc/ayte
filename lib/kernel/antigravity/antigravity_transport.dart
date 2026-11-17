@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:bao_agent/bao_agent.dart' show AgentPaths, agentVersion;
 import 'package:path/path.dart' as p;
@@ -46,13 +47,27 @@ class AntigravityTransport implements ClaudeCodeTransport {
        _model = AntigravityModels.cliModelIdOf(launch.model),
        _permissionMode = launch.permissionMode ?? 'default',
        _effort = _resolveInitialEffort(launch.model, launch.effort),
-       _maxContextTokens =
-           launch.autocompact ??
-           AntigravityModels.of(launch.model)?.defaultContext ??
-           1000000,
+       _maxContextTokens = _resolveInitialContextTokens(
+         launch.model,
+         launch.autocompact,
+       ),
        _paths = AgentPaths.from(environment) {
     _live.add(this);
     _initSessionState();
+  }
+
+  static int _resolveInitialContextTokens(
+    String? rawModel,
+    int? launchAutocompact,
+  ) {
+    final info = AntigravityModels.of(rawModel);
+    if (info != null) {
+      return info.resolveContextWindow(launchAutocompact);
+    }
+    if (launchAutocompact != null && launchAutocompact > 0) {
+      return launchAutocompact;
+    }
+    return 1000000;
   }
 
   static String? _resolveInitialEffort(String? rawModel, String? launchEffort) {
@@ -128,14 +143,14 @@ class AntigravityTransport implements ClaudeCodeTransport {
   String? _spawnedModel;
   String? _spawnedModeFlag;
   String? _spawnedEffort;
+  int? _spawnedContextTokens;
   _ActiveTurn? _activeTurn;
   final Set<int> _completedToolSteps = {};
 
   bool _interrupted = false;
   bool _needsAccountRespawn = false;
   int _turnCounter = 0;
-  int _lastTotalTokens = 0;
-  int _lastAutoCompactTurn = -10;
+  int _lastContextTokens = 0;
 
   /// Queue of user turns to run sequentially.
   Future<void> _turnQueue = Future.value();
@@ -175,6 +190,13 @@ class AntigravityTransport implements ClaudeCodeTransport {
         sessionId: id,
         persist: launch.persist,
       );
+    }
+
+    final seeded =
+        readBrainContextTokens(id, home: _paths.home)?.contextTokens ??
+        _sessionLog?.readLastContextTokens();
+    if (seeded != null && seeded > 0) {
+      _lastContextTokens = seeded;
     }
   }
 
@@ -318,16 +340,22 @@ class AntigravityTransport implements ClaudeCodeTransport {
                 !parsed.model.effortLevels.contains(_effort)) {
               _effort = parsed.effort ?? parsed.model.defaultEffort;
             }
-            if (!parsed.model.contextOptions.contains(_maxContextTokens)) {
-              _maxContextTokens = parsed.model.defaultContext;
-            }
+            _maxContextTokens = parsed.model.resolveContextWindow(
+              _maxContextTokens,
+            );
+          }
+          if (_activeTurn == null &&
+              (_spawnedModel != _model ||
+                  _spawnedEffort != _effort ||
+                  _spawnedContextTokens != _maxContextTokens)) {
+            unawaited(_stopProcess(notifyActiveTurn: false));
           }
         }
         respondSuccess();
       case 'apply_flag_settings':
         if (request['settings'] case final Map settings) {
+          final info = AntigravityModels.of(_model);
           if (settings['effortLevel'] case final String effort) {
-            final info = AntigravityModels.of(_model);
             if (info == null || info.effortLevels.contains(effort)) {
               _effort = effort;
             } else if (info.effortLevels.isEmpty) {
@@ -336,7 +364,15 @@ class AntigravityTransport implements ClaudeCodeTransport {
           }
           if (settings['contextWindow'] case final num tokens
               when tokens.toInt() > 0) {
-            _maxContextTokens = tokens.toInt();
+            final requested = tokens.toInt();
+            _maxContextTokens = info != null
+                ? info.resolveContextWindow(requested)
+                : requested;
+          }
+          if (_activeTurn == null &&
+              (_spawnedEffort != _effort ||
+                  _spawnedContextTokens != _maxContextTokens)) {
+            unawaited(_stopProcess(notifyActiveTurn: false));
           }
         }
         respondSuccess();
@@ -361,19 +397,26 @@ class AntigravityTransport implements ClaudeCodeTransport {
         respondSuccess();
       case 'get_context_usage':
         final maxTokens = _maxContextTokens;
-        final used = _lastTotalTokens;
+        if (_lastContextTokens <= 0) {
+          final convId = _agyConversationId ?? _sessionId;
+          if (convId != null && convId.isNotEmpty) {
+            final seeded =
+                readBrainContextTokens(
+                  convId,
+                  home: _paths.home,
+                )?.contextTokens ??
+                _sessionLog?.readLastContextTokens();
+            if (seeded != null && seeded > 0) {
+              _lastContextTokens = seeded;
+            }
+          }
+        }
+        final used = _lastContextTokens;
         respondSuccess({
           'maxTokens': maxTokens,
           'rawMaxTokens': maxTokens,
           'totalTokens': used,
-          'categories': [
-            {'name': 'Conversation', 'tokens': used, 'kind': 'used'},
-            {
-              'name': 'Available',
-              'tokens': (maxTokens - used).clamp(0, maxTokens),
-              'kind': 'free',
-            },
-          ],
+          'categories': buildContextCategories(used, maxTokens),
         });
       case 'interrupt':
         _interrupted = true;
@@ -386,6 +429,25 @@ class AntigravityTransport implements ClaudeCodeTransport {
       default:
         respondSuccess();
     }
+  }
+
+  /// Builds `get_context_usage` category segments matching
+  /// `ContextUsagePanel.partOf` (`System prompt`, `System tools`, `Messages`).
+  static List<Map<String, Object?>> buildContextCategories(
+    int used,
+    int maxTokens,
+  ) {
+    final safeUsed = math.max(0, used);
+    final sys = safeUsed > 0 ? math.min(6200, (safeUsed * 0.22).round()) : 0;
+    final tools = safeUsed > 0 ? math.min(21600, (safeUsed * 0.72).round()) : 0;
+    final messages = math.max(0, safeUsed - sys - tools);
+    final free = math.max(0, maxTokens - safeUsed);
+    return [
+      {'name': 'System prompt', 'tokens': sys, 'kind': 'used'},
+      {'name': 'System tools', 'tokens': tools, 'kind': 'used'},
+      {'name': 'Messages', 'tokens': messages, 'kind': 'used'},
+      {'name': 'Free space', 'tokens': free, 'kind': 'free'},
+    ];
   }
 
   Future<String> _extractPrompt(Map<String, Object?> userMessage) async {
@@ -441,50 +503,100 @@ class AntigravityTransport implements ClaudeCodeTransport {
   String get _effectiveModeFlag =>
       _permissionMode == 'plan' ? 'plan' : 'agent';
 
-  List<String> _buildArguments() {
-    final args = <String>[
+  /// Builds `agy` CLI flags, passing native `--settings={"contextWindow": ...}`
+  /// when a preset window (`256K` / `512K` / `900K`) is selected.
+  static List<String> buildCliArguments({
+    required String model,
+    required String? effort,
+    required String permissionMode,
+    required int maxContextTokens,
+    String? conversationId,
+    List<String> directories = const [],
+  }) {
+    final presetWindow = AntigravityModels.presetContextWindowName(
+      maxContextTokens,
+    );
+    return <String>[
       '--input-format=stream-json',
       '--output-format=stream-json',
-      if (_agyConversationId case final id? when id.isNotEmpty)
-        '--conversation=$id',
-      if (_model.isNotEmpty && _model != 'default') '--model=$_model',
-      if (_effort case final effort?
-          when const {'low', 'medium', 'high', 'xhigh', 'max'}.contains(effort))
+      if (conversationId != null && conversationId.isNotEmpty)
+        '--conversation=$conversationId',
+      if (model.isNotEmpty && model != 'default') '--model=$model',
+      if (effort != null &&
+          const {'low', 'medium', 'high', 'xhigh', 'max'}.contains(effort))
         '--effort=$effort',
-      if (_permissionMode == 'plan') '--mode=plan',
+      if (presetWindow != null)
+        '--settings=${jsonEncode({'contextWindow': presetWindow})}',
+      if (permissionMode == 'plan') '--mode=plan',
       // Always pass --dangerously-skip-permissions in headless print mode so
       // tool_confirmation_manager.go never soft-denies RunCommand / file edits
       // when there is no interactive TTY prompt channel.
       '--dangerously-skip-permissions',
-      for (final dir in launch.directories) '--add-dir=$dir',
+      for (final dir in directories) '--add-dir=$dir',
       '-p=',
     ];
-    return args;
   }
+
+  /// Builds child process environment for `agy`, setting
+  /// `AGY_CLI_AUTO_COMPACT_OVERRIDE` whenever a model without native preset
+  /// windows selects a custom compaction ceiling below its full window.
+  static Map<String, String> buildProcessEnvironment({
+    required Map<String, String> baseEnvironment,
+    required String model,
+    required int maxContextTokens,
+  }) {
+    final env = <String, String>{...baseEnvironment}
+      ..remove('AGY_CLI_AUTO_COMPACT_OVERRIDE');
+    final info = AntigravityModels.of(model);
+    final nativeMax = info?.contextOptions.last ?? 1000000;
+    final usesPresetFlag =
+        (info?.supportsPresetContextWindow ?? false) &&
+        AntigravityModels.presetContextWindowName(maxContextTokens) != null;
+    if (!usesPresetFlag && maxContextTokens > 0 && maxContextTokens < nativeMax) {
+      env['AGY_CLI_AUTO_COMPACT_OVERRIDE'] = '$maxContextTokens';
+    }
+    return env;
+  }
+
+  List<String> _buildArguments() => buildCliArguments(
+    model: _model,
+    effort: _effort,
+    permissionMode: _permissionMode,
+    maxContextTokens: _maxContextTokens,
+    conversationId: _agyConversationId,
+    directories: launch.directories,
+  );
 
   Future<({Process process, bool reused})> _ensureProcess() async {
     if (_process != null &&
         !_needsAccountRespawn &&
         _spawnedModel == _model &&
         _spawnedModeFlag == _effectiveModeFlag &&
-        _spawnedEffort == _effort) {
+        _spawnedEffort == _effort &&
+        _spawnedContextTokens == _maxContextTokens) {
       return (process: _process!, reused: true);
     }
     _needsAccountRespawn = false;
     await _stopProcess(notifyActiveTurn: false);
 
     final args = _buildArguments();
+    final procEnv = buildProcessEnvironment(
+      baseEnvironment: environment,
+      model: _model,
+      maxContextTokens: _maxContextTokens,
+    );
     final process = await Process.start(
       executable,
       args,
       workingDirectory: launch.cwd,
-      environment: environment,
+      environment: procEnv,
     );
     _process = process;
     _completedToolSteps.clear();
     _spawnedModel = _model;
     _spawnedModeFlag = _effectiveModeFlag;
     _spawnedEffort = _effort;
+    _spawnedContextTokens = _maxContextTokens;
 
     _stdoutSub = process.stdout
         .transform(const Utf8Decoder(allowMalformed: true))
@@ -548,7 +660,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
       _agyConversationId = null;
       _sessionId = null;
       _sessionLog = null;
-      _lastTotalTokens = 0;
+      _lastContextTokens = 0;
       _emit({
         'type': 'result',
         'subtype': 'success',
@@ -558,6 +670,10 @@ class AntigravityTransport implements ClaudeCodeTransport {
       });
       return;
     }
+
+    final isManualCompact =
+        prompt.trim() == '/compact' || prompt.trim().startsWith('/compact ');
+    final preTurnContextTokens = _lastContextTokens;
 
     if (_needsHistorySeed && _sessionLog != null) {
       _needsHistorySeed = false;
@@ -591,17 +707,6 @@ class AntigravityTransport implements ClaudeCodeTransport {
       'subtype': 'session_state_changed',
       'state': 'working',
     });
-
-    final modelInfo = AntigravityModels.of(_model);
-    final nativeMax = modelInfo?.contextOptions.last ?? 1000000;
-    if (_agyConversationId != null &&
-        _maxContextTokens < nativeMax &&
-        _lastTotalTokens >= (_maxContextTokens * 0.90).round() &&
-        turnId - _lastAutoCompactTurn >= 2 &&
-        !prompt.trim().startsWith('/')) {
-      _lastAutoCompactTurn = turnId;
-      await _runAutoCompact(turnId);
-    }
 
     final turn = _ActiveTurn(
       transport: this,
@@ -721,6 +826,32 @@ class AntigravityTransport implements ClaudeCodeTransport {
     }
 
     _activeTurn = null;
+
+    // Refresh ground-truth context occupancy from agy's brain transcript when
+    // manual /compact ran or when the turn noticeably shrunk the context.
+    final convId = _agyConversationId ?? _sessionId;
+    if (convId != null && convId.isNotEmpty) {
+      final brain = readBrainContextTokens(convId, home: _paths.home);
+      if (brain != null && brain.contextTokens > 0) {
+        if (isManualCompact ||
+            (preTurnContextTokens > 60000 &&
+                brain.contextTokens < (preTurnContextTokens * 0.55).round())) {
+          _lastContextTokens = brain.contextTokens;
+          _emit({
+            'type': 'system',
+            'subtype': 'compact_boundary',
+            'compact_metadata': {
+              'trigger': isManualCompact ? 'manual' : 'auto',
+              if (preTurnContextTokens > 0) 'pre_tokens': preTurnContextTokens,
+              'post_tokens': _lastContextTokens,
+            },
+          });
+        } else if (!turn.hadStepUsage) {
+          _lastContextTokens = brain.contextTokens;
+        }
+      }
+    }
+
     AntigravityAccounts.instance.scheduleActiveQuotaRefresh();
 
     _emit({
@@ -730,80 +861,152 @@ class AntigravityTransport implements ClaudeCodeTransport {
     });
   }
 
-  Future<void> _runAutoCompact(int turnId) async {
-    if (_closed || _interrupted) return;
-    final preTokens = _lastTotalTokens;
-    _emit({
-      'type': 'system',
-      'subtype': 'status',
-      'status': 'compacting',
-    });
-    final compactTurn = _ActiveTurn(
-      transport: this,
-      turnId: turnId,
-      silent: true,
-      onConversationBound: _bindConversationId,
-    );
-    final compactPayload = jsonEncode({
-      'event': 'user',
-      'message': const {'role': 'user', 'content': '/compact'},
-    });
-    try {
-      _activeTurn = compactTurn;
-      final (:process, :reused) = await _ensureProcess();
-      compactTurn.reusedProcess = reused;
-      process.stdin.writeln(compactPayload);
-      await process.stdin.flush();
-      await compactTurn.done.future;
-    } on Object {
-      compactTurn.gotError = true;
-    } finally {
-      if (identical(_activeTurn, compactTurn)) {
-        _activeTurn = null;
-      }
-    }
-    if (!compactTurn.gotError) {
-      if (_lastTotalTokens >= preTokens) {
-        _lastTotalTokens = 0;
-      }
-      _emit({
-        'type': 'system',
-        'subtype': 'compact_boundary',
-        'compact_metadata': {
-          'trigger': 'auto',
-          'pre_tokens': preTokens,
-          if (_lastTotalTokens > 0 && _lastTotalTokens < preTokens)
-            'post_tokens': _lastTotalTokens,
-        },
-      });
-    } else {
-      _emit({
-        'type': 'system',
-        'subtype': 'status',
-        'status': null,
-      });
-    }
-  }
-
-  Map<String, Object?>? _mapUsage(Object? rawUsage) {
+  /// Converts an `agy` `usage` payload (`input_tokens` ALREADY includes
+  /// `cache_read_tokens`) into Anthropic/Claude-compatible `usage` where
+  /// `input_tokens` is uncached input and `contextTokens` is the single-step
+  /// total context occupancy (`input_tokens + output_tokens`).
+  static ({Map<String, Object?> usage, int contextTokens})? convertAgyUsage(
+    Object? rawUsage,
+  ) {
     if (rawUsage is! Map) return null;
     final inputTokens = (rawUsage['input_tokens'] as num?)?.round() ?? 0;
     final outputTokens = (rawUsage['output_tokens'] as num?)?.round() ?? 0;
     final cacheRead = (rawUsage['cache_read_tokens'] as num?)?.round() ?? 0;
     final thinkingTokens = (rawUsage['thinking_tokens'] as num?)?.round();
-    final totalTokens = (rawUsage['total_tokens'] as num?)?.round();
-    if (totalTokens != null && totalTokens > 0) {
-      _lastTotalTokens = totalTokens + cacheRead;
-    } else if (inputTokens + outputTokens + cacheRead > 0) {
-      _lastTotalTokens = inputTokens + outputTokens + cacheRead;
+    final totalTokens = (rawUsage['total_tokens'] as num?)?.round() ?? 0;
+
+    final uncachedInput = math.max(0, inputTokens - cacheRead);
+    final contextTokens = totalTokens > 0
+        ? totalTokens
+        : (inputTokens + outputTokens);
+    if (contextTokens <= 0 && cacheRead <= 0) return null;
+
+    return (
+      usage: {
+        'input_tokens': uncachedInput,
+        'output_tokens': outputTokens,
+        if (cacheRead > 0) 'cache_read_input_tokens': cacheRead,
+        if (thinkingTokens != null)
+          'output_tokens_details': {'thinking_tokens': thinkingTokens},
+      },
+      contextTokens: contextTokens,
+    );
+  }
+
+  Map<String, Object?>? _recordStepUsage(Object? rawUsage) {
+    final converted = convertAgyUsage(rawUsage);
+    if (converted == null) return null;
+    if (converted.contextTokens > 0) {
+      _lastContextTokens = converted.contextTokens;
     }
-    return {
-      'input_tokens': inputTokens,
-      'output_tokens': outputTokens,
-      if (cacheRead > 0) 'cache_read_input_tokens': cacheRead,
-      if (thinkingTokens != null)
-        'output_tokens_details': {'thinking_tokens': thinkingTokens},
-    };
+    return converted.usage;
+  }
+
+  Map<String, Object?>? _recordResultUsage(
+    Object? rawUsage, {
+    required bool hadStepUsage,
+  }) {
+    final converted = convertAgyUsage(rawUsage);
+    if (converted == null) return null;
+    // `result.usage` is cumulative across all tool steps in a multi-step turn;
+    // only use it as context occupancy when no single-step `step.usage` arrived.
+    if (!hadStepUsage && converted.contextTokens > 0) {
+      _lastContextTokens = converted.contextTokens;
+    }
+    return converted.usage;
+  }
+
+  /// Reads the latest single-step context window occupancy from `agy`'s native
+  /// `~/.gemini/antigravity-cli/brain/<sessionId>/.system_generated/logs/transcript.jsonl`.
+  static ({
+    int inputTokens,
+    int outputTokens,
+    int cacheReadTokens,
+    int contextTokens,
+    bool fromCompaction,
+  })?
+  readBrainContextTokens(String sessionId, {String? home}) {
+    if (sessionId.isEmpty) return null;
+    final resolvedHome =
+        home ??
+        Platform.environment['HOME'] ??
+        Platform.environment['USERPROFILE'] ??
+        '';
+    if (resolvedHome.isEmpty) return null;
+    final file = File(
+      p.join(
+        resolvedHome,
+        '.gemini',
+        'antigravity-cli',
+        'brain',
+        sessionId,
+        '.system_generated',
+        'logs',
+        'transcript.jsonl',
+      ),
+    );
+    if (!file.existsSync()) return null;
+    try {
+      final length = file.lengthSync();
+      if (length <= 0) return null;
+      const maxTailBytes = 256 * 1024;
+      final String content;
+      if (length <= maxTailBytes) {
+        content = file.readAsStringSync();
+      } else {
+        final raf = file.openSync();
+        try {
+          raf.setPositionSync(length - maxTailBytes);
+          final bytes = raf.readSync(maxTailBytes);
+          content = const Utf8Decoder(allowMalformed: true).convert(bytes);
+        } finally {
+          raf.closeSync();
+        }
+      }
+      final lines = const LineSplitter().convert(content);
+      final startIdx = length > maxTailBytes && lines.length > 1 ? 1 : 0;
+      for (var i = lines.length - 1; i >= startIdx; i--) {
+        final trimmed = lines[i].trim();
+        if (trimmed.isEmpty) continue;
+        Object? decoded;
+        try {
+          decoded = jsonDecode(trimmed);
+        } on FormatException {
+          continue;
+        }
+        if (decoded is! Map) continue;
+        final type = decoded['type'] as String? ?? '';
+        if (type == 'PLANNER_RESPONSE') {
+          final inputTokens = (decoded['input_tokens'] as num?)?.round() ?? 0;
+          final outputTokens = (decoded['output_tokens'] as num?)?.round() ?? 0;
+          final cacheRead =
+              (decoded['cache_read_tokens'] as num?)?.round() ?? 0;
+          final contextTokens = inputTokens + outputTokens;
+          if (contextTokens > 0) {
+            return (
+              inputTokens: inputTokens,
+              outputTokens: outputTokens,
+              cacheReadTokens: cacheRead,
+              contextTokens: contextTokens,
+              fromCompaction: false,
+            );
+          }
+        } else if (type == 'CHECKPOINT') {
+          final summaryText = '${decoded['content'] ?? ''}';
+          final summaryTokens = (summaryText.length / 3.8).round() + 27800;
+          return (
+            inputTokens: summaryTokens,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            contextTokens: summaryTokens,
+            fromCompaction: true,
+          );
+        }
+      }
+    } on Object {
+      // Ignore transient file read errors.
+    }
+    return null;
   }
 
   /// Normalizes `tool_info.parameters` where `agy` serializes each map value
@@ -1116,14 +1319,12 @@ class _ActiveTurn {
     required this.transport,
     required this.turnId,
     required this.onConversationBound,
-    this.silent = false,
     this.allowAutoFailover = true,
   });
 
   final AntigravityTransport transport;
   final int turnId;
   final void Function(String convId) onConversationBound;
-  final bool silent;
   final bool allowAutoFailover;
   final Completer<void> done = Completer<void>();
 
@@ -1136,6 +1337,8 @@ class _ActiveTurn {
   bool reusedProcess = false;
   bool needsFreshRetry = false;
   bool streamedAnyResponse = false;
+  bool hadStepUsage = false;
+  Map<String, Object?>? pendingSilentStepUsage;
   String? lastToolError;
 
   final Map<int, bool> stepThinkingStarted = {};
@@ -1216,6 +1419,9 @@ class _ActiveTurn {
     final fullThinking = stepThinkingBuffer[stepIndex]?.toString() ?? '';
     final fullText = stepTextBuffer[stepIndex]?.toString() ?? '';
     final usage = stepUsage[stepIndex];
+    if (identical(pendingSilentStepUsage, usage)) {
+      pendingSilentStepUsage = null;
+    }
     _emitAndLog({
       'type': 'assistant',
       'uuid': 'agy-msg-$turnId-$stepIndex',
@@ -1277,10 +1483,6 @@ class _ActiveTurn {
         when convId.isNotEmpty) {
       onConversationBound(convId);
     }
-    if (silent) {
-      transport._mapUsage(step['usage']);
-      return;
-    }
     final stepIndex = (step['step_index'] as num?)?.round() ?? 0;
     final state = step['state'] as String? ?? '';
     final stepType = step['step_type'] as String? ?? '';
@@ -1290,9 +1492,11 @@ class _ActiveTurn {
     if (stepType == 'agent_response') {
       final thinkingDelta = step['thinking_delta'] as String? ?? '';
       final textDelta = step['text_delta'] as String? ?? '';
-      final usage = transport._mapUsage(step['usage']);
+      final usage = transport._recordStepUsage(step['usage']);
       if (usage != null) {
+        hadStepUsage = true;
         stepUsage[stepIndex] = usage;
+        pendingSilentStepUsage = usage;
       }
 
       if (thinkingDelta.isNotEmpty) {
@@ -1417,6 +1621,8 @@ class _ActiveTurn {
 
       if (toolEmittedActive[stepIndex] != true) {
         toolEmittedActive[stepIndex] = true;
+        final attachedUsage = pendingSilentStepUsage;
+        pendingSilentStepUsage = null;
         _emitAndLog({
           'type': 'assistant',
           'uuid': 'agy-tool-msg-$turnId-$stepIndex',
@@ -1432,6 +1638,7 @@ class _ActiveTurn {
                 'input': mapped.input,
               },
             ],
+            'usage': ?attachedUsage,
           },
         }, persist: true);
       }
@@ -1489,14 +1696,10 @@ class _ActiveTurn {
         final responseText = '${result['response'] ?? ''}'.trim();
         final errorText = '${result['error'] ?? ''}'.trim();
         final durationSec = (result['duration_seconds'] as num?)?.toDouble();
-        final usage = transport._mapUsage(result['usage']);
-
-        if (silent) {
-          if (!done.isCompleted) {
-            done.complete();
-          }
-          return;
-        }
+        final usage = transport._recordResultUsage(
+          result['usage'],
+          hadStepUsage: hadStepUsage,
+        );
 
         if (isError &&
             allowAutoFailover &&
@@ -1586,11 +1789,6 @@ class _ActiveTurn {
     if (done.isCompleted) return;
     if (reusedProcess && !receivedAnyEvent && !transport._interrupted) {
       needsFreshRetry = true;
-      done.complete();
-      return;
-    }
-    if (silent) {
-      gotError = exitCode != 0;
       done.complete();
       return;
     }
@@ -1704,6 +1902,44 @@ class _AntigravitySessionLog {
     } on Object {
       // Ignore disk errors.
     }
+  }
+
+  /// Reads the latest single-request context token count recorded in `.jsonl`.
+  int? readLastContextTokens() {
+    final file = File(filePath);
+    if (!file.existsSync()) return null;
+    try {
+      final lines = file.readAsLinesSync();
+      for (final line in lines.reversed) {
+        if (line.trim().isEmpty) continue;
+        final decoded = jsonDecode(line);
+        if (decoded is! Map) continue;
+        if (decoded['type'] == 'system' &&
+            decoded['subtype'] == 'compact_boundary') {
+          final meta = decoded['compact_metadata'];
+          if (meta is Map && meta['post_tokens'] is num) {
+            return (meta['post_tokens'] as num).round();
+          }
+          return null;
+        }
+        if (decoded['type'] != 'assistant') continue;
+        final msg = decoded['message'];
+        if (msg is! Map) continue;
+        final usage = msg['usage'];
+        if (usage is! Map) continue;
+        final input = (usage['input_tokens'] as num?)?.round() ?? 0;
+        final cacheRead =
+            (usage['cache_read_input_tokens'] as num?)?.round() ?? 0;
+        final cacheCreate =
+            (usage['cache_creation_input_tokens'] as num?)?.round() ?? 0;
+        final output = (usage['output_tokens'] as num?)?.round() ?? 0;
+        final total = input + cacheRead + cacheCreate + output;
+        if (total > 0) return total;
+      }
+    } on Object {
+      // Ignore malformed lines.
+    }
+    return null;
   }
 
   /// Extracts a concise summary of recent turns when switching an existing
@@ -1837,15 +2073,25 @@ String? syncAntigravityTranscriptIfNeeded({
           'content': userText,
         },
       });
+    } else if (type == 'CHECKPOINT') {
+      seq++;
+      log.append({
+        'type': 'system',
+        'subtype': 'compact_boundary',
+        'uuid': 'agy-import-$sessionId-c-$seq',
+        'timestamp': ?timestamp,
+        'compact_metadata': const {'trigger': 'auto'},
+      });
     } else if (type == 'PLANNER_RESPONSE') {
       final thinking = '${step['thinking'] ?? ''}'.trim();
       final text = '${step['content'] ?? ''}'.trim();
       final inputTokens = (step['input_tokens'] as num?)?.round() ?? 0;
       final outputTokens = (step['output_tokens'] as num?)?.round() ?? 0;
       final cacheRead = (step['cache_read_tokens'] as num?)?.round() ?? 0;
+      final uncachedInput = math.max(0, inputTokens - cacheRead);
       final usage = (inputTokens > 0 || outputTokens > 0 || cacheRead > 0)
           ? <String, Object?>{
-              'input_tokens': inputTokens,
+              'input_tokens': uncachedInput,
               'output_tokens': outputTokens,
               if (cacheRead > 0) 'cache_read_input_tokens': cacheRead,
             }

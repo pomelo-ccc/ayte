@@ -1,16 +1,18 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:baocode/chat/panels/context_usage_panel.dart';
 import 'package:baocode/kernel/agent_kernel.dart';
 import 'package:baocode/kernel/antigravity/antigravity_cli.dart';
 import 'package:baocode/kernel/antigravity/antigravity_transport.dart';
 import 'package:baocode/kernel/claude_code/claude_code_kernel.dart';
 import 'package:baocode/kernel/claude_code/claude_core_setting.dart';
+import 'package:baocode/kernel/kernel_event.dart';
 import 'package:baocode/models/model_providers.dart';
 
 void main() {
   group('AntigravityModels deduplication & context windows', () {
     test(
-      'updateFromJson collapses 22 raw agy model variants into 9 clean families',
+      'updateFromJson collapses 22 raw agy model variants into 9 clean families with agy 1.5.10 context windows',
       () {
         const rawJson = {
           'command': {
@@ -70,20 +72,28 @@ void main() {
           'GPT-OSS 120B',
         ]);
 
+        final argon = AntigravityModels.of('gemini-4-argon')!;
+        expect(argon.effortLevels, ['low', 'medium', 'high']);
+        expect(argon.contextOptions, [256000, 512000, 900000]);
+        expect(argon.defaultContext, 256000);
+        expect(argon.supportsPresetContextWindow, isTrue);
+
         final hydrogen = AntigravityModels.of('gemini-4-hydrogen')!;
         expect(hydrogen.effortLevels, ['low', 'medium', 'high', 'xhigh']);
-        expect(hydrogen.contextOptions, [200000, 400000, 1000000]);
+        expect(hydrogen.contextOptions, [256000, 512000, 900000, 1000000]);
         expect(hydrogen.defaultContext, 1000000);
         expect(hydrogen.effectiveCliModel, 'gemini-4-hydrogen');
+        expect(hydrogen.resolveContextWindow(200000), 256000);
+        expect(hydrogen.resolveContextWindow(400000), 512000);
 
         final orchestrator = AntigravityModels.of('gemini-pro-orchestrator')!;
         expect(orchestrator.effortLevels, isEmpty);
-        expect(orchestrator.contextOptions, [200000, 400000, 1000000]);
+        expect(orchestrator.contextOptions, [256000, 512000, 900000, 1000000]);
 
         final claudeOpus = AntigravityModels.of('claude-opus-5-5')!;
         expect(claudeOpus.effortLevels, ['low', 'medium', 'high']);
-        expect(claudeOpus.contextOptions, [200000, 400000, 1000000]);
-        expect(claudeOpus.defaultContext, 200000);
+        expect(claudeOpus.contextOptions, [256000, 512000, 900000, 1000000]);
+        expect(claudeOpus.defaultContext, 1000000);
 
         final gptOss = AntigravityModels.of('gpt-oss-120b')!;
         expect(gptOss.effortLevels, isEmpty);
@@ -110,8 +120,8 @@ void main() {
     });
 
     test(
-      'ClaudeCodeKernel exposes context window and effort submenus per Antigravity model',
-      () {
+      'ClaudeCodeKernel exposes agy 1.5.10 context windows and emits UsageReported immediately on switch',
+      () async {
         final previousCore = ClaudeCore.current;
         ClaudeCore.current = () => ClaudeCore.antigravity;
         addTearDown(() => ClaudeCore.current = previousCore);
@@ -130,6 +140,8 @@ void main() {
             cwd: '/tmp',
             settings: {
               'model': '@antigravity-cli/gemini-4-carbon-medium',
+              // Legacy 400K setting migrates to agy 1.5.10's 512K automatically.
+              'context@@antigravity-cli/gemini-4-hydrogen': '400000',
             },
           ),
           providers: providers,
@@ -137,16 +149,32 @@ void main() {
         );
         addTearDown(kernel.dispose);
 
+        final reported = <UsageReported>[];
+        final sub = kernel.events.listen((event) {
+          if (event is UsageReported) reported.add(event);
+        });
+        addTearDown(sub.cancel);
+
         // Legacy variant ID normalized to canonical family ref + preserved effort.
         expect(kernel.model.selected, '@antigravity-cli/gemini-4-carbon');
         expect(kernel.effort.selected, 'medium');
         expect(kernel.contextSize.selected, '1000000');
+        expect(
+          kernel.contextSize.selectedFor('@antigravity-cli/gemini-4-hydrogen'),
+          '512000',
+        );
 
         final carbonContexts = kernel.contextSize
             .optionsFor('@antigravity-cli/gemini-4-carbon')
             .map((o) => o.label)
             .toList();
-        expect(carbonContexts, ['200K', '400K', '1M']);
+        expect(carbonContexts, ['256K', '512K', '900K', '1M']);
+
+        final argonContexts = kernel.contextSize
+            .optionsFor('@antigravity-cli/gemini-4-argon')
+            .map((o) => o.label)
+            .toList();
+        expect(argonContexts, ['256K', '512K', '900K']);
 
         final gptContexts = kernel.contextSize
             .optionsFor('@antigravity-cli/gpt-oss-120b')
@@ -164,14 +192,89 @@ void main() {
             .toList();
         expect(hydrogenEfforts, ['low', 'medium', 'high', 'xhigh']);
 
-        // Switching context window updates selected context immediately.
+        // Switching context window updates selected context & emits UsageReported immediately.
         kernel.contextSize.select(
           '@antigravity-cli/gemini-4-carbon',
-          '400000',
+          '512000',
         );
-        expect(kernel.contextSize.selected, '400000');
+        await Future<void>.delayed(Duration.zero);
+        expect(kernel.contextSize.selected, '512000');
+        expect(kernel.contextWindow, 512000);
+        expect(reported, isNotEmpty);
+        expect(reported.last.usage.window, 512000);
       },
     );
+  });
+
+  group('AntigravityTransport CLI flags, context env & usage accuracy', () {
+    test('buildCliArguments and buildProcessEnvironment pass native agy settings', () {
+      final argonArgs = AntigravityTransport.buildCliArguments(
+        model: 'gemini-4-argon',
+        effort: 'high',
+        permissionMode: 'default',
+        maxContextTokens: 512000,
+        conversationId: 'conv-123',
+      );
+      expect(argonArgs, contains('--settings={"contextWindow":"512K"}'));
+      expect(argonArgs, contains('--model=gemini-4-argon'));
+      expect(argonArgs, contains('--effort=high'));
+
+      final argonEnv = AntigravityTransport.buildProcessEnvironment(
+        baseEnvironment: const {'PATH': '/usr/bin'},
+        model: 'gemini-4-argon',
+        maxContextTokens: 512000,
+      );
+      expect(argonEnv.containsKey('AGY_CLI_AUTO_COMPACT_OVERRIDE'), isFalse);
+
+      final hydrogen512Env = AntigravityTransport.buildProcessEnvironment(
+        baseEnvironment: const {'PATH': '/usr/bin'},
+        model: 'gemini-4-hydrogen',
+        maxContextTokens: 512000,
+      );
+      expect(hydrogen512Env['AGY_CLI_AUTO_COMPACT_OVERRIDE'], '512000');
+
+      final hydrogen1mEnv = AntigravityTransport.buildProcessEnvironment(
+        baseEnvironment: const {
+          'PATH': '/usr/bin',
+          'AGY_CLI_AUTO_COMPACT_OVERRIDE': '512000',
+        },
+        model: 'gemini-4-hydrogen',
+        maxContextTokens: 1000000,
+      );
+      expect(
+        hydrogen1mEnv.containsKey('AGY_CLI_AUTO_COMPACT_OVERRIDE'),
+        isFalse,
+      );
+    });
+
+    test('convertAgyUsage separates uncached input from cache_read_tokens', () {
+      final converted = AntigravityTransport.convertAgyUsage(const {
+        'input_tokens': 148793,
+        'output_tokens': 2811,
+        'thinking_tokens': 412,
+        'cache_read_tokens': 144783,
+        'total_tokens': 151604,
+      });
+      expect(converted, isNotNull);
+      expect(converted!.contextTokens, 151604);
+      expect(converted.usage['input_tokens'], 4010);
+      expect(converted.usage['cache_read_input_tokens'], 144783);
+      expect(converted.usage['output_tokens'], 2811);
+    });
+
+    test('buildContextCategories maps cleanly to ContextUsagePanel parts', () {
+      final cats = AntigravityTransport.buildContextCategories(151604, 512000);
+      expect(cats.length, 4);
+      expect(ContextUsagePanel.partOf('${cats[0]['name']}'), 'system');
+      expect(ContextUsagePanel.partOf('${cats[1]['name']}'), 'tools');
+      expect(ContextUsagePanel.partOf('${cats[2]['name']}'), 'messages');
+      final usedSum =
+          (cats[0]['tokens'] as int) +
+          (cats[1]['tokens'] as int) +
+          (cats[2]['tokens'] as int);
+      expect(usedSum, 151604);
+      expect(cats[3]['tokens'], 512000 - 151604);
+    });
   });
 
   group('AntigravityTransport tool mapping & normalization', () {

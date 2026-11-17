@@ -23,6 +23,7 @@ import '../../usage/usage_ledger.dart';
 import '../../workspace/editor_launcher.dart' show openExternal;
 import '../agent_kernel.dart';
 import '../antigravity/antigravity_cli.dart';
+import '../antigravity/antigravity_transport.dart' show AntigravityTransport;
 import '../commit_attribution.dart';
 import '../extension_switches.dart';
 import '../kernel_event.dart';
@@ -183,7 +184,11 @@ class ClaudeCodeKernel
         _pickedEfforts[key.substring(efforts.length)] = value;
       } else if (key.startsWith(contexts)) {
         if (parseTokens(value) case final tokens? when tokens > 0) {
-          _pickedWindows[key.substring(contexts.length)] = tokens;
+          final targetModel = key.substring(contexts.length);
+          final agy = AntigravityModels.of(targetModel);
+          _pickedWindows[targetModel] = agy != null
+              ? agy.resolveContextWindow(tokens)
+              : tokens;
         }
       } else if (key.startsWith(speeds)) {
         _pickedFast[key.substring(speeds.length)] = value == 'fast';
@@ -197,8 +202,8 @@ class ClaudeCodeKernel
       if (_effort != null) {
         _pickedEfforts.putIfAbsent(ref, () => _effort!);
       }
-      if (_window case final w? when agy.contextOptions.contains(w)) {
-        _pickedWindows.putIfAbsent(ref, () => w);
+      if (_window case final w? when w > 0) {
+        _pickedWindows.putIfAbsent(ref, () => agy.resolveContextWindow(w));
       }
       _contextWindow = _agyWindowFor(agy, ref);
       _contextReported = true;
@@ -2826,7 +2831,35 @@ class ClaudeCodeKernel
   /// counted them, scaled to that. Nothing before the CLI has counted.
   void _reportContext() {
     final counted = _counted;
-    if (counted == null) return;
+    if (counted == null) {
+      if (!AntigravityModels.isAntigravityModel(_model)) return;
+      final used = _toldContext ?? 0;
+      final categories = AntigravityTransport.buildContextCategories(
+        used,
+        _contextWindow,
+      );
+      emit(
+        UsageReported(
+          nextSeq,
+          ContextUsage(
+            window: _contextWindow,
+            used: used,
+            segments: [
+              for (final raw in categories)
+                ContextSegment(
+                  '${raw['name']}',
+                  raw['tokens'] as int,
+                  kind: raw['kind'] == 'free'
+                      ? ContextKind.free
+                      : ContextKind.used,
+                ),
+            ],
+            detail: _shownDetail,
+          ),
+        ),
+      );
+      return;
+    }
     final used = _toldContext ?? counted.total;
     final scale = counted.total > 0 ? used / counted.total : 1.0;
     final kept = counted.segments
@@ -2838,23 +2871,24 @@ class ClaudeCodeKernel
         ContextUsage(
           window: _contextWindow,
           used: used,
-          segments: scale == 1
-              ? counted.segments
-              : [
-                  for (final s in counted.segments)
-                    switch (s.kind) {
-                      ContextKind.used => ContextSegment(
-                        s.label,
-                        (s.tokens * scale).round(),
-                      ),
-                      ContextKind.free => ContextSegment(
-                        s.label,
-                        math.max(0, _contextWindow - used - kept),
-                        kind: ContextKind.free,
-                      ),
-                      _ => s,
-                    },
-                ],
+          segments: [
+            for (final s in counted.segments)
+              switch (s.kind) {
+                ContextKind.used =>
+                  scale == 1
+                      ? s
+                      : ContextSegment(
+                          s.label,
+                          (s.tokens * scale).round(),
+                        ),
+                ContextKind.free => ContextSegment(
+                  s.label,
+                  math.max(0, _contextWindow - used - kept),
+                  kind: ContextKind.free,
+                ),
+                _ => s,
+              },
+          ],
           detail: _shownDetail,
         ),
       ),
@@ -3033,6 +3067,26 @@ class ClaudeCodeKernel
       }
       _readHead = _translator.head;
       _translator.endReplay();
+      if (AntigravityModels.isAntigravityModel(_model)) {
+        final brain = AntigravityTransport.readBrainContextTokens(session.id);
+        if (brain != null && brain.contextTokens > 0) {
+          _toldContext = brain.contextTokens;
+          if (!counted) {
+            final reqId = 'agy-brain-${session.id}';
+            _lastRequest = reqId;
+            _lastModel = _model;
+            if (brain.cacheReadTokens > 0) {
+              _cachingModels.add(_model);
+            }
+            _requests[reqId] = CacheTokens(
+              read: brain.cacheReadTokens,
+              written: 0,
+              uncached: math.max(0, brain.inputTokens - brain.cacheReadTokens),
+            );
+            counted = true;
+          }
+        }
+      }
       if (counted) _reportStats();
       _reportContext();
     } on Object catch (error) {
@@ -3377,6 +3431,7 @@ class ClaudeCodeKernel
           },
         ),
       ]);
+      _reportContext();
       emitInfoChanged();
       return;
     }
@@ -3488,10 +3543,7 @@ class ClaudeCodeKernel
   };
 
   int _agyWindowFor(AntigravityModel agy, String ref) =>
-      switch (_pickedWindows[ref]) {
-        final picked? when agy.contextOptions.contains(picked) => picked,
-        _ => agy.defaultContext,
-      };
+      agy.resolveContextWindow(_pickedWindows[ref]);
 
   String? _agyEffortFor(
     AntigravityModel agy,
@@ -3642,11 +3694,7 @@ class ClaudeCodeKernel
               '$tokens',
               formatTokens(tokens),
               Icons.notes_rounded,
-              tokens == agy.defaultContext
-                  ? '默认窗口'
-                  : tokens < agy.defaultContext
-                  ? '提前自动压缩，降低延迟与上下文衰减'
-                  : '超长上下文窗口',
+              agy.contextOptionDescription(tokens),
             ),
         ];
       }
@@ -3709,8 +3757,9 @@ class ClaudeCodeKernel
         return;
       }
       if (AntigravityModels.of(model) case final agy?) {
-        final tokens = parseTokens(id);
-        if (tokens == null || !agy.contextOptions.contains(tokens)) return;
+        final rawTokens = parseTokens(id);
+        if (rawTokens == null || rawTokens <= 0) return;
+        final tokens = agy.resolveContextWindow(rawTokens);
         final ref = modelRef(antigravityBuiltinProviderId, agy.id);
         _window = _pickedWindows[ref] = tokens;
         _contextWindow = tokens;
@@ -3727,6 +3776,7 @@ class ClaudeCodeKernel
               },
             ),
           ]);
+          _reportContext();
           emitInfoChanged();
         }
         return;

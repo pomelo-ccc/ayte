@@ -30,6 +30,13 @@ abstract final class AntigravityPathSetting {
 /// Canonical reasoning effort tiers supported by `agy --effort`.
 const antigravityEffortOrder = ['low', 'medium', 'high', 'xhigh', 'max'];
 
+/// Native preset context window choices defined by `agy` (`ParsePresetContextWindow`).
+const antigravityPresetContextChoices = <int, String>{
+  256000: '256K',
+  512000: '512K',
+  900000: '900K',
+};
+
 /// A deduplicated model family offered by Antigravity CLI (`agy`).
 class AntigravityModel {
   const AntigravityModel({
@@ -39,8 +46,9 @@ class AntigravityModel {
     this.description = '',
     this.effortLevels = const [],
     this.defaultEffort,
-    this.contextOptions = const [200000, 400000, 1000000],
+    this.contextOptions = const [256000, 512000, 900000, 1000000],
     this.defaultContext = 1000000,
+    this.supportsPresetContextWindow = false,
   });
 
   /// Canonical family id (e.g. `gemini-4-carbon`, `claude-opus-5-5`).
@@ -68,7 +76,49 @@ class AntigravityModel {
   /// Default context window capacity (in tokens).
   final int defaultContext;
 
+  /// Whether `agy` natively switches this model's server preset window via
+  /// `--settings={"contextWindow":"256K"|"512K"|"900K"}` (`offersContextWindow`).
+  final bool supportsPresetContextWindow;
+
   String get effectiveCliModel => cliModelId ?? id;
+
+  /// Resolves [candidate] to a valid option in [contextOptions], snapping
+  /// legacy values (such as `200000` or `400000`) to the closest `agy` option.
+  int resolveContextWindow(int? candidate) {
+    if (contextOptions.isEmpty) return defaultContext;
+    if (candidate == null || candidate <= 0) return defaultContext;
+    if (contextOptions.contains(candidate)) return candidate;
+    var best = contextOptions.first;
+    var bestDiff = (candidate - best).abs();
+    for (final option in contextOptions.skip(1)) {
+      final diff = (candidate - option).abs();
+      if (diff < bestDiff || (diff == bestDiff && option > best)) {
+        best = option;
+        bestDiff = diff;
+      }
+    }
+    return best;
+  }
+
+  /// Human-readable description for a selectable context window option.
+  String contextOptionDescription(int tokens) {
+    if (supportsPresetContextWindow) {
+      return switch (tokens) {
+        256000 => '默认窗口 · 1x 配额倍率',
+        512000 => '扩展窗口 · 1.3x 配额倍率',
+        900000 => '超长窗口 · 1.8x 配额倍率',
+        _ => tokens == defaultContext ? '默认窗口' : '扩展上下文窗口',
+      };
+    }
+    if (tokens == defaultContext) return '默认完整窗口';
+    return switch (tokens) {
+      64000 => '64K 自动压缩阈值',
+      256000 => '256K 自动压缩阈值',
+      512000 => '512K 自动压缩阈值',
+      900000 => '900K 自动压缩阈值',
+      _ => tokens < defaultContext ? '提前自动压缩，降低长对话延迟' : '超长上下文窗口',
+    };
+  }
 }
 
 /// Built-in and dynamically queried model families of Antigravity CLI (`agy`).
@@ -80,17 +130,18 @@ abstract final class AntigravityModels {
       description: '1M context · Frontier deep reasoning',
       effortLevels: ['low', 'medium', 'high'],
       defaultEffort: 'high',
-      contextOptions: [200000, 400000, 1000000],
+      contextOptions: [256000, 512000, 900000, 1000000],
       defaultContext: 1000000,
     ),
     AntigravityModel(
       id: 'gemini-4-argon',
       label: 'Gemini 4 Argon',
-      description: '1M context · Frontier reasoning & coding',
+      description: '256K–900K context · Frontier reasoning & coding',
       effortLevels: ['low', 'medium', 'high'],
       defaultEffort: 'high',
-      contextOptions: [200000, 400000, 1000000],
-      defaultContext: 1000000,
+      contextOptions: [256000, 512000, 900000],
+      defaultContext: 256000,
+      supportsPresetContextWindow: true,
     ),
     AntigravityModel(
       id: 'gemini-4-hydrogen',
@@ -98,21 +149,21 @@ abstract final class AntigravityModels {
       description: '1M context · High-speed agentic engine',
       effortLevels: ['low', 'medium', 'high', 'xhigh'],
       defaultEffort: 'high',
-      contextOptions: [200000, 400000, 1000000],
+      contextOptions: [256000, 512000, 900000, 1000000],
       defaultContext: 1000000,
     ),
     AntigravityModel(
       id: 'gemini-pro-orchestrator',
       label: 'Orchestrator (Carbon)',
       description: '1M context · Carbon planner + Hydrogen executor',
-      contextOptions: [200000, 400000, 1000000],
+      contextOptions: [256000, 512000, 900000, 1000000],
       defaultContext: 1000000,
     ),
     AntigravityModel(
       id: 'gemini-pro-orchestrator-argon',
       label: 'Orchestrator (Argon)',
       description: '1M context · Argon planner + Hydrogen executor',
-      contextOptions: [200000, 400000, 1000000],
+      contextOptions: [256000, 512000, 900000, 1000000],
       defaultContext: 1000000,
     ),
     AntigravityModel(
@@ -121,26 +172,26 @@ abstract final class AntigravityModels {
       description: '1M context · Low-latency coding & sub-tasks',
       effortLevels: ['low', 'medium', 'high'],
       defaultEffort: 'high',
-      contextOptions: [200000, 400000, 1000000],
+      contextOptions: [256000, 512000, 900000, 1000000],
       defaultContext: 1000000,
     ),
     AntigravityModel(
       id: 'claude-opus-5-5',
       label: 'Claude Opus 5.5',
-      description: 'Up to 1M context · Anthropic flagship reasoning',
+      description: '1M context · Anthropic flagship reasoning',
       effortLevels: ['low', 'medium', 'high'],
       defaultEffort: 'high',
-      contextOptions: [200000, 400000, 1000000],
-      defaultContext: 200000,
+      contextOptions: [256000, 512000, 900000, 1000000],
+      defaultContext: 1000000,
     ),
     AntigravityModel(
       id: 'claude-sonnet-5-5',
       label: 'Claude Sonnet 5.5',
-      description: 'Up to 1M context · Balanced Anthropic coding model',
+      description: '1M context · Balanced Anthropic coding model',
       effortLevels: ['low', 'medium', 'high'],
       defaultEffort: 'medium',
-      contextOptions: [200000, 400000, 1000000],
-      defaultContext: 200000,
+      contextOptions: [256000, 512000, 900000, 1000000],
+      defaultContext: 1000000,
     ),
     AntigravityModel(
       id: 'gpt-oss-120b',
@@ -245,8 +296,18 @@ abstract final class AntigravityModels {
     return of(modelId)?.label ?? bareModelId(modelId);
   }
 
+  /// Returns the canonical `agy` `--settings` `contextWindow` string (`"256K"`,
+  /// `"512K"`, or `"900K"`) when [tokens] matches a preset window.
+  static String? presetContextWindowName(int tokens) =>
+      antigravityPresetContextChoices[tokens];
+
   /// Context window presets inferred for a dynamically discovered model family.
-  static ({List<int> options, int defaultContext, String summary})
+  static ({
+    List<int> options,
+    int defaultContext,
+    String summary,
+    bool supportsPreset,
+  })
   _contextProfileFor(String familyId) {
     final lower = familyId.toLowerCase();
     if (lower.startsWith('gpt-oss')) {
@@ -254,19 +315,30 @@ abstract final class AntigravityModels {
         options: const [64000, 128000],
         defaultContext: 128000,
         summary: '128K context · Open-weight model',
+        supportsPreset: false,
+      );
+    }
+    if (lower == 'gemini-4-argon') {
+      return (
+        options: const [256000, 512000, 900000],
+        defaultContext: 256000,
+        summary: '256K–900K context · Google Antigravity',
+        supportsPreset: true,
       );
     }
     if (lower.startsWith('claude-')) {
       return (
-        options: const [200000, 400000, 1000000],
-        defaultContext: 200000,
-        summary: 'Up to 1M context · Anthropic coding model',
+        options: const [256000, 512000, 900000, 1000000],
+        defaultContext: 1000000,
+        summary: '1M context · Anthropic coding model',
+        supportsPreset: false,
       );
     }
     return (
-      options: const [200000, 400000, 1000000],
+      options: const [256000, 512000, 900000, 1000000],
       defaultContext: 1000000,
       summary: '1M context · Google Antigravity',
+      supportsPreset: false,
     );
   }
 
@@ -339,6 +411,8 @@ abstract final class AntigravityModels {
           defaultEffort: defaultEffort,
           contextOptions: preset?.contextOptions ?? profile.options,
           defaultContext: preset?.defaultContext ?? profile.defaultContext,
+          supportsPresetContextWindow:
+              preset?.supportsPresetContextWindow ?? profile.supportsPreset,
         ),
       );
     }
