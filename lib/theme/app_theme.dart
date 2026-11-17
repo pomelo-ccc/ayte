@@ -168,10 +168,25 @@ abstract final class AppColors {
   /// `textPreformat.foreground`.
   static Color get inlineCode => _colors['textPreformat.foreground'];
 
-  /// `textPreformat.background`. See-through in the default themes: a
-  /// selection is painted under the text, and shows through it as on the
-  /// web.
-  static Color get inlineCodeBackground => _colors['textPreformat.background'];
+  /// `textPreformat.background`, with a guaranteed muted pill contrast against
+  /// `editor.background` (matching Antigravity's `bg-muted` inline code pill)
+  /// when a theme's own `textPreformat.background` is nearly indistinguishable
+  /// from the conversation surface.
+  static Color get inlineCodeBackground {
+    final colors = _colors;
+    final raw = colors['textPreformat.background'];
+    final surface = colors['editor.background'];
+    final over = Color.alphaBlend(raw, surface).computeLuminance();
+    final under = surface.computeLuminance();
+    final (light, dark) = over > under ? (over, under) : (under, over);
+    if ((light + 0.05) / (dark + 0.05) >= 1.10) return raw;
+    final fg = colors['editor.foreground'].withValues(alpha: 1);
+    return Color.lerp(
+      surface.withValues(alpha: 1),
+      fg,
+      colors.dark ? 0.095 : 0.065,
+    )!;
+  }
 
   /// Selected text's background: `editor.selectionBackground`, see-through
   /// (see [seeThroughSelection]), for editors that may paint it over the
