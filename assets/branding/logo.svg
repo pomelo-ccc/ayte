@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="290 235 444 530" fill="none">
+  <defs>
+    <linearGradient id="bar1" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#60A5FA" />
+      <stop offset="48%" stop-color="#3B82F6" />
+      <stop offset="100%" stop-color="#1D4ED8" />
+    </linearGradient>
+    <linearGradient id="bar2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FF944D" />
+      <stop offset="42%" stop-color="#F96B16" />
+      <stop offset="78%" stop-color="#EA580C" />
+      <stop offset="100%" stop-color="#B93808" />
+    </linearGradient>
+    <linearGradient id="bar3" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="45%" stop-color="#2563EB" />
+      <stop offset="100%" stop-color="#1E3A8A" />
+    </linearGradient>
+    <linearGradient id="bar4" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="50%" stop-color="#2563EB" />
+      <stop offset="100%" stop-color="#1D4ED8" />
+    </linearGradient>
+  </defs>
+  <rect x="303" y="428.5" width="62" height="215" rx="31" fill="url(#bar1)" />
+  <rect x="419" y="247" width="66" height="462" rx="33" fill="url(#bar2)" />
+  <rect x="539" y="395" width="62" height="278" rx="31" fill="url(#bar3)" />
+  <rect x="657" y="296" width="62" height="376" rx="31" fill="url(#bar4)" />
+</svg>

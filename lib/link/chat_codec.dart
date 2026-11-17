@@ -1,0 +1,571 @@
+import 'dart:convert';
+
+import '../chat/chat_models.dart';
+import '../chat/reply_suggestions.dart';
+import '../chat/session_links.dart' show isSessionTool, sessionIdsOf;
+
+/// The history's items as JSON, for the phones paired with the desktop
+/// (see `package:bao_link`). The phone has this file as it is (its
+/// lib/link/chat_codec.dart), over its copy of chat_models.dart.
+abstract final class ChatCodec {
+  /// What a tool's or a command's output keeps, at most: the phone shows it
+  /// on demand, and a build's log would weigh on every update.
+  static const maxOutput = 64 * 1024;
+
+  // --- Bots ------------------------------------------------------------------
+
+  /// The tag the app's messages to a bot are wrapped in: what happened to
+  /// the user's agents, for it to tell of. Not the user's words: shown as
+  /// a note.
+  static const botEventTag = 'bao-event';
+
+  /// The bot's tool that sends a picture: a file's, which it answers with
+  /// (the item's images), or one on the web (its input's `url`).
+  static const botImageTool = 'bot_send_image';
+
+  /// The bots' tool to send a message where they are not answering: to
+  /// the user in private ([botToUser]), or to a group.
+  static const botSendTool = 'bot_send';
+  static const botToUser = 'private';
+
+  /// What [item] sent the user in private, if it is a bot's message so
+  /// ([botSendTool]), sent: its words; empty for pictures alone (in its
+  /// images).
+  static String? botSentToUser(ChatItem item) => switch (item) {
+    ToolCallItem(
+      tool: botSendTool,
+      :final input,
+      :final images,
+      status: ToolStatus.succeeded,
+    )
+        when input['to'] == botToUser =>
+      switch (input['text']) {
+        final String text when text.trim().isNotEmpty => text.trim(),
+        // Pictures alone.
+        _ when images.isNotEmpty => '',
+        _ => null,
+      },
+    _ => null,
+  };
+
+  /// The tag a bot wraps each message of its reply in: what it says to the
+  /// user. What it writes outside them is not for the user.
+  static const botSayTag = 'bot_say';
+
+  /// The tag a bot wraps narration in: what it does or what goes on, told
+  /// beside its messages, not said to the user.
+  static const botNarrateTag = 'bot_narrate';
+
+  /// The tag a bot wraps one of the user's agents' ids in, to show it in
+  /// its chat as a card that opens it.
+  static const botCardTag = 'bot_show_chat';
+
+  /// The tag a bot that has a group's conversation wraps the name of the
+  /// one it passes it to in.
+  static const botNextTag = 'bot_next';
+
+  /// Whom a bot's reply [text] passes a group's conversation to
+  /// ([botNextTag]): the last it names, if it does.
+  static String? botNext(String text) => switch (RegExp(
+    '<$botNextTag>(.*?)</$botNextTag>',
+    dotAll: true,
+  ).allMatches(text).lastOrNull?[1]?.trim()) {
+    final name? when name.isNotEmpty => name,
+    _ => null,
+  };
+
+  /// The tag a bot wraps each of what the user might say next in, at the
+  /// end of its reply, when they turned that on: a tap away from sent.
+  static const botSuggestTag = 'bot_suggest';
+
+  /// What the app told a bot in [item], if it is such a note.
+  static String? botEvent(UserMessageItem item) {
+    // The pictures that came with it referred to after it, if they are.
+    final text = item.text.replaceAll(imageReferencePattern, '').trim();
+    const open = '<$botEventTag>', close = '</$botEventTag>';
+    if (!text.startsWith(open) || !text.endsWith(close)) return null;
+    return text.substring(open.length, text.length - close.length).trim();
+  }
+
+  /// The group chat a note of the app's to a bot ([botEvent]) is from: its
+  /// first line `[group <id>] …`. None for one of its own chat's.
+  static String? botGroupOf(UserMessageItem item) => switch (botEvent(item)) {
+    final event? => _botGroup.firstMatch(event)?.group(1),
+    null => null,
+  };
+
+  static final _botGroup = RegExp(r'^\[group ([\w-]+)\]');
+
+  /// The first line of a note of the app's to a bot from [group]'s chat.
+  static String botGroupLine(String group) => '[group $group]';
+
+  /// Where each of a bot's conversation's [items] is: its group chats' ids
+  /// for those of a turn of theirs (from a note of a group's, till a
+  /// message of the user's or a note of its own chat's), null for its own
+  /// chat's. One bot, one conversation: what it says goes where the last
+  /// it heard came from.
+  static List<String?> botPlaces(Iterable<ChatItem> items) {
+    String? place;
+    return [
+      for (final item in items)
+        if (item is UserMessageItem)
+          place = botGroupOf(item)
+        // Sent the user from a group's turn: theirs.
+        else if (botSentToUser(item) != null)
+          null
+        else
+          place,
+    ];
+  }
+
+  /// [text] (a message of the user's to a bot) without the app's notes
+  /// in it: taken up with one, the two are one message.
+  static String withoutBotEvents(String text) =>
+      text.replaceAll(_botEvents, '').trim();
+
+  static final _botEvents = RegExp(
+    '<$botEventTag>.*?</$botEventTag>',
+    dotAll: true,
+  );
+
+  /// The messages a bot's reply [text] has, in order: each `<bot_say>`'s,
+  /// once closed (one still being written shows when it is whole), as
+  /// they show ([withoutVoiceCues]).
+  static List<String> botSays(String text) => [
+    for (final (tag, said) in botParts(text))
+      if (tag == botSayTag)
+        if (withoutVoiceCues(said) case final shown when shown.isNotEmpty)
+          shown,
+  ];
+
+  /// How a bot's words sound, where it said: `[whispers]`, `[laughs]`, in
+  /// its messages and narration. For them read aloud; not shown.
+  static final voiceCue = RegExp(r"\[[a-z][a-z ,'-]{0,30}\]");
+
+  /// [text] (a bot's message, its narration) as it shows: without its
+  /// [voiceCue]s.
+  static String withoutVoiceCues(String text) => text
+      .replaceAll(voiceCue, '')
+      .replaceAll(RegExp(r'[ \t]{2,}'), ' ')
+      .trim();
+
+  /// What a bot's reply [text] shows, in order, each once closed: its
+  /// messages ([botSayTag]), its narration ([botNarrateTag]) and the
+  /// agents it shows ([botCardTag], their ids). Its [voiceCue]s kept.
+  static List<(String tag, String text)> botParts(String text) => [
+    for (final (:tag, :text, ref: _) in botPartsOf(text)) (tag, text),
+  ];
+
+  /// [botParts], each with the message of its group's it answers, if it
+  /// says: `<bot_say ref="74">` ([botRefAttribute]), its number.
+  static List<({String tag, String text, int? ref})> botPartsOf(
+    String text,
+  ) => [
+    for (final match in _botParts.allMatches(text))
+      if (match[3]!.trim() case final part when part.isNotEmpty)
+        (
+          tag: match[1]!,
+          text: part,
+          ref: int.tryParse(_botRef.firstMatch(match[2] ?? '')?.group(1) ?? ''),
+        ),
+  ];
+
+  /// What a bot's message in a group answers, its number there:
+  /// `<bot_say ref="74">`.
+  static const botRefAttribute = 'ref';
+
+  static final _botParts = RegExp(
+    '<($botSayTag|$botNarrateTag|$botCardTag)((?:\\s+[a-z]+="[^"]*")*)\\s*>'
+    '(.*?)</\\1>',
+    dotAll: true,
+  );
+
+  static final _botRef = RegExp('$botRefAttribute="\\s*#?(\\d+)\\s*"');
+
+  /// What a bot's reply [text] suggests the user say next
+  /// ([botSuggestTag]), each once closed: not among what it shows.
+  static List<String> botSuggestions(String text) => [
+    for (final match in _botSuggestions.allMatches(text))
+      if (match[1]!.trim() case final said when said.isNotEmpty) said,
+  ];
+
+  static final _botSuggestions = RegExp(
+    '<$botSuggestTag>(.*?)</$botSuggestTag>',
+    dotAll: true,
+  );
+
+  /// Whether [item] is something a bot sent into its chat with its tools:
+  /// a picture (one being made too). Its messages and cards are in its
+  /// texts (see [botParts]).
+  static bool botSent(ChatItem item) =>
+      botSentToUser(item) != null ||
+      item is ToolCallItem &&
+          item.status != ToolStatus.failed &&
+          (botImageUrl(item) != null ||
+              item.kind == ToolKind.image ||
+              item.images.isNotEmpty);
+
+  /// The picture on the web [item] sent, if it is the bot's tool that did.
+  static String? botImageUrl(ToolCallItem item) =>
+      switch (_botInput(item, botImageTool, 'url')) {
+        final String url
+            when item.status != ToolStatus.failed &&
+                (url.startsWith('https://') || url.startsWith('http://')) =>
+          url,
+        _ => null,
+      };
+
+  static String? _botInput(ToolCallItem item, String tool, String key) =>
+      switch (item) {
+        ToolCallItem(tool: final named, :final input) when named == tool =>
+          switch (input[key]) {
+            final String value when value.isNotEmpty => value,
+            _ => null,
+          },
+        _ => null,
+      };
+
+  /// What the user's message says when it is a sticker: [id]'s (its
+  /// picture goes with it).
+  static String stickerText(String id) => '[Sticker: $id]';
+
+  /// The sticker a message of the user's ([text], its pictures' references
+  /// aside) is, if it is one.
+  static String? sticker(String text) => _stickerText.firstMatch(
+    text.replaceAll(imageReferencePattern, '').trim(),
+  )?[1];
+
+  static final _stickerText = RegExp(r'^\[Sticker: ([\w-]+)\]$');
+
+  /// [item] for a phone; [session] gives a conversation's id as the phone
+  /// knows it, for one that sent or was handed work ([SessionTools] ids).
+  static Map<String, Object?> encode(
+    ChatItem item, {
+    String Function(String id) session = _same,
+  }) => switch (item) {
+    UserMessageItem() => {
+      't': 'user',
+      'text': item.text,
+      if (item.queued) 'queued': true,
+      if (item.images.isNotEmpty) 'images': _images(item.images),
+      'worked': ?item.worked?.inMilliseconds,
+      if (item.stopped) 'stopped': true,
+      'at': ?item.sentAt?.millisecondsSinceEpoch,
+      'agent': ?item.fromAgent,
+      'agentSession': ?switch (item.fromSession) {
+        final id? => session(id),
+        null => null,
+      },
+      if (item.usage case final usage?)
+        'usage': {
+          'in': ?usage.inputTokens,
+          'out': ?usage.outputTokens,
+          'speed': ?usage.tokensPerSecond,
+          'cost': ?usage.costUsd,
+        },
+    },
+    // Without the suggestions in it: a phone's app before them would show
+    // their tags.
+    AssistantTextItem(:final text, :final suggestions) => {
+      't': 'text',
+      'text': text,
+      if (suggestions.isNotEmpty) 'suggest': suggestions,
+    },
+    ThinkingItem() => {
+      't': 'thinking',
+      'text': item.text,
+      'tokens': item.tokens,
+      'seconds': ?item.seconds,
+      'startedAt': ?item.startedAt?.millisecondsSinceEpoch,
+    },
+    ToolCallItem() => {
+      't': 'tool',
+      'kind': item.kind.name,
+      'target': item.target,
+      'detail': ?item.detail,
+      'path': ?item.path,
+      if (item.results.isNotEmpty) 'results': item.results,
+      'label': ?item.label,
+      'status': item.status.name,
+      'output': ?_head(item.output),
+      'tool': ?item.tool,
+      // The conversations a step of coordinating is about, and what was
+      // handed them, for its line to name and open them.
+      if (isSessionTool(item.tool)) ...{
+        'sessions': [for (final id in sessionIdsOf(item)) session(id)],
+        'handed': ?switch (item.input['text']) {
+          final String text when text.trim().isNotEmpty => _head(text.trim()),
+          _ => null,
+        },
+      },
+      'url': ?botImageUrl(item),
+      'sent': ?botSentToUser(item),
+      // What a browser's call does, for its line to say.
+      if (item.kind == ToolKind.browser)
+        'browse': {
+          'action': ?(item.input['action'] as String?),
+          if (item.input['url'] != null) 'url': true,
+        },
+      // The pictures it returned (an image model's, a file read), but for
+      // a failed call's.
+      if (item.images.isNotEmpty && item.status != ToolStatus.failed)
+        'images': _images(item.images),
+      // Pictures under way: how many, and of what shape, for their places
+      // to show as big as they will be; once its input has come.
+      if (item.kind == ToolKind.image && item.input.containsKey('prompt'))
+        'making': {
+          'count': switch (item.input['count']) {
+            final num count => count.toInt().clamp(1, 4),
+            _ => 1,
+          },
+          'size': ?(item.input['size'] as String?),
+          'aspect': ?(item.input['aspect_ratio'] as String?),
+        },
+    },
+    AgentItem() => {
+      't': 'agent',
+      'description': item.description,
+      'id': ?item.id,
+      'agentType': ?item.agentType,
+      'prompt': ?item.prompt,
+      'status': item.status.name,
+      'tokens': ?item.tokens,
+      'toolUses': ?item.toolUses,
+      'lastTool': ?item.lastTool,
+      'activity': ?item.activity,
+      'startedAt': ?item.startedAt?.millisecondsSinceEpoch,
+      'duration': ?item.duration?.inMilliseconds,
+      'ranBefore': ?item.ranBefore?.inMilliseconds,
+      'model': ?item.model,
+      if (item.children.isNotEmpty)
+        'children': [
+          for (final child in item.children) encode(child, session: session),
+        ],
+      'result': ?item.result,
+      if (item.background) 'background': true,
+    },
+    NoticeItem() => {'t': 'notice', 'kind': item.kind.name, 'text': item.text},
+    PlanItem() => {
+      't': 'plan',
+      'path': item.path,
+      'round': item.round,
+      'title': ?item.title,
+      'text': ?item.text,
+      'status': item.status.name,
+      'writes': item.writes,
+      'feedback': ?item.feedback,
+    },
+    TerminalItem() => {
+      't': 'terminal',
+      'command': item.command,
+      'output': _tail(item.output),
+      'description': ?item.description,
+      'status': item.status.name,
+      if (item.background) 'background': true,
+      'startedAt': ?item.startedAt?.millisecondsSinceEpoch,
+    },
+    CodeDiffItem() => {
+      't': 'diff',
+      'fileName': item.fileName,
+      'directory': item.directory,
+      'lines': [
+        for (final line in item.lines)
+          [line.type.index, line.lineNumber, line.text],
+      ],
+      'added': item.added,
+      'removed': item.removed,
+    },
+    LiveStatusItem() => {
+      't': 'live',
+      'label': item.label,
+      if (item.whimsical) 'whimsical': true,
+      if (!item.visible) 'visible': false,
+      // For the phone's line of figures under it, as the footer's here.
+      'startedAt': ?item.startedAt?.millisecondsSinceEpoch,
+      'tokens': ?item.output?.tokens,
+      'speed': ?item.output?.tokensPerSecond,
+    },
+  };
+
+  /// The item [json] is; null for one of a kind this side does not know
+  /// (a newer desktop's).
+  static ChatItem? decode(Object? json) {
+    if (json is! Map<String, Object?>) return null;
+    String text(String key) => json[key] as String? ?? '';
+    String? optional(String key) => json[key] as String?;
+    int? number(String key) => (json[key] as num?)?.toInt();
+    DateTime? time(String key) => switch (number(key)) {
+      final ms? => DateTime.fromMillisecondsSinceEpoch(ms),
+      null => null,
+    };
+    Duration? duration(String key) => switch (number(key)) {
+      final ms? => Duration(milliseconds: ms),
+      null => null,
+    };
+    T named<T extends Enum>(List<T> values, String key, T fallback) =>
+        values.asNameMap()[json[key]] ?? fallback;
+    return switch (json['t']) {
+      'user' => UserMessageItem(
+        text: text('text'),
+        queued: json['queued'] == true,
+        images: _decodeImages(json['images']),
+        worked: duration('worked'),
+        stopped: json['stopped'] == true,
+        sentAt: time('at'),
+        fromAgent: json['agent'] as String?,
+        fromSession: json['agentSession'] as String?,
+        usage: switch (json['usage']) {
+          final Map<String, Object?> usage => TurnUsage(
+            inputTokens: (usage['in'] as num?)?.toInt(),
+            outputTokens: (usage['out'] as num?)?.toInt(),
+            tokensPerSecond: (usage['speed'] as num?)?.toDouble(),
+            costUsd: (usage['cost'] as num?)?.toDouble(),
+          ),
+          _ => null,
+        },
+      ),
+      'text' => AssistantTextItem(
+        ReplySuggestions.write(text('text'), [
+          for (final said in json['suggest'] as List? ?? const [])
+            if (said is String) said,
+        ]),
+      ),
+      'thinking' => ThinkingItem(
+        text: text('text'),
+        tokens: number('tokens') ?? 0,
+        seconds: number('seconds'),
+        startedAt: time('startedAt'),
+      ),
+      'tool' => ToolCallItem(
+        kind: named(ToolKind.values, 'kind', ToolKind.other),
+        target: text('target'),
+        detail: optional('detail'),
+        path: optional('path'),
+        results: [...?(json['results'] as List?)?.whereType<String>()],
+        label: optional('label'),
+        status: named(ToolStatus.values, 'status', ToolStatus.succeeded),
+        output: optional('output'),
+        tool: optional('tool'),
+        images: _decodeImages(json['images']),
+        input: switch ((json['making'], json['browse'])) {
+          _ when json['sticker'] is String => {'sticker': json['sticker']},
+          _ when json['url'] is String => {'url': json['url']},
+          _ when json['sent'] is String => {
+            'to': botToUser,
+            'text': json['sent'],
+          },
+          (final Map<String, Object?> making, _) => {
+            'prompt': '',
+            'count': ?making['count'],
+            'size': ?making['size'],
+            'aspect_ratio': ?making['aspect'],
+          },
+          (_, final Map<String, Object?> browse) => {
+            'action': ?browse['action'],
+            if (browse['url'] == true) 'url': '',
+          },
+          _ => const {},
+        },
+      ),
+      'agent' => AgentItem(
+        description: text('description'),
+        id: optional('id'),
+        agentType: optional('agentType'),
+        prompt: optional('prompt'),
+        status: named(CommandStatus.values, 'status', CommandStatus.running),
+        tokens: number('tokens'),
+        toolUses: number('toolUses'),
+        lastTool: optional('lastTool'),
+        activity: optional('activity'),
+        startedAt: time('startedAt'),
+        duration: duration('duration'),
+        model: optional('model'),
+        children: [
+          for (final child in (json['children'] as List?) ?? const [])
+            ?decode(child),
+        ],
+        result: optional('result'),
+        background: json['background'] == true,
+        ranBefore: duration('ranBefore'),
+      ),
+      'notice' => NoticeItem(
+        named(NoticeKind.values, 'kind', NoticeKind.info),
+        text('text'),
+      ),
+      'plan' => PlanItem(
+        path: text('path'),
+        round: number('round') ?? 1,
+        title: optional('title'),
+        text: optional('text'),
+        status: named(PlanStatus.values, 'status', PlanStatus.drafting),
+        writes: number('writes') ?? 0,
+        feedback: optional('feedback'),
+      ),
+      'terminal' => TerminalItem(
+        command: text('command'),
+        output: text('output'),
+        description: optional('description'),
+        status: named(CommandStatus.values, 'status', CommandStatus.succeeded),
+        background: json['background'] == true,
+        startedAt: time('startedAt'),
+      ),
+      'diff' => CodeDiffItem(
+        fileName: text('fileName'),
+        directory: text('directory'),
+        lines: [
+          for (final line in (json['lines'] as List?) ?? const [])
+            if (line case [final int type, final int number, final String text]
+                when type >= 0 && type < DiffLineType.values.length)
+              DiffLine(DiffLineType.values[type], number, text),
+        ],
+        added: number('added'),
+        removed: number('removed'),
+      ),
+      'live' => LiveStatusItem(
+        text('label'),
+        whimsical: json['whimsical'] == true,
+        visible: json['visible'] != false,
+        startedAt: time('startedAt'),
+        output: switch (json['tokens']) {
+          final num tokens => TurnOutput(
+            tokens: tokens.toInt(),
+            tokensPerSecond: (json['speed'] as num?)?.toDouble(),
+          ),
+          _ => null,
+        },
+      ),
+      _ => null,
+    };
+  }
+
+  static List<Map<String, Object?>> _images(List<ImageAttachment> images) => [
+    for (final image in images)
+      {
+        'data': base64.encode(image.bytes),
+        'type': image.mediaType,
+        'name': ?image.name,
+        'n': ?image.number,
+      },
+  ];
+
+  static List<ImageAttachment> _decodeImages(Object? json) => [
+    for (final image in (json as List?) ?? const [])
+      if (image case {'data': final String data, 'type': final String type})
+        ImageAttachment(
+          bytes: base64.decode(data),
+          mediaType: type,
+          name: image['name'] as String?,
+          number: (image['n'] as num?)?.toInt(),
+        ),
+  ];
+
+  static String _same(String id) => id;
+
+  static String? _head(String? text) => text == null || text.length <= maxOutput
+      ? text
+      : '${text.substring(0, maxOutput)}\n…';
+
+  static String _tail(String text) => text.length <= maxOutput
+      ? text
+      : '…\n${text.substring(text.length - maxOutput)}';
+}
