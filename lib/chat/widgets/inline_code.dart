@@ -166,21 +166,11 @@ class RenderInlineCodeBackdrop extends RenderProxyBox {
         final paint = Paint()..color = _color;
         final text = paragraph.text.toPlainText(includeSemanticsLabels: false);
         for (final range in ranges) {
-          // A line may break after the code's leading space: that space alone
-          // at the end of the line above is no code, so it gets no background.
-          final lines = [
-            for (final box in paragraph.getBoxesForSelection(
-              _trimmed(text, range),
-            ))
-              box.toRect(),
-          ];
-          bool onCodeLine(Rect rect) => lines.any(
-            (line) => line.top < rect.bottom && rect.top < line.bottom,
-          );
+          final trimmed = _trimmed(text, range);
+          if (trimmed.isCollapsed) continue;
           final merged = <Rect>[];
-          for (final box in paragraph.getBoxesForSelection(range)) {
+          for (final box in paragraph.getBoxesForSelection(trimmed)) {
             final rect = box.toRect();
-            if (!onCodeLine(rect)) continue;
             if (merged.isNotEmpty &&
                 merged.last.top < rect.bottom &&
                 rect.top < merged.last.bottom) {
@@ -195,10 +185,10 @@ class RenderInlineCodeBackdrop extends RenderProxyBox {
               boxRect,
             ).shift(offset);
             final rect = Rect.fromLTRB(
-              raw.left + 0.25,
-              raw.top + 0.5,
-              raw.right - 0.25,
-              raw.bottom - 0.5,
+              raw.left - 3.6,
+              raw.top - 0.5,
+              raw.right + 3.6,
+              raw.bottom + 0.5,
             );
             context.canvas.drawRRect(
               RRect.fromRectAndRadius(rect, radius),

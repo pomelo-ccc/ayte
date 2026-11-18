@@ -168,10 +168,10 @@ abstract final class AppColors {
   /// `textPreformat.foreground`.
   static Color get inlineCode => _colors['textPreformat.foreground'];
 
-  /// `textPreformat.background`, with a guaranteed muted pill contrast against
-  /// `editor.background` (matching Antigravity's `bg-muted` inline code pill)
-  /// when a theme's own `textPreformat.background` is nearly indistinguishable
-  /// from the conversation surface.
+  /// `textPreformat.background`, using a see-through foreground tint (matching
+  /// Antigravity's `bg-muted` inline code pill across frosted `WindowBlur`,
+  /// unfocused panes, and message cards) whenever a theme's own value does not
+  /// strongly stand out on its own.
   static Color get inlineCodeBackground {
     final colors = _colors;
     final raw = colors['textPreformat.background'];
@@ -179,13 +179,10 @@ abstract final class AppColors {
     final over = Color.alphaBlend(raw, surface).computeLuminance();
     final under = surface.computeLuminance();
     final (light, dark) = over > under ? (over, under) : (under, over);
-    if ((light + 0.05) / (dark + 0.05) >= 1.10) return raw;
-    final fg = colors['editor.foreground'].withValues(alpha: 1);
-    return Color.lerp(
-      surface.withValues(alpha: 1),
-      fg,
-      colors.dark ? 0.095 : 0.065,
-    )!;
+    if ((light + 0.05) / (dark + 0.05) >= 1.25) return raw;
+    return colors['editor.foreground'].withValues(
+      alpha: colors.dark ? 0.11 : 0.075,
+    );
   }
 
   /// Selected text's background: `editor.selectionBackground`, see-through

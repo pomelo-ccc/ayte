@@ -196,7 +196,7 @@ abstract final class ThemePaletteOverrides {
         case 'textPreformat.background':
           final target =
               fg ?? (dark ? defaultDarkForeground : defaultLightForeground);
-          return ui.Color.lerp(bg, target, dark ? 0.095 : 0.065);
+          return target.withValues(alpha: dark ? 0.11 : 0.075);
       }
     }
     if (fg != null) {
