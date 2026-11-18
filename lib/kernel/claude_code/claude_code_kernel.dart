@@ -157,6 +157,7 @@ class ClaudeCodeKernel
       'default',
     );
     final rawInitialModel = settings[KernelChoiceKind.model.name];
+    _hasExplicitSessionModel = settings['__explicitSessionModel'] == '1';
     _model = rawInitialModel;
     String? legacyAgyEffort;
     if (AntigravityModels.parseVariant(rawInitialModel) case final parsed?) {
@@ -423,6 +424,7 @@ class ClaudeCodeKernel
 
   set _model(String? model) => _pickedModel = model;
   String? _pickedModel;
+  late final bool _hasExplicitSessionModel;
 
   /// The provider's model the process was started on, which its
   /// environment names for each of Claude Code's own (`ANTHROPIC_MODEL`,
@@ -3050,8 +3052,18 @@ class ClaudeCodeKernel
         ..keptTurns = kept;
       var counted = false;
       var whole = page.earlier == null;
+      String? lastHistoryModel;
       for (final line in page.entries) {
-        if (line['type'] == 'assistant') counted |= _countRequest(line);
+        if (line['type'] == 'assistant') {
+          counted |= _countRequest(line);
+          final uuid = '${line['uuid'] ?? ''}';
+          if (!uuid.startsWith('agy-import-')) {
+            if (line['message'] case {'model': final String m}
+                when m.trim().isNotEmpty) {
+              lastHistoryModel = m.trim();
+            }
+          }
+        }
         _results.add(line);
         // What the model told before it is no longer what it holds.
         if (line case {'type': 'system', 'subtype': 'compact_boundary'}) {
@@ -3059,6 +3071,9 @@ class ClaudeCodeKernel
           whole = true;
         }
         _translator.translate(line);
+      }
+      if (!_hasExplicitSessionModel && lastHistoryModel != null) {
+        _restoreModelFromHistory(lastHistoryModel);
       }
       if (whole) {
         _resultsKnown = true;
@@ -3103,6 +3118,30 @@ class ClaudeCodeKernel
         ..keptTurns = const {};
       _loadingHistory = false;
       if (!_disposed) emitInfoChanged();
+    }
+  }
+
+  /// Restores the model, effort, and context window a historical conversation
+  /// actually used on its latest assistant turn when the user has not
+  /// explicitly pinned a different model for this session.
+  void _restoreModelFromHistory(String rawModel) {
+    if (AntigravityModels.parseVariant(rawModel) case final parsed?) {
+      final ref = modelRef(antigravityBuiltinProviderId, parsed.model.id);
+      _model = ref;
+      if (parsed.effort != null && !_pickedEfforts.containsKey(ref)) {
+        _pickedEfforts[ref] = parsed.effort!;
+      }
+      _effort = _agyEffortFor(parsed.model, ref);
+      _window = _agyWindowFor(parsed.model, ref);
+      _contextWindow = _window!;
+      _contextReported = true;
+      return;
+    }
+    final candidate = _ownModel(rawModel);
+    if (_providers.resolve(candidate) case (_, final info)) {
+      _model = candidate;
+      _effort = _effortFor(info);
+      _window = _windowFor(info);
     }
   }
 
