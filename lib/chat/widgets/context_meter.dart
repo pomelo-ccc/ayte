@@ -33,8 +33,15 @@ class ContextMeter extends StatelessWidget {
   /// in [AppColors.caution] once [warnAt] of it is used.
   final bool labeled;
 
-  /// How full the context is when the label warns.
-  static const warnAt = 0.8;
+  /// Thresholds for caution (amber) and critical (coral-red) states.
+  static const cautionAt = 0.65;
+  static const warnAt = 0.85;
+
+  static Color _arcColorFor(double fraction) {
+    if (fraction >= warnAt) return const Color(0xFFDC3E3E);
+    if (fraction >= cautionAt) return const Color(0xFFD98B1C);
+    return AppColors.accent.withValues(alpha: 1.0);
+  }
 
   /// Shared TapRegion group ID between [ContextMeter] and [ContextUsagePanel].
   static const tapRegionGroupId = 'context-usage-popover';
@@ -53,17 +60,21 @@ class ContextMeter extends StatelessWidget {
   Widget build(BuildContext context) {
     final colors = themeColors;
     final fraction = usage.fraction;
-    final warn = labeled && fraction >= warnAt;
+    final warn = fraction >= warnAt;
+    final arcColor = _arcColorFor(fraction);
+    final trackColor = (colors.dark ? Colors.white : Colors.black).withValues(
+      alpha: colors.dark ? 0.24 : 0.16,
+    );
     final ring = SizedBox.square(
-      dimension: 13,
+      dimension: 16,
       child: TweenAnimationBuilder<double>(
         tween: Tween(end: fraction),
         duration: const Duration(milliseconds: 400),
         builder: (context, value, _) => CustomPaint(
           painter: _RingPainter(
             value,
-            track: colors['disabledForeground'],
-            arc: warn ? AppColors.caution : colors['icon.foreground'],
+            track: trackColor,
+            arc: arcColor,
           ),
         ),
       ),
@@ -78,8 +89,8 @@ class ContextMeter extends StatelessWidget {
             onTap: onTap,
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 120),
-              width: labeled ? null : 23,
-              height: 22,
+              width: labeled ? null : 26,
+              height: 26,
               padding: labeled
                   ? const EdgeInsets.symmetric(horizontal: 6)
                   : EdgeInsets.zero,
@@ -91,7 +102,7 @@ class ContextMeter extends StatelessWidget {
                     : hovered
                     ? colors['toolbar.hoverBackground']
                     : Colors.transparent,
-                borderRadius: BorderRadius.circular(5),
+                borderRadius: BorderRadius.circular(labeled ? 5 : 13),
               ),
               child: labeled
                   ? Row(
@@ -134,25 +145,33 @@ class _RingPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final rect = Offset.zero & size;
+    const strokeWidth = 2.35;
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = (math.min(size.width, size.height) - strokeWidth) / 2;
+    final rect = Rect.fromCircle(center: center, radius: radius);
     final stroke = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 2
+      ..strokeWidth = strokeWidth
       ..strokeCap = StrokeCap.round;
+    canvas.drawCircle(center, radius, stroke..color = track);
+    if (fraction <= 0) return;
+    final clamped = fraction.clamp(0.0, 1.0);
     canvas.drawArc(
-      rect.deflate(1),
-      0,
-      math.pi * 2,
-      false,
-      stroke..color = track,
-    );
-    canvas.drawArc(
-      rect.deflate(1),
+      rect,
       -math.pi / 2,
-      math.pi * 2 * fraction.clamp(0, 1),
+      math.pi * 2 * clamped,
       false,
       stroke..color = arc,
     );
+    if (fraction >= 0.95) {
+      canvas.drawCircle(
+        center,
+        2.0,
+        Paint()
+          ..style = PaintingStyle.fill
+          ..color = arc,
+      );
+    }
   }
 
   @override

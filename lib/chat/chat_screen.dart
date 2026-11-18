@@ -1491,12 +1491,16 @@ class _ChatScreenState extends State<ChatScreen>
               final usage? => ContextMeter(
                 usage: usage,
                 active: _contextPanelOpen,
-                labeled: true,
-                tooltip: ChatKeys.titleWithKey(
-                  context.l10n.composerContextUsage,
-                  ChatCommandIds.toggleContextPanel,
-                  const {ChatContextKeys.inChat: true},
-                ),
+                tooltip: [
+                  ChatKeys.titleWithKey(
+                    context.l10n.composerContextUsage,
+                    ChatCommandIds.toggleContextPanel,
+                    const {ChatContextKeys.inChat: true},
+                  ),
+                  usage.window == 0
+                      ? ContextMeter.format(usage.used)
+                      : '${(usage.fraction * 100).round()}% (${ContextMeter.format(usage.used)} / ${ContextMeter.format(usage.window)})',
+                ].join(' · '),
                 onTap: _toggleContextPanel,
               ),
               null => const SizedBox.shrink(),
