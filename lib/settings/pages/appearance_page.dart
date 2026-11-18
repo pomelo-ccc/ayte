@@ -95,6 +95,7 @@ class AppearanceSettingsPage extends StatelessWidget {
   List<List<IdeColorThemeEntry>> _groups() {
     final all = themes.colorThemes;
     int pinRank(IdeColorThemeEntry theme) => switch (theme.id) {
+      'Antigravity Light' => -1,
       ThemeSettingDefaults.colorThemeLight ||
       ThemeSettingDefaults.colorThemeDark => 0,
       'Claude Code Light' || 'Claude Code Dark' => 1,

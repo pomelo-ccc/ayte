@@ -181,7 +181,7 @@ abstract final class AppColors {
     final (light, dark) = over > under ? (over, under) : (under, over);
     if ((light + 0.05) / (dark + 0.05) >= 1.25) return raw;
     return colors['editor.foreground'].withValues(
-      alpha: colors.dark ? 0.11 : 0.075,
+      alpha: colors.dark ? 0.11 : 0.055,
     );
   }
 
