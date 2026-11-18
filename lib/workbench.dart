@@ -5585,6 +5585,14 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
         : Codicons.layoutSidebarLeftOff,
     tooltip: context.l10n.windowShowSidebar,
     command: 'workbench.action.toggleSidebarVisibility',
+    size: 26,
+    customGlyph: (color) => AntigravitySidebarIcon(
+      _sidebarAtRight
+          ? AntigravitySidebarGlyph.sidebarRight
+          : AntigravitySidebarGlyph.sidebarLeft,
+      color: color,
+      filledPane: false,
+    ),
     onTap: _toggle,
   );
 

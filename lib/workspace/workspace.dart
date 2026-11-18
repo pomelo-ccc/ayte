@@ -3409,6 +3409,18 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
   final List<AgentThread> _agentsForward = [];
   static const _agentsKept = 50;
 
+  bool _isValidHistoryTarget(AgentThread thread) =>
+      !identical(thread, _selected) &&
+      !thread.archived &&
+      _threads.contains(thread) &&
+      _projects.contains(thread.project);
+
+  /// Whether there is a previous agent in the navigation history.
+  bool get canNavigateBack => _agentsBack.any(_isValidHistoryTarget);
+
+  /// Whether there is a forward agent in the navigation history.
+  bool get canNavigateForward => _agentsForward.any(_isValidHistoryTarget);
+
   /// Selects the agent before, or (not [back]) the one gone back from; not
   /// those archived or deleted since. Whether there was one.
   bool navigate({required bool back}) {
