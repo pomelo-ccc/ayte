@@ -169,17 +169,19 @@ class _AntigravityAccountPickerState extends State<AntigravityAccountPicker> {
                           color: AppColors.textMuted,
                         ),
                       const SizedBox(width: 4),
-                      ConstrainedBox(
-                        constraints: const BoxConstraints(maxWidth: 110),
-                        child: Text(
-                          label,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: hovered
-                                ? AppColors.text
-                                : AppColors.textMuted,
+                      Flexible(
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 110),
+                          child: Text(
+                            label,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: hovered
+                                  ? AppColors.text
+                                  : AppColors.textMuted,
+                            ),
                           ),
                         ),
                       ),
