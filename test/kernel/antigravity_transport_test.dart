@@ -77,28 +77,30 @@ void main() {
         expect(argon.contextOptions, [256000, 512000, 900000]);
         expect(argon.defaultContext, 256000);
         expect(argon.supportsPresetContextWindow, isTrue);
+        expect(argon.resolveContextWindow(200000), 256000);
+        expect(argon.resolveContextWindow(400000), 512000);
 
         final hydrogen = AntigravityModels.of('gemini-4-hydrogen')!;
         expect(hydrogen.effortLevels, ['low', 'medium', 'high', 'xhigh']);
-        expect(hydrogen.contextOptions, [256000, 512000, 900000, 1000000]);
-        expect(hydrogen.defaultContext, 1000000);
+        expect(hydrogen.contextOptions, [256000]);
+        expect(hydrogen.defaultContext, 256000);
+        expect(hydrogen.supportsPresetContextWindow, isFalse);
         expect(hydrogen.effectiveCliModel, 'gemini-4-hydrogen');
-        expect(hydrogen.resolveContextWindow(200000), 256000);
-        expect(hydrogen.resolveContextWindow(400000), 512000);
+        expect(hydrogen.resolveContextWindow(512000), 256000);
 
         final orchestrator = AntigravityModels.of('gemini-pro-orchestrator')!;
         expect(orchestrator.effortLevels, isEmpty);
-        expect(orchestrator.contextOptions, [256000, 512000, 900000, 1000000]);
+        expect(orchestrator.contextOptions, [256000]);
 
         final claudeOpus = AntigravityModels.of('claude-opus-5-5')!;
         expect(claudeOpus.effortLevels, ['low', 'medium', 'high']);
-        expect(claudeOpus.contextOptions, [256000, 512000, 900000, 1000000]);
-        expect(claudeOpus.defaultContext, 1000000);
+        expect(claudeOpus.contextOptions, [256000]);
+        expect(claudeOpus.defaultContext, 256000);
 
         final gptOss = AntigravityModels.of('gpt-oss-120b')!;
         expect(gptOss.effortLevels, isEmpty);
         expect(gptOss.effectiveCliModel, 'gpt-oss-120b-medium');
-        expect(gptOss.contextOptions, [64000, 128000]);
+        expect(gptOss.contextOptions, [128000]);
         expect(gptOss.defaultContext, 128000);
       },
     );
@@ -140,8 +142,8 @@ void main() {
             cwd: '/tmp',
             settings: {
               'model': '@antigravity-cli/gemini-4-carbon-medium',
-              // Legacy 400K setting migrates to agy 1.5.10's 512K automatically.
-              'context@@antigravity-cli/gemini-4-hydrogen': '400000',
+              // Legacy 400K setting on Argon migrates to agy 1.5.10's 512K automatically.
+              'context@@antigravity-cli/gemini-4-argon': '400000',
             },
           ),
           providers: providers,
@@ -155,12 +157,14 @@ void main() {
         });
         addTearDown(sub.cancel);
 
-        // Legacy variant ID normalized to canonical family ref + preserved effort.
+        // Legacy variant ID normalized to canonical family ref + preserved effort,
+        // and fixed-window Carbon reports Cortex's real 256K compaction limit.
         expect(kernel.model.selected, '@antigravity-cli/gemini-4-carbon');
         expect(kernel.effort.selected, 'medium');
-        expect(kernel.contextSize.selected, '1000000');
+        expect(kernel.contextSize.selected, isNull);
+        expect(kernel.contextWindow, 256000);
         expect(
-          kernel.contextSize.selectedFor('@antigravity-cli/gemini-4-hydrogen'),
+          kernel.contextSize.selectedFor('@antigravity-cli/gemini-4-argon'),
           '512000',
         );
 
@@ -168,7 +172,7 @@ void main() {
             .optionsFor('@antigravity-cli/gemini-4-carbon')
             .map((o) => o.label)
             .toList();
-        expect(carbonContexts, ['256K', '512K', '900K', '1M']);
+        expect(carbonContexts, isEmpty);
 
         final argonContexts = kernel.contextSize
             .optionsFor('@antigravity-cli/gemini-4-argon')
@@ -180,7 +184,7 @@ void main() {
             .optionsFor('@antigravity-cli/gpt-oss-120b')
             .map((o) => o.label)
             .toList();
-        expect(gptContexts, ['64K', '128K']);
+        expect(gptContexts, isEmpty);
         expect(
           kernel.effort.optionsFor('@antigravity-cli/gpt-oss-120b'),
           isEmpty,
@@ -192,22 +196,27 @@ void main() {
             .toList();
         expect(hydrogenEfforts, ['low', 'medium', 'high', 'xhigh']);
 
-        // Switching context window updates selected context & emits UsageReported immediately.
-        kernel.contextSize.select(
-          '@antigravity-cli/gemini-4-carbon',
-          '512000',
-        );
+        // Switching Argon's context window updates selected context & emits UsageReported immediately.
+        kernel.model.select('@antigravity-cli/gemini-4-argon');
         await Future<void>.delayed(Duration.zero);
         expect(kernel.contextSize.selected, '512000');
         expect(kernel.contextWindow, 512000);
+
+        kernel.contextSize.select(
+          '@antigravity-cli/gemini-4-argon',
+          '900000',
+        );
+        await Future<void>.delayed(Duration.zero);
+        expect(kernel.contextSize.selected, '900000');
+        expect(kernel.contextWindow, 900000);
         expect(reported, isNotEmpty);
-        expect(reported.last.usage.window, 512000);
+        expect(reported.last.usage.window, 900000);
       },
     );
   });
 
   group('AntigravityTransport CLI flags, context env & usage accuracy', () {
-    test('buildCliArguments and buildProcessEnvironment pass native agy settings', () {
+    test('buildCliArguments and buildProcessEnvironment wire Argon 512K/900K via AGY_CLI_AUTO_COMPACT_OVERRIDE', () {
       final argonArgs = AntigravityTransport.buildCliArguments(
         model: 'gemini-4-argon',
         effort: 'high',
@@ -219,30 +228,47 @@ void main() {
       expect(argonArgs, contains('--model=gemini-4-argon'));
       expect(argonArgs, contains('--effort=high'));
 
-      final argonEnv = AntigravityTransport.buildProcessEnvironment(
+      final argon512Env = AntigravityTransport.buildProcessEnvironment(
         baseEnvironment: const {'PATH': '/usr/bin'},
         model: 'gemini-4-argon',
         maxContextTokens: 512000,
       );
-      expect(argonEnv.containsKey('AGY_CLI_AUTO_COMPACT_OVERRIDE'), isFalse);
+      expect(argon512Env['AGY_CLI_AUTO_COMPACT_OVERRIDE'], '512000');
 
-      final hydrogen512Env = AntigravityTransport.buildProcessEnvironment(
-        baseEnvironment: const {'PATH': '/usr/bin'},
-        model: 'gemini-4-hydrogen',
-        maxContextTokens: 512000,
+      final argon256Env = AntigravityTransport.buildProcessEnvironment(
+        baseEnvironment: const {
+          'PATH': '/usr/bin',
+          'AGY_CLI_AUTO_COMPACT_OVERRIDE': '512000',
+        },
+        model: 'gemini-4-argon',
+        maxContextTokens: 256000,
       );
-      expect(hydrogen512Env['AGY_CLI_AUTO_COMPACT_OVERRIDE'], '512000');
+      expect(
+        argon256Env.containsKey('AGY_CLI_AUTO_COMPACT_OVERRIDE'),
+        isFalse,
+      );
 
-      final hydrogen1mEnv = AntigravityTransport.buildProcessEnvironment(
+      final carbonArgs = AntigravityTransport.buildCliArguments(
+        model: 'gemini-4-carbon',
+        effort: 'high',
+        permissionMode: 'default',
+        maxContextTokens: 256000,
+      );
+      expect(
+        carbonArgs.any((arg) => arg.startsWith('--settings=')),
+        isFalse,
+      );
+
+      final hydrogenEnv = AntigravityTransport.buildProcessEnvironment(
         baseEnvironment: const {
           'PATH': '/usr/bin',
           'AGY_CLI_AUTO_COMPACT_OVERRIDE': '512000',
         },
         model: 'gemini-4-hydrogen',
-        maxContextTokens: 1000000,
+        maxContextTokens: 256000,
       );
       expect(
-        hydrogen1mEnv.containsKey('AGY_CLI_AUTO_COMPACT_OVERRIDE'),
+        hydrogenEnv.containsKey('AGY_CLI_AUTO_COMPACT_OVERRIDE'),
         isFalse,
       );
     });

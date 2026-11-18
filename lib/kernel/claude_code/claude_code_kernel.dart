@@ -203,7 +203,7 @@ class ClaudeCodeKernel
       if (_effort != null) {
         _pickedEfforts.putIfAbsent(ref, () => _effort!);
       }
-      if (_window case final w? when w > 0) {
+      if (_window case final w? when w > 0 && agy.contextOptions.length > 1) {
         _pickedWindows.putIfAbsent(ref, () => agy.resolveContextWindow(w));
       }
       _contextWindow = _agyWindowFor(agy, ref);
@@ -3529,10 +3529,12 @@ class ClaudeCodeKernel
     if (current == null) return;
     if (effort.selected case final level?) _pickedEfforts[current] = level;
     if (_custom != null) return;
-    if (AntigravityModels.of(current) != null) {
-      if (parseTokens(contextSize.selected ?? '') case final window?
-          when window > 0) {
-        _pickedWindows[current] = window;
+    if (AntigravityModels.of(current) case final agy?) {
+      if (agy.contextOptions.length > 1) {
+        if (parseTokens(contextSize.selected ?? '') case final window?
+            when window > 0) {
+          _pickedWindows[current] = window;
+        }
       }
       return;
     }
@@ -3749,6 +3751,7 @@ class ClaudeCodeKernel
     selected: () {
       if (_custom case (_, final info)) return '${_windowFor(info)}';
       if (AntigravityModels.of(_model) case final agy?) {
+        if (agy.contextOptions.length <= 1) return null;
         final ref = modelRef(antigravityBuiltinProviderId, agy.id);
         return '${_agyWindowFor(agy, ref)}';
       }
@@ -3771,6 +3774,7 @@ class ClaudeCodeKernel
         return '${info.contextOptions.contains(picked) ? picked : info.initialContext}';
       }
       if (AntigravityModels.of(model) case final agy?) {
+        if (agy.contextOptions.length <= 1) return null;
         final ref = modelRef(antigravityBuiltinProviderId, agy.id);
         return '${_agyWindowFor(agy, ref)}';
       }

@@ -46,8 +46,8 @@ class AntigravityModel {
     this.description = '',
     this.effortLevels = const [],
     this.defaultEffort,
-    this.contextOptions = const [256000, 512000, 900000, 1000000],
-    this.defaultContext = 1000000,
+    this.contextOptions = const [256000],
+    this.defaultContext = 256000,
     this.supportsPresetContextWindow = false,
   });
 
@@ -127,11 +127,11 @@ abstract final class AntigravityModels {
     AntigravityModel(
       id: 'gemini-4-carbon',
       label: 'Gemini 4 Carbon',
-      description: '1M context · Frontier deep reasoning',
+      description: '256K context · Frontier deep reasoning',
       effortLevels: ['low', 'medium', 'high'],
       defaultEffort: 'high',
-      contextOptions: [256000, 512000, 900000, 1000000],
-      defaultContext: 1000000,
+      contextOptions: [256000],
+      defaultContext: 256000,
     ),
     AntigravityModel(
       id: 'gemini-4-argon',
@@ -146,59 +146,59 @@ abstract final class AntigravityModels {
     AntigravityModel(
       id: 'gemini-4-hydrogen',
       label: 'Gemini 4 Hydrogen',
-      description: '1M context · High-speed agentic engine',
+      description: '256K context · High-speed agentic engine',
       effortLevels: ['low', 'medium', 'high', 'xhigh'],
       defaultEffort: 'high',
-      contextOptions: [256000, 512000, 900000, 1000000],
-      defaultContext: 1000000,
+      contextOptions: [256000],
+      defaultContext: 256000,
     ),
     AntigravityModel(
       id: 'gemini-pro-orchestrator',
       label: 'Orchestrator (Carbon)',
-      description: '1M context · Carbon planner + Hydrogen executor',
-      contextOptions: [256000, 512000, 900000, 1000000],
-      defaultContext: 1000000,
+      description: '256K context · Carbon planner + Hydrogen executor',
+      contextOptions: [256000],
+      defaultContext: 256000,
     ),
     AntigravityModel(
       id: 'gemini-pro-orchestrator-argon',
       label: 'Orchestrator (Argon)',
-      description: '1M context · Argon planner + Hydrogen executor',
-      contextOptions: [256000, 512000, 900000, 1000000],
-      defaultContext: 1000000,
+      description: '256K context · Argon planner + Hydrogen executor',
+      contextOptions: [256000],
+      defaultContext: 256000,
     ),
     AntigravityModel(
       id: 'gemini-3.8-flash',
       label: 'Gemini 3.8 Flash',
-      description: '1M context · Low-latency coding & sub-tasks',
+      description: '256K context · Low-latency coding & sub-tasks',
       effortLevels: ['low', 'medium', 'high'],
       defaultEffort: 'high',
-      contextOptions: [256000, 512000, 900000, 1000000],
-      defaultContext: 1000000,
+      contextOptions: [256000],
+      defaultContext: 256000,
     ),
     AntigravityModel(
       id: 'claude-opus-5-5',
       label: 'Claude Opus 5.5',
-      description: '1M context · Anthropic flagship reasoning',
+      description: '256K context · Anthropic flagship reasoning',
       effortLevels: ['low', 'medium', 'high'],
       defaultEffort: 'high',
-      contextOptions: [256000, 512000, 900000, 1000000],
-      defaultContext: 1000000,
+      contextOptions: [256000],
+      defaultContext: 256000,
     ),
     AntigravityModel(
       id: 'claude-sonnet-5-5',
       label: 'Claude Sonnet 5.5',
-      description: '1M context · Balanced Anthropic coding model',
+      description: '256K context · Balanced Anthropic coding model',
       effortLevels: ['low', 'medium', 'high'],
       defaultEffort: 'medium',
-      contextOptions: [256000, 512000, 900000, 1000000],
-      defaultContext: 1000000,
+      contextOptions: [256000],
+      defaultContext: 256000,
     ),
     AntigravityModel(
       id: 'gpt-oss-120b',
       cliModelId: 'gpt-oss-120b-medium',
       label: 'GPT-OSS 120B',
       description: '128K context · Open-weight reasoning model',
-      contextOptions: [64000, 128000],
+      contextOptions: [128000],
       defaultContext: 128000,
     ),
   ];
@@ -302,6 +302,12 @@ abstract final class AntigravityModels {
       antigravityPresetContextChoices[tokens];
 
   /// Context window presets inferred for a dynamically discovered model family.
+  ///
+  /// Both Antigravity IDE (`R.base === "Gemini 4 Argon"`) and `agy` CLI
+  /// (`backend.ContextWindowSelectable = ["Gemini 4 Argon"]`) only expose
+  /// selectable `256K / 512K / 900K` windows on `Gemini 4 Argon`; all other
+  /// families use Cortex's fixed `256K` (`256,000`) checkpoint limit (`128K`
+  /// for `gpt-oss-*`).
   static ({
     List<int> options,
     int defaultContext,
@@ -312,7 +318,7 @@ abstract final class AntigravityModels {
     final lower = familyId.toLowerCase();
     if (lower.startsWith('gpt-oss')) {
       return (
-        options: const [64000, 128000],
+        options: const [128000],
         defaultContext: 128000,
         summary: '128K context · Open-weight model',
         supportsPreset: false,
@@ -328,16 +334,16 @@ abstract final class AntigravityModels {
     }
     if (lower.startsWith('claude-')) {
       return (
-        options: const [256000, 512000, 900000, 1000000],
-        defaultContext: 1000000,
-        summary: '1M context · Anthropic coding model',
+        options: const [256000],
+        defaultContext: 256000,
+        summary: '256K context · Anthropic coding model',
         supportsPreset: false,
       );
     }
     return (
-      options: const [256000, 512000, 900000, 1000000],
-      defaultContext: 1000000,
-      summary: '1M context · Google Antigravity',
+      options: const [256000],
+      defaultContext: 256000,
+      summary: '256K context · Google Antigravity',
       supportsPreset: false,
     );
   }

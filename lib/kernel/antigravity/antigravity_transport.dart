@@ -67,7 +67,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
     if (launchAutocompact != null && launchAutocompact > 0) {
       return launchAutocompact;
     }
-    return 1000000;
+    return 256000;
   }
 
   static String? _resolveInitialEffort(String? rawModel, String? launchEffort) {
@@ -503,8 +503,8 @@ class AntigravityTransport implements ClaudeCodeTransport {
   String get _effectiveModeFlag =>
       _permissionMode == 'plan' ? 'plan' : 'agent';
 
-  /// Builds `agy` CLI flags, passing native `--settings={"contextWindow": ...}`
-  /// when a preset window (`256K` / `512K` / `900K`) is selected.
+  /// Builds `agy` CLI flags, passing `--settings={"contextWindow": ...}` only
+  /// for models in `agy`'s `ContextWindowSelectable` (`supportsPresetContextWindow`).
   static List<String> buildCliArguments({
     required String model,
     required String? effort,
@@ -513,9 +513,10 @@ class AntigravityTransport implements ClaudeCodeTransport {
     String? conversationId,
     List<String> directories = const [],
   }) {
-    final presetWindow = AntigravityModels.presetContextWindowName(
-      maxContextTokens,
-    );
+    final info = AntigravityModels.of(model);
+    final presetWindow = (info?.supportsPresetContextWindow ?? false)
+        ? AntigravityModels.presetContextWindowName(maxContextTokens)
+        : null;
     return <String>[
       '--input-format=stream-json',
       '--output-format=stream-json',
@@ -537,9 +538,15 @@ class AntigravityTransport implements ClaudeCodeTransport {
     ];
   }
 
-  /// Builds child process environment for `agy`, setting
-  /// `AGY_CLI_AUTO_COMPACT_OVERRIDE` whenever a model without native preset
-  /// windows selects a custom compaction ceiling below its full window.
+  /// Builds child process environment for `agy`.
+  ///
+  /// In `agy` v1.5.10, `store.(*Store).ContextWindow()` gates on
+  /// `backend.ContextWindowSelectable` (`["Gemini 4 Argon"]`), and its
+  /// `featureProvider` check before `ContextWindowChoice()` (`--settings`) is
+  /// dead-code eliminated in CLI mode, whereas `AGY_CLI_AUTO_COMPACT_OVERRIDE`
+  /// runs right before it and sets `CheckpointConfig.MaxTokenLimit` (`512000`
+  /// or `900000`) directly on Cortex — matching Antigravity IDE's `GRa` map
+  /// (`{"256K": undefined, "512K": 512000, "900K": 900000}`).
   static Map<String, String> buildProcessEnvironment({
     required Map<String, String> baseEnvironment,
     required String model,
@@ -548,11 +555,8 @@ class AntigravityTransport implements ClaudeCodeTransport {
     final env = <String, String>{...baseEnvironment}
       ..remove('AGY_CLI_AUTO_COMPACT_OVERRIDE');
     final info = AntigravityModels.of(model);
-    final nativeMax = info?.contextOptions.last ?? 1000000;
-    final usesPresetFlag =
-        (info?.supportsPresetContextWindow ?? false) &&
-        AntigravityModels.presetContextWindowName(maxContextTokens) != null;
-    if (!usesPresetFlag && maxContextTokens > 0 && maxContextTokens < nativeMax) {
+    if ((info?.supportsPresetContextWindow ?? false) &&
+        maxContextTokens > 256000) {
       env['AGY_CLI_AUTO_COMPACT_OVERRIDE'] = '$maxContextTokens';
     }
     return env;
