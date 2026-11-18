@@ -1396,10 +1396,12 @@ class _ChatScreenState extends State<ChatScreen>
     final footer = _footer;
     final titled = _titled;
     return Scaffold(
-      // The window's color about the card, or the card's it is on (the
-      // IDE's, a card or not): none of its own.
+      // In island mode, transparent so the window's sidebar color frames the
+      // card; in flush border mode (`!Islands.on`), paint `widget.island`
+      // (`conversationSurface`, e.g. `#FAF9F5`) directly so the conversation
+      // pane keeps its own surface distinct from the `#EFEEEA` sidebar.
       backgroundColor: island == null && !IslandSurface.on(context)
-          ? null
+          ? widget.island
           : Colors.transparent,
       body: Stack(
         children: [

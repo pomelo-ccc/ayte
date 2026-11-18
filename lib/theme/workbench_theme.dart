@@ -23,8 +23,8 @@
 // restyles the whole workbench upstream.
 
 import 'dart:async';
-import 'dart:convert' show jsonEncode;
-import 'dart:io' show File;
+import 'dart:convert' show JsonEncoder, jsonDecode, jsonEncode;
+import 'dart:io' show Directory, File;
 import 'dart:ui' as ui;
 
 import 'package:flutter/services.dart';
@@ -106,55 +106,182 @@ abstract interface class ColorThemeStorage {
   });
 }
 
-/// Optional user overrides for the Light and Dark theme palettes
-/// (`Background`, `Foreground`, `Accent`), defaulting to the Claude-style
-/// palette (`#FAF9F5` / `#141413` / `#D97757` in light, `#191919` / `#FAF9F5` /
-/// `#D97757` in dark).
+/// Persistent per-theme color overrides (`workbench.themeOverrides`), custom
+/// user themes (`workbench.customThemes`), and deleted built-in themes
+/// (`workbench.deletedThemes`).
 abstract final class ThemePaletteOverrides {
-  static const defaultLightBackground = ui.Color(0xFFF6F3EB);
-  static const defaultLightForeground = ui.Color(0xFF282624);
-  static const defaultLightAccent = ui.Color(0xFFCF795A);
+  static const overridesKey = 'workbench.themeOverrides';
+  static const customThemesKey = 'workbench.customThemes';
+  static const deletedThemesKey = 'workbench.deletedThemes';
+
+  static const slotBackground = 'background';
+  static const slotSidebar = 'sidebar';
+  static const slotCard = 'card';
+  static const slotForeground = 'foreground';
+  static const slotAccent = 'accent';
+  static const slotInlineCode = 'inlineCode';
+
+  static const allSlots = <String>[
+    slotBackground,
+    slotSidebar,
+    slotCard,
+    slotForeground,
+    slotAccent,
+    slotInlineCode,
+  ];
+
+  static const defaultLightBackground = ui.Color(0xFFFAF9F5);
+  static const defaultLightForeground = ui.Color(0xFF2B2A28);
+  static const defaultLightAccent = ui.Color(0xFF3E8ED1);
 
   static const defaultDarkBackground = ui.Color(0xFF1D1C1A);
   static const defaultDarkForeground = ui.Color(0xFFE6E3DC);
   static const defaultDarkAccent = ui.Color(0xFFD47F60);
 
-  static final lightBackground = ValueNotifier<ui.Color?>(null);
-  static final lightForeground = ValueNotifier<ui.Color?>(null);
-  static final lightAccent = ValueNotifier<ui.Color?>(null);
+  static final ValueNotifier<int> _revision = ValueNotifier<int>(0);
+  static Listenable get changes => _revision;
 
-  static final darkBackground = ValueNotifier<ui.Color?>(null);
-  static final darkForeground = ValueNotifier<ui.Color?>(null);
-  static final darkAccent = ValueNotifier<ui.Color?>(null);
+  /// `themeId -> { slot -> Color }`.
+  static final Map<String, Map<String, ui.Color>> _overrides = {};
+  static Future<void> Function(String key, Object? value)? _writer;
+  static String? _dataDir;
+  static bool _syncingFromSettings = false;
 
-  static final Listenable changes = Listenable.merge([
-    lightBackground,
-    lightForeground,
-    lightAccent,
-    darkBackground,
-    darkForeground,
-    darkAccent,
-  ]);
-
-  static bool hasCustom({required bool dark}) => dark
-      ? (darkBackground.value != null ||
-            darkForeground.value != null ||
-            darkAccent.value != null)
-      : (lightBackground.value != null ||
-            lightForeground.value != null ||
-            lightAccent.value != null);
-
-  static void reset({required bool dark}) {
-    if (dark) {
-      darkBackground.value = null;
-      darkForeground.value = null;
-      darkAccent.value = null;
-    } else {
-      lightBackground.value = null;
-      lightForeground.value = null;
-      lightAccent.value = null;
-    }
+  static void _notify() {
+    _revision.value++;
     WorkbenchThemeService.instance.invalidateColors();
+  }
+
+  /// Connects persistent settings and `<dataDir>/themes/` custom theme files.
+  static void follow(
+    Listenable settings, {
+    required Object? Function(String key) read,
+    required Future<void> Function(String key, Object? value) write,
+    required String dataDir,
+  }) {
+    _writer = write;
+    _dataDir = dataDir;
+    void sync() {
+      if (_syncingFromSettings) return;
+      _loadOverridesFromRaw(read(overridesKey));
+      final customRaw = read(customThemesKey);
+      final deletedRaw = read(deletedThemesKey);
+      WorkbenchThemeService.instance.syncUserThemes(
+        customRaw: customRaw,
+        deletedRaw: deletedRaw,
+        dataDir: dataDir,
+      );
+      _notify();
+    }
+
+    sync();
+    settings.addListener(sync);
+  }
+
+  static void _loadOverridesFromRaw(Object? raw) {
+    _overrides.clear();
+    if (raw is! Map) return;
+    for (final entry in raw.entries) {
+      final themeId = entry.key;
+      final value = entry.value;
+      if (themeId is! String || value is! Map) continue;
+      final slots = <String, ui.Color>{};
+      for (final slotEntry in value.entries) {
+        final k = slotEntry.key;
+        final v = slotEntry.value;
+        if (k is String && v is String) {
+          if (parseHex(v) case final parsed?) {
+            slots[k] = parsed;
+          }
+        }
+      }
+      if (slots.isNotEmpty) {
+        _overrides[themeId] = slots;
+      }
+    }
+  }
+
+  static Map<String, Object?>? _serializeOverrides() {
+    if (_overrides.isEmpty) return null;
+    final out = <String, Object?>{};
+    for (final MapEntry(key: themeId, value: slots) in _overrides.entries) {
+      if (slots.isEmpty) continue;
+      out[themeId] = {
+        for (final MapEntry(:key, :value) in slots.entries) key: toHex(value),
+      };
+    }
+    return out.isEmpty ? null : out;
+  }
+
+  static Future<void> _persistKey(String key, Object? value) async {
+    final write = _writer;
+    if (write == null) return;
+    _syncingFromSettings = true;
+    try {
+      await write(key, value);
+    } catch (error) {
+      debugPrint('$key not persisted: $error');
+    } finally {
+      _syncingFromSettings = false;
+    }
+  }
+
+  static ui.Color? slotColor(String themeId, String slot) =>
+      _overrides[themeId]?[slot];
+
+  static Map<String, ui.Color> overridesFor(String themeId) =>
+      Map<String, ui.Color>.unmodifiable(_overrides[themeId] ?? const {});
+
+  static bool hasCustomFor(String themeId) =>
+      (_overrides[themeId]?.isNotEmpty ?? false);
+
+  /// Updates [slot] in memory and repaints immediately without disk I/O (used
+  /// during live HSV color picker dragging; call [setSlotColor] on commit).
+  static void previewSlotColor(
+    String themeId,
+    String slot,
+    ui.Color? color,
+  ) {
+    if (color == null) {
+      final slots = _overrides[themeId];
+      slots?.remove(slot);
+      if (slots != null && slots.isEmpty) _overrides.remove(themeId);
+    } else {
+      (_overrides[themeId] ??= {})[slot] = color;
+    }
+    _notify();
+  }
+
+  static Future<void> setSlotColor(
+    String themeId,
+    String slot,
+    ui.Color? color,
+  ) async {
+    previewSlotColor(themeId, slot, color);
+    await _persistKey(overridesKey, _serializeOverrides());
+  }
+
+  static Future<void> resetTheme(String themeId) async {
+    if (_overrides.remove(themeId) == null) return;
+    _notify();
+    await _persistKey(overridesKey, _serializeOverrides());
+  }
+
+  static Future<void> moveOverrides(String fromId, String toId) async {
+    final moved = _overrides.remove(fromId);
+    if (moved == null) return;
+    _overrides[toId] = moved;
+    _notify();
+    await _persistKey(overridesKey, _serializeOverrides());
+  }
+
+  @visibleForTesting
+  static void resetForTesting() {
+    _overrides.clear();
+    _writer = null;
+    _dataDir = null;
+    _syncingFromSettings = false;
+    _revision.value++;
   }
 
   static String toHex(ui.Color color) {
@@ -169,10 +296,65 @@ abstract final class ThemePaletteOverrides {
     return value == null ? null : ui.Color(0xFF000000 | value);
   }
 
-  static ui.Color? resolveOverride(String id, {required bool dark}) {
-    final bg = dark ? darkBackground.value : lightBackground.value;
-    final fg = dark ? darkForeground.value : lightForeground.value;
-    final accent = dark ? darkAccent.value : lightAccent.value;
+  static ui.Color? resolveOverride(
+    String id, {
+    required String themeId,
+    required bool dark,
+  }) {
+    final slots = _overrides[themeId];
+    if (slots == null || slots.isEmpty) return null;
+    final bg = slots[slotBackground];
+    final sb = slots[slotSidebar];
+    final card = slots[slotCard];
+    final fg = slots[slotForeground];
+    final accent = slots[slotAccent];
+    final inlineCode = slots[slotInlineCode];
+
+    if (inlineCode != null && id == 'textPreformat.foreground') {
+      return inlineCode;
+    }
+
+    if (card != null) {
+      switch (id) {
+        case 'agentsChatInput.background' ||
+            'chat.requestBubbleBackground' ||
+            'list.activeSelectionBackground' ||
+            'list.inactiveSelectionBackground' ||
+            'list.focusBackground' ||
+            'menu.background' ||
+            'quickInput.background' ||
+            'editorWidget.background' ||
+            'editorSuggestWidget.background' ||
+            'editorHoverWidget.background' ||
+            'settings.dropdownBackground' ||
+            'dropdown.background' ||
+            'dropdown.listBackground' ||
+            'input.background' ||
+            'agentsNewSessionButton.background' ||
+            'notifications.background':
+          return card;
+      }
+    }
+
+    if (sb != null) {
+      switch (id) {
+        case 'sideBar.background' ||
+            'sideBarSectionHeader.background' ||
+            'activityBar.background' ||
+            'titleBar.activeBackground' ||
+            'titleBar.inactiveBackground' ||
+            'panel.background' ||
+            'statusBar.background' ||
+            'statusBar.inactiveBackground' ||
+            'statusBar.noFolderBackground' ||
+            'agents.background' ||
+            'terminal.background' ||
+            'editorGroupHeader.tabsBackground' ||
+            'tab.inactiveBackground':
+          return sb;
+      }
+    }
+
     if (bg != null) {
       switch (id) {
         case 'editor.background' ||
@@ -181,42 +363,87 @@ abstract final class ThemePaletteOverrides {
             'tab.activeBackground' ||
             'tab.hoverBackground' ||
             'breadcrumb.background' ||
-            'editorGutter.background':
+            'editorGutter.background' ||
+            'agentStatusIndicator.background' ||
+            'agentsCard.background':
           return bg;
         case 'sideBar.background' ||
+            'sideBarSectionHeader.background' ||
             'activityBar.background' ||
             'titleBar.activeBackground' ||
             'titleBar.inactiveBackground' ||
             'panel.background' ||
             'statusBar.background' ||
-            'agents.background':
+            'agents.background'
+            when sb == null:
           final target =
               fg ?? (dark ? defaultDarkForeground : defaultLightForeground);
-          return ui.Color.lerp(bg, target, 0.035);
+          return ui.Color.lerp(bg, target, 0.042);
         case 'textPreformat.background':
           final target =
               fg ?? (dark ? defaultDarkForeground : defaultLightForeground);
-          return target.withValues(alpha: dark ? 0.11 : 0.075);
+          return target.withValues(alpha: dark ? 0.11 : 0.055);
       }
     }
+
+    if (bg != null || sb != null || fg != null) {
+      switch (id) {
+        case 'sideBar.border' ||
+            'panel.border' ||
+            'surface.border' ||
+            'agentsPanel.border' ||
+            'widget.border' ||
+            'input.border' ||
+            'dropdown.border' ||
+            'menu.border' ||
+            'agentsChatInput.border' ||
+            'chat.requestBorder' ||
+            'textSeparator.foreground':
+          final baseBg =
+              bg ??
+              sb ??
+              (dark ? defaultDarkBackground : defaultLightBackground);
+          final baseFg =
+              fg ?? (dark ? defaultDarkForeground : defaultLightForeground);
+          return ui.Color.lerp(baseBg, baseFg, dark ? 0.14 : 0.10);
+      }
+    }
+
     if (fg != null) {
       switch (id) {
         case 'foreground' ||
             'editor.foreground' ||
+            'sideBar.foreground' ||
+            'settings.headerForeground' ||
+            'agentsPanel.foreground' ||
+            'surface.foreground' ||
+            'agentsChatInput.foreground' ||
             'list.activeSelectionForeground' ||
             'list.inactiveSelectionForeground' ||
             'list.hoverForeground' ||
             'sideBarTitle.foreground' ||
             'titleBar.activeForeground' ||
             'input.foreground' ||
-            'dropdown.foreground':
+            'dropdown.foreground' ||
+            'menu.foreground' ||
+            'quickInput.foreground' ||
+            'terminal.foreground':
           return fg;
-        case 'sideBar.foreground' || 'descriptionForeground':
+        case 'descriptionForeground' ||
+            'icon.foreground' ||
+            'sideBarSectionHeader.foreground':
           final canvas =
               bg ?? (dark ? defaultDarkBackground : defaultLightBackground);
-          return ui.Color.lerp(fg, canvas, 0.36);
+          return ui.Color.lerp(fg, canvas, 0.42);
+        case 'disabledForeground' ||
+            'input.placeholderForeground' ||
+            'agentsChatInput.placeholderForeground':
+          final canvas =
+              bg ?? (dark ? defaultDarkBackground : defaultLightBackground);
+          return ui.Color.lerp(fg, canvas, 0.60);
       }
     }
+
     if (accent != null) {
       switch (id) {
         case 'button.background' ||
@@ -229,7 +456,8 @@ abstract final class ThemePaletteOverrides {
             'list.highlightForeground' ||
             'editorCursor.foreground' ||
             'sash.hoverBorder' ||
-            'chat.inputWorkingBorderColor1':
+            'chat.inputWorkingBorderColor1' ||
+            'progressBar.background':
           return accent;
         case 'button.hoverBackground' || 'textLink.activeForeground':
           return ui.Color.lerp(
@@ -240,6 +468,115 @@ abstract final class ThemePaletteOverrides {
       }
     }
     return null;
+  }
+
+  /// Applies [slots] to a raw VS Code theme `colors` map for standalone export.
+  static void applySlotsToColorMap(
+    Map<String, Object?> colors,
+    Map<String, ui.Color> slots, {
+    required bool dark,
+  }) {
+    const targetIds = <String>[
+      'editor.background',
+      'agentsPanel.background',
+      'surface.background',
+      'tab.activeBackground',
+      'tab.hoverBackground',
+      'breadcrumb.background',
+      'editorGutter.background',
+      'agentStatusIndicator.background',
+      'agentsCard.background',
+      'sideBar.background',
+      'sideBarSectionHeader.background',
+      'activityBar.background',
+      'titleBar.activeBackground',
+      'titleBar.inactiveBackground',
+      'panel.background',
+      'statusBar.background',
+      'statusBar.inactiveBackground',
+      'statusBar.noFolderBackground',
+      'agents.background',
+      'terminal.background',
+      'editorGroupHeader.tabsBackground',
+      'tab.inactiveBackground',
+      'agentsChatInput.background',
+      'chat.requestBubbleBackground',
+      'list.activeSelectionBackground',
+      'list.inactiveSelectionBackground',
+      'list.focusBackground',
+      'menu.background',
+      'quickInput.background',
+      'editorWidget.background',
+      'editorSuggestWidget.background',
+      'editorHoverWidget.background',
+      'settings.dropdownBackground',
+      'dropdown.background',
+      'dropdown.listBackground',
+      'input.background',
+      'agentsNewSessionButton.background',
+      'notifications.background',
+      'sideBar.border',
+      'panel.border',
+      'surface.border',
+      'agentsPanel.border',
+      'widget.border',
+      'input.border',
+      'dropdown.border',
+      'menu.border',
+      'agentsChatInput.border',
+      'chat.requestBorder',
+      'textSeparator.foreground',
+      'foreground',
+      'editor.foreground',
+      'sideBar.foreground',
+      'settings.headerForeground',
+      'agentsPanel.foreground',
+      'surface.foreground',
+      'agentsChatInput.foreground',
+      'list.activeSelectionForeground',
+      'list.inactiveSelectionForeground',
+      'list.hoverForeground',
+      'sideBarTitle.foreground',
+      'titleBar.activeForeground',
+      'input.foreground',
+      'dropdown.foreground',
+      'menu.foreground',
+      'quickInput.foreground',
+      'terminal.foreground',
+      'descriptionForeground',
+      'icon.foreground',
+      'sideBarSectionHeader.foreground',
+      'disabledForeground',
+      'input.placeholderForeground',
+      'agentsChatInput.placeholderForeground',
+      'button.background',
+      'textLink.foreground',
+      'focusBorder',
+      'badge.background',
+      'activityBarBadge.background',
+      'agentsBadge.background',
+      'agentsUnreadBadge.background',
+      'list.highlightForeground',
+      'editorCursor.foreground',
+      'sash.hoverBorder',
+      'chat.inputWorkingBorderColor1',
+      'progressBar.background',
+      'button.hoverBackground',
+      'textLink.activeForeground',
+      'textPreformat.foreground',
+    ];
+    const tempId = '__export__';
+    _overrides[tempId] = Map<String, ui.Color>.of(slots);
+    try {
+      for (final key in targetIds) {
+        final resolved = resolveOverride(key, themeId: tempId, dark: dark);
+        if (resolved != null) {
+          colors[key] = toHex(resolved);
+        }
+      }
+    } finally {
+      _overrides.remove(tempId);
+    }
   }
 }
 
@@ -259,7 +596,11 @@ class WorkbenchColors {
   /// gives it one.
   ui.Color? get(String id) => _colors.putIfAbsent(id, () {
     if (!highContrast) {
-      final overridden = ThemePaletteOverrides.resolveOverride(id, dark: dark);
+      final overridden = ThemePaletteOverrides.resolveOverride(
+        id,
+        themeId: theme.settingsId,
+        dark: dark,
+      );
       if (overridden != null) return overridden;
     }
     final color = theme.getColor(id);
@@ -335,8 +676,8 @@ class WorkbenchThemeService extends ChangeNotifier
       (_preview == null && _automatic);
   String get _resolvedSetting => _followsSystem
       ? (_brightness == ui.Brightness.light
-            ? ThemeSettingDefaults.colorThemeLight
-            : ThemeSettingDefaults.colorThemeDark)
+            ? _preferredLightThemeId
+            : _preferredDarkThemeId)
       : _preview ?? _setting;
 
   /// Shows a change of theme to [colors]: [apply] once, unless another
@@ -392,19 +733,385 @@ class WorkbenchThemeService extends ChangeNotifier
   List<IdeColorThemeEntry> get colorThemes => [
     for (final theme
         in _manifest?.themes ?? const <TextMateThemeContribution>[])
-      IdeColorThemeEntry(
-        id: theme.id,
-        label: theme.label,
-        type: _themeData(theme).type,
-      ),
-    for (final theme in _extensionThemes.values)
+      if (!_deletedThemes.contains(theme.id))
+        IdeColorThemeEntry(
+          id: theme.id,
+          label: theme.label,
+          type: _themeData(theme).type,
+        ),
+    for (final theme in _customThemes.values)
       IdeColorThemeEntry(
         id: theme.settingsId,
         label: theme.label,
         type: theme.type,
         description: theme.description,
       ),
+    for (final theme in _extensionThemes.values)
+      if (!_deletedThemes.contains(theme.settingsId))
+        IdeColorThemeEntry(
+          id: theme.settingsId,
+          label: theme.label,
+          type: theme.type,
+          description: theme.description,
+        ),
   ];
+
+  // --- Custom & deleted themes (`workbench.customThemes`, `workbench.deletedThemes`) ---
+
+  final List<Map<String, String>> _customThemeRecords = [];
+  final Map<String, ColorThemeData> _customThemes = {};
+  final Set<String> _deletedThemes = {};
+
+  bool isCustomTheme(String id) => _customThemes.containsKey(id);
+  bool get hasDeletedThemes => _deletedThemes.isNotEmpty;
+
+  String get _preferredLightThemeId {
+    if (!_deletedThemes.contains(ThemeSettingDefaults.colorThemeLight)) {
+      return ThemeSettingDefaults.colorThemeLight;
+    }
+    for (final entry in colorThemes) {
+      if (entry.type == ColorScheme.light) return entry.id;
+    }
+    return ThemeSettingDefaults.colorThemeLight;
+  }
+
+  String get _preferredDarkThemeId {
+    if (!_deletedThemes.contains(ThemeSettingDefaults.colorThemeDark)) {
+      return ThemeSettingDefaults.colorThemeDark;
+    }
+    for (final entry in colorThemes) {
+      if (entry.type == ColorScheme.dark) return entry.id;
+    }
+    return ThemeSettingDefaults.colorThemeDark;
+  }
+
+  void syncUserThemes({
+    required Object? customRaw,
+    required Object? deletedRaw,
+    required String dataDir,
+  }) {
+    _deletedThemes.clear();
+    if (deletedRaw is List) {
+      for (final item in deletedRaw) {
+        if (item is String && item.isNotEmpty) {
+          _deletedThemes.add(item);
+        }
+      }
+    }
+
+    _customThemeRecords.clear();
+    final nextCustom = <String, ColorThemeData>{};
+    if (customRaw is List) {
+      for (final item in customRaw) {
+        if (item is! Map) continue;
+        final id = item['id'];
+        final label = item['label'] ?? id;
+        final uiTheme = item['uiTheme'];
+        final file = item['file'];
+        if (id is! String || id.isEmpty || file is! String || file.isEmpty) {
+          continue;
+        }
+        final resolvedLabel = label is String && label.isNotEmpty ? label : id;
+        final resolvedUiTheme = uiTheme is String && uiTheme.isNotEmpty
+            ? uiTheme
+            : 'vs-dark';
+        _customThemeRecords.add({
+          'id': id,
+          'label': resolvedLabel,
+          'uiTheme': resolvedUiTheme,
+          'file': file,
+        });
+        final fullPath = p
+            .normalize(p.join(dataDir, 'themes', file))
+            .replaceAll(r'\', '/');
+        final kept = _customThemes[id];
+        if (kept != null &&
+            kept.location == fullPath &&
+            kept.label == resolvedLabel) {
+          nextCustom[id] = kept;
+        } else {
+          nextCustom[id] = ColorThemeData.fromExtensionTheme(
+            IThemeExtensionPoint(
+              id: id,
+              label: resolvedLabel,
+              path: file,
+              uiTheme: resolvedUiTheme,
+            ),
+            fullPath,
+            extensionId: 'user.custom',
+          );
+        }
+      }
+    }
+    _customThemes
+      ..clear()
+      ..addAll(nextCustom);
+
+    if (_manifest != null) {
+      unawaited(_queue(() => _loadCurrent(_request)));
+    }
+  }
+
+  /// Loads [id] (bundled, custom, or extension) and returns its underlying
+  /// [ColorThemeData] (before [ThemePaletteOverrides]).
+  Future<ColorThemeData?> loadThemeData(String id) async {
+    if (id == _current.settingsId && _current.isLoaded) {
+      return _current;
+    }
+    return _loadTheme(id);
+  }
+
+  /// Loads [id] (bundled, custom, or extension) and returns its resolved
+  /// [WorkbenchColors] including any [ThemePaletteOverrides].
+  Future<WorkbenchColors?> previewThemeColors(String id) async {
+    final data = await loadThemeData(id);
+    if (data == null) return null;
+    return WorkbenchColors(data);
+  }
+
+  /// Creates a standalone custom theme JSON file on disk, registers it in
+  /// `workbench.customThemes`, activates it, and returns its unique ID.
+  Future<String> createCustomTheme({
+    required String name,
+    required bool dark,
+    String? baseId,
+    Map<String, ui.Color>? initialSlots,
+  }) async {
+    await _loadManifest();
+    var trimmed = name.trim();
+    if (trimmed.isEmpty) {
+      trimmed = dark ? 'Custom Dark' : 'Custom Light';
+    }
+    final existingIds = {
+      for (final t in colorThemes) t.id.toLowerCase(),
+      for (final r in _customThemeRecords) r['id']!.toLowerCase(),
+    };
+    var candidate = trimmed;
+    var suffix = 2;
+    while (existingIds.contains(candidate.toLowerCase())) {
+      candidate = '$trimmed ($suffix)';
+      suffix++;
+    }
+    if (_deletedThemes.remove(candidate)) {
+      await ThemePaletteOverrides._persistKey(
+        ThemePaletteOverrides.deletedThemesKey,
+        _deletedThemes.isEmpty ? null : (_deletedThemes.toList()..sort()),
+      );
+    }
+
+    final resolvedBaseId =
+        baseId ?? (dark ? _preferredDarkThemeId : _preferredLightThemeId);
+    final baseData =
+        await _loadTheme(resolvedBaseId) ??
+        await _loadTheme(
+          dark
+              ? ThemeSettingDefaults.colorThemeDark
+              : ThemeSettingDefaults.colorThemeLight,
+        );
+
+    final mergedColors = <String, String>{
+      if (baseData != null) ...baseData.colors,
+    };
+    final mergedSlots = <String, ui.Color>{
+      ...ThemePaletteOverrides.overridesFor(resolvedBaseId),
+      ...?initialSlots,
+    };
+    if (mergedSlots.isNotEmpty) {
+      ThemePaletteOverrides.applySlotsToColorMap(
+        mergedColors,
+        mergedSlots,
+        dark: dark,
+      );
+    }
+
+    final slugBase = candidate
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9\u4e00-\u9fa5_-]+'), '-')
+        .replaceAll(RegExp(r'^-+|-+$'), '');
+    final fileName =
+        '${slugBase.isEmpty ? 'theme' : slugBase}-${DateTime.now().millisecondsSinceEpoch}.json';
+    final rootDir =
+        ThemePaletteOverrides._dataDir ?? Directory.systemTemp.path;
+    final themesDir = Directory(p.join(rootDir, 'themes'));
+    await themesDir.create(recursive: true);
+    final fullPath = p
+        .normalize(p.join(themesDir.path, fileName))
+        .replaceAll(r'\', '/');
+
+    final jsonContent = const JsonEncoder.withIndent('  ').convert({
+      r'$schema': 'vscode://schemas/color-theme',
+      'name': candidate,
+      'type': dark ? 'dark' : 'light',
+      if (baseData != null)
+        'semanticHighlighting': baseData.semanticHighlighting,
+      'colors': mergedColors,
+      'tokenColors': baseData?.themeTokenColors ?? const <Object?>[],
+    });
+    await File(fullPath).writeAsString('$jsonContent\n');
+
+    final uiTheme = dark ? 'vs-dark' : 'vs';
+    _customThemeRecords.add({
+      'id': candidate,
+      'label': candidate,
+      'uiTheme': uiTheme,
+      'file': fileName,
+    });
+    final themeData = ColorThemeData.fromExtensionTheme(
+      IThemeExtensionPoint(
+        id: candidate,
+        label: candidate,
+        path: fileName,
+        uiTheme: uiTheme,
+      ),
+      fullPath,
+      extensionId: 'user.custom',
+    );
+    await themeData.ensureLoaded(_read);
+    _customThemes[candidate] = themeData;
+
+    await ThemePaletteOverrides._persistKey(
+      ThemePaletteOverrides.customThemesKey,
+      _customThemeRecords.map((r) => Map<String, Object?>.of(r)).toList(),
+    );
+    notifyListeners();
+    await setColorTheme(candidate);
+    return candidate;
+  }
+
+  /// Renames a user-created custom theme and updates settings & active state.
+  Future<String> renameCustomTheme(String id, String newName) async {
+    final index = _customThemeRecords.indexWhere((r) => r['id'] == id);
+    if (index < 0) return id;
+    var trimmed = newName.trim();
+    if (trimmed.isEmpty || trimmed == id) return id;
+    final existingIds = {
+      for (final t in colorThemes)
+        if (t.id != id) t.id.toLowerCase(),
+      for (final r in _customThemeRecords)
+        if (r['id'] != id) r['id']!.toLowerCase(),
+    };
+    var candidate = trimmed;
+    var suffix = 2;
+    while (existingIds.contains(candidate.toLowerCase())) {
+      candidate = '$trimmed ($suffix)';
+      suffix++;
+    }
+
+    final record = Map<String, String>.of(_customThemeRecords[index]);
+    record['id'] = candidate;
+    record['label'] = candidate;
+    _customThemeRecords[index] = record;
+
+    final oldData = _customThemes.remove(id);
+    final rootDir =
+        ThemePaletteOverrides._dataDir ?? Directory.systemTemp.path;
+    final fullPath =
+        oldData?.location ??
+        p
+            .normalize(p.join(rootDir, 'themes', record['file']!))
+            .replaceAll(r'\', '/');
+
+    try {
+      final file = File(fullPath);
+      if (await file.exists()) {
+        final decoded = jsonDecode(await file.readAsString());
+        if (decoded is Map<String, Object?>) {
+          decoded['name'] = candidate;
+          await file.writeAsString(
+            '${const JsonEncoder.withIndent('  ').convert(decoded)}\n',
+          );
+        }
+      }
+    } catch (error) {
+      debugPrint('Custom theme file rename update skipped: $error');
+    }
+
+    final newData = ColorThemeData.fromExtensionTheme(
+      IThemeExtensionPoint(
+        id: candidate,
+        label: candidate,
+        path: record['file']!,
+        uiTheme: record['uiTheme'],
+      ),
+      fullPath,
+      extensionId: 'user.custom',
+    );
+    await newData.ensureLoaded(_read);
+    _customThemes[candidate] = newData;
+
+    await ThemePaletteOverrides.moveOverrides(id, candidate);
+    await ThemePaletteOverrides._persistKey(
+      ThemePaletteOverrides.customThemesKey,
+      _customThemeRecords.map((r) => Map<String, Object?>.of(r)).toList(),
+    );
+    if (_setting == id || _current.settingsId == id) {
+      await setColorTheme(candidate);
+    } else {
+      notifyListeners();
+    }
+    return candidate;
+  }
+
+  /// Deletes a custom theme (removing its JSON file) or hides a built-in
+  /// theme in `workbench.deletedThemes`. Always preserves at least one theme
+  /// per color scheme (Light / Dark).
+  Future<bool> deleteTheme(String id) async {
+    await _loadManifest();
+    final target = colorThemes.where((t) => t.id == id).firstOrNull;
+    if (target == null) return false;
+    final sameSchemeRemaining = colorThemes
+        .where((t) => isDark(t.type) == isDark(target.type) && t.id != id)
+        .toList();
+    if (sameSchemeRemaining.isEmpty) return false;
+
+    final wasCustom = _customThemes.containsKey(id);
+    if (wasCustom) {
+      final removed = _customThemes.remove(id);
+      _customThemeRecords.removeWhere((r) => r['id'] == id);
+      await ThemePaletteOverrides._persistKey(
+        ThemePaletteOverrides.customThemesKey,
+        _customThemeRecords.isEmpty
+            ? null
+            : _customThemeRecords
+                  .map((r) => Map<String, Object?>.of(r))
+                  .toList(),
+      );
+      if (removed?.location case final loc?) {
+        try {
+          final f = File(loc);
+          if (await f.exists()) await f.delete();
+        } catch (error) {
+          debugPrint('Custom theme file delete skipped: $error');
+        }
+      }
+    } else {
+      _deletedThemes.add(id);
+      await ThemePaletteOverrides._persistKey(
+        ThemePaletteOverrides.deletedThemesKey,
+        _deletedThemes.toList()..sort(),
+      );
+    }
+
+    await ThemePaletteOverrides.resetTheme(id);
+
+    if (_setting == id || _current.settingsId == id || _preview == id) {
+      await setColorTheme(sameSchemeRemaining.first.id);
+    } else {
+      notifyListeners();
+    }
+    return true;
+  }
+
+  /// Restores any built-in themes previously hidden via [deleteTheme].
+  Future<void> restoreDeletedThemes() async {
+    if (_deletedThemes.isEmpty) return;
+    _deletedThemes.clear();
+    await ThemePaletteOverrides._persistKey(
+      ThemePaletteOverrides.deletedThemesKey,
+      null,
+    );
+    notifyListeners();
+  }
 
   // --- Extensions' colors (`contributes.colors`) ---------------------------
 
@@ -529,8 +1236,8 @@ class WorkbenchThemeService extends ChangeNotifier
   });
 
   String get _defaultSetting => _committedType == ColorScheme.light
-      ? ThemeSettingDefaults.colorThemeLight
-      : ThemeSettingDefaults.colorThemeDark;
+      ? _preferredLightThemeId
+      : _preferredDarkThemeId;
 
   ColorThemeData _themeData(TextMateThemeContribution theme) =>
       _themes[theme.id] ??= ColorThemeData.fromExtensionTheme(
@@ -582,6 +1289,11 @@ class WorkbenchThemeService extends ChangeNotifier
   }
 
   Future<ColorThemeData?> _loadTheme(String id) async {
+    if (_deletedThemes.contains(id)) return null;
+    if (_customThemes[id] case final custom?) {
+      await custom.ensureLoaded(_read);
+      return custom;
+    }
     final theme = (await _loadManifest()).themeById(id);
     final data = theme != null ? _themeData(theme) : _extensionThemes[id];
     if (data != null) await data.ensureLoaded(_read);
@@ -684,7 +1396,10 @@ class WorkbenchThemeService extends ChangeNotifier
       // The kept theme's type, for a fallback, even as a preview shows.
       if (revision == _preferenceRevision) {
         final theme = manifest.themeById(id);
-        final data = theme != null ? _themeData(theme) : _extensionThemes[id];
+        final data = _deletedThemes.contains(id)
+            ? null
+            : _customThemes[id] ??
+                  (theme != null ? _themeData(theme) : _extensionThemes[id]);
         if (data != null) _committedType = data.type;
       }
       await _loadCurrent(request, force: true);
@@ -722,8 +1437,8 @@ class WorkbenchThemeService extends ChangeNotifier
     final automatic = settingsId == IdeColorThemeController.autoId;
     final id = automatic
         ? (_brightness == ui.Brightness.light
-              ? ThemeSettingDefaults.colorThemeLight
-              : ThemeSettingDefaults.colorThemeDark)
+              ? _preferredLightThemeId
+              : _preferredDarkThemeId)
         : settingsId;
     try {
       final data = await _loadTheme(id);
