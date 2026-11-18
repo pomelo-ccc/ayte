@@ -1978,24 +1978,23 @@ class ChatComposerState extends State<ChatComposer>
     ];
   }
 
-  Color _cardSurfaceColor({required bool dark, required bool focused}) {
+  Color _cardSurfaceColor({required bool dark}) {
     if (dark) {
-      return Color.lerp(
-        AppColors.bubbleFill,
-        Colors.white,
-        focused ? 0.038 : 0.018,
-      )!;
+      return Color.lerp(AppColors.bubbleFill, Colors.white, 0.024)!;
     }
-    return Color.lerp(
-      AppColors.bubbleFill,
-      Colors.white,
-      focused ? 0.62 : 0.44,
-    )!;
+    return Colors.white;
+  }
+
+  Color _cardBorderColor({required bool dark, required bool focused}) {
+    if (dark) {
+      return focused ? const Color(0xFF4C4841) : const Color(0xFF33312D);
+    }
+    return focused ? const Color(0xFFCFC9BD) : const Color(0xFFE8E4DC);
   }
 
   Widget _buildBox({required bool focused}) {
     final dark = themeColors.dark;
-    final cardSurface = _cardSurfaceColor(dark: dark, focused: focused);
+    final cardSurface = _cardSurfaceColor(dark: dark);
     final shelf = _buildEmptySuggestionShelf(dark: dark);
     final box = GestureDetector(
       behavior: HitTestBehavior.translucent,
@@ -2010,28 +2009,32 @@ class ChatComposerState extends State<ChatComposer>
           shape: RoundedSuperellipseBorder(
             borderRadius: BorderRadius.circular(16),
             side: BorderSide(
-              color: AppColors.bubbleBorder(focused: focused),
-              width: focused ? 1.15 : 1.0,
+              color: _cardBorderColor(dark: dark, focused: focused),
+              width: 1.0,
             ),
           ),
           shadows: [
             BoxShadow(
-              color: Colors.black.withValues(
-                alpha: focused ? (dark ? 0.30 : 0.075) : (dark ? 0.18 : 0.045),
-              ),
-              blurRadius: focused ? 18 : 10,
-              offset: Offset(0, focused ? 5 : 2.5),
-            ),
-            BoxShadow(
-              color: Colors.black.withValues(alpha: dark ? 0.12 : 0.02),
+              color: dark
+                  ? const Color.fromRGBO(0, 0, 0, 0.20)
+                  : const Color.fromRGBO(0, 0, 0, 0.04),
               blurRadius: 2,
               offset: const Offset(0, 1),
             ),
+            BoxShadow(
+              color: dark
+                  ? const Color.fromRGBO(0, 0, 0, 0.28)
+                  : const Color.fromRGBO(60, 40, 20, 0.05),
+              blurRadius: 16,
+              offset: const Offset(0, 4),
+            ),
             if (focused)
               BoxShadow(
-                color: AppColors.accent.withValues(alpha: dark ? 0.13 : 0.09),
-                blurRadius: 8,
-                spreadRadius: 0.5,
+                color: dark
+                    ? Colors.white.withValues(alpha: 0.065)
+                    : const Color(0xFF786E60).withValues(alpha: 0.10),
+                blurRadius: 0,
+                spreadRadius: 3,
               ),
           ],
         ),
@@ -2075,7 +2078,9 @@ class ChatComposerState extends State<ChatComposer>
         _dismissedSuggestionTurnKey == _suggestionTurnKey) {
       return null;
     }
-    final chipSurface = _cardSurfaceColor(dark: dark, focused: false);
+    final chipSurface = _cardSurfaceColor(dark: dark);
+    final chipBorder = _cardBorderColor(dark: dark, focused: false);
+    final chipHoverBorder = _cardBorderColor(dark: dark, focused: true);
     return SizedBox(
       height: 27,
       child: Row(
@@ -2087,7 +2092,6 @@ class ChatComposerState extends State<ChatComposer>
               separatorBuilder: (_, _) => const SizedBox(width: 6),
               itemBuilder: (context, index) {
                 final item = _emptySuggestions[index];
-                final isPrimary = index == 0;
                 return IdeHover(
                   message: context.l10n.replySuggestionHint,
                   child: HoverBuilder(
@@ -2097,77 +2101,46 @@ class ChatComposerState extends State<ChatComposer>
                       onTap: () => _acceptSuggestion(item),
                       onDoubleTap: () => _sendSuggestion(item),
                       child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 130),
-                      padding: EdgeInsets.only(
-                        left: isPrimary ? 9 : 10,
-                        right: isPrimary ? 6.5 : 10,
-                      ),
-                      decoration: BoxDecoration(
-                        color: hovered
-                            ? Color.lerp(
-                                chipSurface,
-                                AppColors.accent,
-                                dark ? 0.14 : 0.07,
-                              )
-                            : chipSurface.withValues(
-                                alpha: isPrimary ? 1.0 : (dark ? 0.82 : 0.86),
-                              ),
-                        borderRadius: BorderRadius.circular(999),
-                        border: Border.all(
+                        duration: const Duration(milliseconds: 130),
+                        padding: const EdgeInsets.symmetric(horizontal: 11),
+                        decoration: BoxDecoration(
                           color: hovered
-                              ? AppColors.accent.withValues(
-                                  alpha: dark ? 0.45 : 0.35,
+                              ? Color.lerp(
+                                  chipSurface,
+                                  dark ? Colors.white : Colors.black,
+                                  dark ? 0.06 : 0.025,
                                 )
-                              : isPrimary
-                              ? AppColors.accent.withValues(
-                                  alpha: dark ? 0.25 : 0.20,
-                                )
-                              : AppColors.bubbleBorder(),
+                              : chipSurface,
+                          borderRadius: BorderRadius.circular(999),
+                          border: Border.all(
+                            color: hovered ? chipHoverBorder : chipBorder,
+                          ),
+                          boxShadow: [
+                            BoxShadow(
+                              color: dark
+                                  ? const Color.fromRGBO(0, 0, 0, 0.16)
+                                  : const Color.fromRGBO(60, 40, 20, 0.04),
+                              blurRadius: 6,
+                              offset: const Offset(0, 1),
+                            ),
+                          ],
                         ),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withValues(
-                              alpha: dark ? 0.14 : 0.03,
-                            ),
-                            blurRadius: 4,
-                            offset: const Offset(0, 1),
-                          ),
-                        ],
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          if (isPrimary) ...[
-                            Icon(
-                              Codicons.sparkle,
-                              size: 11.5,
-                              color: AppColors.accent,
-                            ),
-                            const SizedBox(width: 5),
-                          ],
-                          ConstrainedBox(
-                            constraints: const BoxConstraints(maxWidth: 270),
-                            child: Text(
-                              item,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontSize: 11.5,
-                                fontWeight: isPrimary
-                                    ? FontWeight.w500
-                                    : FontWeight.w400,
-                                color: hovered || isPrimary
-                                    ? AppColors.text
-                                    : AppColors.textMuted,
-                              ),
+                        alignment: Alignment.center,
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 280),
+                          child: Text(
+                            item,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w400,
+                              color: hovered
+                                  ? AppColors.text
+                                  : AppColors.textMuted,
                             ),
                           ),
-                          if (isPrimary) ...[
-                            const SizedBox(width: 6),
-                            _KeycapBadge(label: 'Tab', dark: dark),
-                          ],
-                        ],
-                      ),
+                        ),
                       ),
                     ),
                   ),
@@ -2546,134 +2519,111 @@ class ChatComposerState extends State<ChatComposer>
       KernelChoiceKind.permission,
       option,
     );
-    final dark = themeColors.dark;
     final hasModel = model != null || session.health.noModel;
-    final hasLeadingPickers = kernel != null || mode != null || permission != null;
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: (dark ? Colors.white : Colors.black).withValues(
-          alpha: dark ? 0.015 : 0.016,
-        ),
-        border: Border(
-          top: BorderSide(
-            color: AppColors.partBorder.withValues(alpha: dark ? 0.35 : 0.42),
-            width: 0.75,
-          ),
-        ),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(8, 5.5, 8, 6),
-        child: Row(
-          children: [
-            // Takes the room left, so the actions sit at the far end; the
-            // model's label cut short to fit, scrolls when even that does not.
-            Expanded(
-              child: LayoutBuilder(
-                builder: (context, constraints) => SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  child: PickersRow(
-                    maxWidth: constraints.maxWidth,
-                    children: [
-                      if (kernel != null) ...[
-                        ComposerPicker(
-                          options: kernel.options,
-                          selected: kernel.selected,
-                          tapRegionGroupId: widget.tapRegionGroupId,
-                          focusNode: _focusNode,
-                          onSelected: kernel.onSelected,
-                        ),
-                        const SizedBox(width: 3),
-                      ],
-                      if (mode != null) ...[
-                        ComposerPicker(
-                          key: _modePickerKey,
-                          options: mode.options,
-                          selected: mode.selected,
-                          emphasized: true,
-                          tooltip: _hovers.mode,
-                          tapRegionGroupId: widget.tapRegionGroupId,
-                          focusNode: _focusNode,
-                          onSelected: mode.onSelected,
-                        ),
-                        const SizedBox(width: 3),
-                      ],
-                      if (permission != null) ...[
-                        ComposerPicker(
-                          options: [
-                            for (final option in permission.options)
-                              localized(option),
-                          ],
-                          selected: localized(permission.selected),
-                          // `context` is the session's here.
-                          title: l10n.composerApprovalTitle(
-                            session.kernel.label,
-                          ),
-                          menuWidth: 290,
-                          tapRegionGroupId: widget.tapRegionGroupId,
-                          focusNode: _focusNode,
-                          onSelected: permission.onSelected,
-                        ),
-                      ],
-                      if (hasLeadingPickers && hasModel) ...[
-                        Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 5),
-                          child: Container(
-                            width: 1,
-                            height: 11,
-                            color: AppColors.partBorder.withValues(
-                              alpha: dark ? 0.55 : 0.65,
-                            ),
-                          ),
-                        ),
-                      ],
-                      // With none to pick, one to set up.
-                      if (hasModel) ...[
-                        SessionModelPicker(
-                          session: session,
-                          pickerKey: _modelPickerKey,
-                          tooltip: _hovers.model,
-                          tapRegionGroupId: widget.tapRegionGroupId,
-                          focusNode: _focusNode,
-                        ),
-                        if (model != null)
-                          AntigravityAccountPicker(modelId: model.selected.id),
-                      ],
+    final localizedPermission = permission == null
+        ? null
+        : localized(permission.selected);
+    final permissionTooltip = localizedPermission == null
+        ? null
+        : localizedPermission.description.isEmpty
+        ? localizedPermission.label
+        : '${localizedPermission.label} · ${localizedPermission.description}';
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 2, 8, 7),
+      child: Row(
+        children: [
+          // Left toolbar: strictly clean Agent + Model ghost buttons.
+          Expanded(
+            child: LayoutBuilder(
+              builder: (context, constraints) => SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: PickersRow(
+                  maxWidth: constraints.maxWidth,
+                  children: [
+                    if (kernel != null) ...[
+                      ComposerPicker(
+                        options: kernel.options,
+                        selected: kernel.selected,
+                        tapRegionGroupId: widget.tapRegionGroupId,
+                        focusNode: _focusNode,
+                        onSelected: kernel.onSelected,
+                      ),
+                      const SizedBox(width: 2),
                     ],
-                  ),
+                    if (mode != null) ...[
+                      ComposerPicker(
+                        key: _modePickerKey,
+                        options: mode.options,
+                        selected: mode.selected,
+                        tooltip: _hovers.mode,
+                        tapRegionGroupId: widget.tapRegionGroupId,
+                        focusNode: _focusNode,
+                        onSelected: mode.onSelected,
+                      ),
+                      if (hasModel) const SizedBox(width: 2),
+                    ],
+                    if (hasModel)
+                      SessionModelPicker(
+                        session: session,
+                        pickerKey: _modelPickerKey,
+                        tooltip: _hovers.model,
+                        tapRegionGroupId: widget.tapRegionGroupId,
+                        focusNode: _focusNode,
+                      ),
+                  ],
                 ),
               ),
             ),
-            const SizedBox(width: 8),
-            if (ComposerPolishSetting.current()) ...[
-              _PolishButton(
-                busy: _polishing,
-                enabled: _polishing || _shownBuilt!.polishable,
-                onTap: () => unawaited(_polish()),
-              ),
-              const SizedBox(width: 2),
-            ],
-            if ((widget.onToggleContextPanel, context) case (
-              final onToggle?,
-              final usage?,
-            )) ...[
-              ContextMeter(
-                usage: usage,
-                active: widget.contextPanelOpen,
-                // Toggle Context Panel's, which has none by default.
-                tooltip: _hovers.ring,
-                onTap: onToggle,
-              ),
-              const SizedBox(width: 2),
-            ],
-            const SizedBox(width: 3),
-            _SendButton(
-              streaming: _showsStop,
-              enabled: _canSend,
-              onSend: _submit,
-              onStop: () => stopTurn(this.context, session),
+          ),
+          const SizedBox(width: 6),
+          if (permission != null && localizedPermission != null) ...[
+            ComposerPicker(
+              iconOnly: true,
+              options: [
+                for (final option in permission.options) localized(option),
+              ],
+              selected: localizedPermission,
+              tooltip: permissionTooltip,
+              title: l10n.composerApprovalTitle(session.kernel.label),
+              menuWidth: 290,
+              tapRegionGroupId: widget.tapRegionGroupId,
+              focusNode: _focusNode,
+              onSelected: permission.onSelected,
             ),
+            const SizedBox(width: 2),
           ],
-        ),
+          if (ComposerPolishSetting.current()) ...[
+            _PolishButton(
+              busy: _polishing,
+              enabled: _polishing || _shownBuilt!.polishable,
+              onTap: () => unawaited(_polish()),
+            ),
+            const SizedBox(width: 2),
+          ],
+          if (model != null) ...[
+            AntigravityAccountPicker(modelId: model.selected.id),
+            const SizedBox(width: 3),
+          ],
+          if ((widget.onToggleContextPanel, context) case (
+            final onToggle?,
+            final usage?,
+          )) ...[
+            ContextMeter(
+              usage: usage,
+              active: widget.contextPanelOpen,
+              // Toggle Context Panel's, which has none by default.
+              tooltip: _hovers.ring,
+              onTap: onToggle,
+            ),
+            const SizedBox(width: 3),
+          ],
+          _SendButton(
+            streaming: _showsStop,
+            enabled: _canSend,
+            onSend: _submit,
+            onStop: () => stopTurn(this.context, session),
+          ),
+        ],
       ),
     );
   }

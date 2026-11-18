@@ -150,91 +150,60 @@ class _AntigravityAccountPickerState extends State<AntigravityAccountPicker> {
           quotaSummary = '${primaryBucket.percentage}%';
         }
 
-        final label = active == null ? '添加账号' : active.shortLabel;
         final busy = _store.switchingId != null;
+        final dark = themeColors.dark;
+        final hoverBg = (dark ? Colors.white : Colors.black).withValues(
+          alpha: dark ? 0.08 : 0.05,
+        );
+        final tooltip = active == null
+            ? '添加或管理 Antigravity 账号'
+            : [
+                active.email,
+                ?quotaSummary,
+                '点击查看详情或切换账号',
+              ].join(' · ');
 
         return Builder(
           builder: (pillCtx) => IdeHover(
-            message: active == null
-                ? '添加或管理 Antigravity 账号'
-                : '当前账号：${active.email}（点击查看 Usage 详情或一键切号）',
+            position: IdeHoverPosition.above,
+            message: tooltip,
             child: HoverBuilder(
               cursor: SystemMouseCursors.click,
               builder: (context, hovered) => GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTapDown: (_) {},
                 onTap: () => _openUsagePopover(pillCtx),
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 120),
-                  height: 22,
-                  padding: const EdgeInsets.symmetric(horizontal: 7.5),
+                  width: 26,
+                  height: 26,
+                  alignment: Alignment.center,
                   decoration: BoxDecoration(
-                    color: hovered
-                        ? AppColors.textFaint.withValues(alpha: 0.14)
-                        : Colors.transparent,
-                    borderRadius: BorderRadius.circular(6),
+                    color: hovered ? hoverBg : Colors.transparent,
+                    shape: BoxShape.circle,
                   ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      if (busy)
-                        IdeSpinning(
+                  child: busy
+                      ? IdeSpinning(
                           Icon(
                             Codicons.loading,
-                            size: 12,
+                            size: 13.5,
                             color: AppColors.textMuted,
                           ),
                         )
-                      else
-                        Icon(
+                      : active == null
+                      ? Icon(
                           Codicons.account,
-                          size: 12.5,
-                          color: AppColors.textMuted,
-                        ),
-                      const SizedBox(width: 4),
-                      Flexible(
-                        child: ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 110),
-                          child: Text(
-                            label,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: hovered
-                                  ? AppColors.text
-                                  : AppColors.textMuted,
-                            ),
+                          size: 14,
+                          color: hovered ? AppColors.text : AppColors.textMuted,
+                        )
+                      : Opacity(
+                          opacity: hovered ? 1.0 : 0.88,
+                          child: AntigravityQuotaRing(
+                            fraction: strictestFraction ?? 1.0,
+                            size: 14.5,
+                            strokeWidth: 1.9,
                           ),
                         ),
-                      ),
-                      if (quotaSummary != null &&
-                          strictestFraction != null) ...[
-                        const SizedBox(width: 5),
-                        AntigravityQuotaRing(
-                          fraction: strictestFraction,
-                          size: 12,
-                          strokeWidth: 1.7,
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          quotaSummary,
-                          style: TextStyle(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w500,
-                            color: hovered
-                                ? AppColors.text
-                                : AppColors.textMuted,
-                            fontFeatures: const [FontFeature.tabularFigures()],
-                          ),
-                        ),
-                      ],
-                      const SizedBox(width: 2),
-                      Icon(
-                        Codicons.chevronDown,
-                        size: 11,
-                        color: AppColors.textFaint,
-                      ),
-                    ],
-                  ),
                 ),
               ),
             ),
@@ -296,7 +265,7 @@ class _AntigravityUsagePopoverState extends State<_AntigravityUsagePopover> {
     final onManageAccounts = widget.onManageAccounts;
     final screen = MediaQuery.sizeOf(context);
     const width = 320.0;
-    final left = widget.anchor.left
+    final left = (widget.anchor.right - width)
         .clamp(12.0, math.max(12.0, screen.width - width - 12.0))
         .toDouble();
     final bottom = (screen.height - widget.anchor.top + 8.0)

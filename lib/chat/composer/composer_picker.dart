@@ -44,6 +44,7 @@ class ComposerPicker extends StatefulWidget {
     this.submenuOf,
     this.checks,
     this.emphasized = false,
+    this.iconOnly = false,
     this.foreground,
     this.title,
     this.tooltip,
@@ -87,8 +88,12 @@ class ComposerPicker extends StatefulWidget {
   /// folder's branch); [selected] if null.
   final bool Function(KernelOption option)? checks;
 
-  /// Draws a filled pill, used for the mode picker.
+  /// Draws a filled pill, used for emphasized pickers.
   final bool emphasized;
+
+  /// Renders a compact icon-only ghost button (e.g. permission shield icon)
+  /// whose label/risk details appear in [tooltip] and the popup menu.
+  final bool iconOnly;
 
   /// Its label's color, where not cautioned: [AppColors.textMuted] (as the
   /// composer's) by default; fainter in a status line under a card.
@@ -780,6 +785,13 @@ class ComposerPickerState extends State<ComposerPicker> {
     // overlay under the node of what they are around, and in one node the
     // menu's would win; the hover's, under none, would leave the desktop
     // engines' semantics tree behind as it shows.
+    if (widget.iconOnly) {
+      pill = Semantics(
+        button: true,
+        label: widget.label ?? widget.selected.label,
+        child: pill,
+      );
+    }
     if (widget.tooltip case final tooltip?) {
       pill = Semantics(
         container: true,
@@ -790,7 +802,10 @@ class ComposerPickerState extends State<ComposerPicker> {
       visible: _open,
       // Above the pill; below it when there is no room (e.g. a message being
       // edited at the top of the window).
-      placement: (side: FloatingSide.top, align: FloatingAlign.start),
+      placement: (
+        side: FloatingSide.top,
+        align: widget.iconOnly ? FloatingAlign.end : FloatingAlign.start,
+      ),
       tapRegionGroupId: _tapRegion,
       outerTapRegionGroupId: widget.tapRegionGroupId,
       onTapOutside: () => _setOpen(false),
@@ -810,28 +825,47 @@ class ComposerPickerState extends State<ComposerPicker> {
   Widget _buildPill(bool hovered, bool open) {
     final colors = themeColors;
     final dark = colors.dark;
+    final ghostHoverBg = (dark ? Colors.white : Colors.black).withValues(
+      alpha: open ? (dark ? 0.10 : 0.065) : (dark ? 0.07 : 0.045),
+    );
+    if (widget.iconOnly) {
+      final iconColor = widget.selected.caution
+          ? AppColors.caution
+          : (hovered || open
+                ? AppColors.text
+                : (widget.foreground ?? AppColors.textMuted));
+      return AnimatedContainer(
+        duration: const Duration(milliseconds: 120),
+        width: 26,
+        height: 26,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: hovered || open ? ghostHoverBg : Colors.transparent,
+          shape: BoxShape.circle,
+        ),
+        child: widget.selected.iconBuilder?.call(14, iconColor) ??
+            Icon(widget.selected.icon, size: 14, color: iconColor),
+      );
+    }
+
     final emphasized = widget.emphasized;
     final color = widget.selected.caution
         ? AppColors.caution
         : emphasized
         ? AppColors.text
-        : (hovered || open ? AppColors.text : (widget.foreground ?? AppColors.textMuted));
+        : (hovered || open
+              ? AppColors.text
+              : (widget.foreground ?? AppColors.textMuted));
     return AnimatedContainer(
       duration: const Duration(milliseconds: 120),
-      height: 24,
-      padding: const EdgeInsets.only(left: 8, right: 5),
-      // Emphasized, a secondary button, as the agents window's pickers in
-      // its chat input; else a toolbar item.
+      height: 25,
+      padding: const EdgeInsets.only(left: 7.5, right: 5),
       decoration: BoxDecoration(
         color: emphasized
             ? colors[hovered || open
                   ? 'button.secondaryHoverBackground'
                   : 'button.secondaryBackground']
-            : open
-            ? colors['toolbar.activeBackground']
-            : hovered
-            ? colors['toolbar.hoverBackground']
-            : colors['toolbar.hoverBackground'].withValues(alpha: 0),
+            : (hovered || open ? ghostHoverBg : Colors.transparent),
         border: switch (emphasized
             ? (colors.get('button.secondaryBorder') ??
                   (dark
@@ -841,7 +875,7 @@ class ComposerPickerState extends State<ComposerPicker> {
           final border? => Border.all(color: border),
           null => null,
         },
-        borderRadius: BorderRadius.circular(7.5),
+        borderRadius: BorderRadius.circular(7),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
@@ -869,8 +903,8 @@ class ComposerPickerState extends State<ComposerPicker> {
           const SizedBox(width: 1),
           Icon(
             Icons.keyboard_arrow_down_rounded,
-            size: 14.5,
-            color: AppColors.textFaint,
+            size: 14,
+            color: hovered || open ? AppColors.textMuted : AppColors.textFaint,
           ),
         ],
       ),

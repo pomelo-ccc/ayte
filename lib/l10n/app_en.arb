@@ -1864,7 +1864,7 @@
   "@composerMentions": {
     "description": "Title of the menu @ opens in the composer: the project's files and folders, then the other conversations to refer to, under their projects' folders."
   },
-  "composerPlaceholder": "Plan, search, build anything  ·  drop or paste files  / for commands",
+  "composerPlaceholder": "Describe a task or ask a question · drop or paste files · type / for commands",
   "composerApprovalTitle": "How should {agent} get approval?",
   "@composerApprovalTitle": {
     "placeholders": {

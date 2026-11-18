@@ -2917,7 +2917,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get composerPlaceholder =>
-      'Plan, search, build anything  ·  drop or paste files  / for commands';
+      'Describe a task or ask a question · drop or paste files · type / for commands';
 
   @override
   String composerApprovalTitle(String agent) {
