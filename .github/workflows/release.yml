@@ -1,0 +1,473 @@
+# Builds Ayte for macOS (arm64, x64), Windows (x64, arm64) and Linux (x64, arm64),
+# signs the auto-update manifest (latest.json), and publishes all installers and
+# SSH remote server binaries to GitHub Releases.
+#
+#   git tag v2.0.2 && git push origin v2.0.2   build and publish v2.0.2
+#   Actions → Release → Run workflow           build only, to verify CI
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: ${{ startsWith(github.ref, 'refs/tags/v') && 'release' || format('build-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: 3.47.5
+
+jobs:
+  check:
+    name: Check the version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      marketing: ${{ steps.version.outputs.marketing }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: version
+        name: Read pubspec.yaml's version, and match the tag against it
+        run: |
+          version=$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml)
+          marketing=${version%%+*}
+          code=$(sed -n "s/^const appVersionString = '\(.*\)';/\1/p" lib/update/version.dart)
+          echo "pubspec.yaml: $version, lib/update/version.dart: $code"
+          if [ "$version" != "$code" ]; then
+            echo "::error::lib/update/version.dart says $code, pubspec.yaml $version: run tool/bump_version.dart"
+            exit 1
+          fi
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+$ ]]; then
+            echo "::error::$version is not x.y.z+build"
+            exit 1
+          fi
+          publish=false
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if [ "$GITHUB_REF_NAME" != "v$marketing" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME, but pubspec.yaml is $version: the tag has to be v$marketing"
+              exit 1
+            fi
+            publish=true
+          fi
+          {
+            echo "version=$version"
+            echo "marketing=$marketing"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+      - name: Be no older than the version published
+        if: steps.version.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          published=$(curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/latest.json" 2>/dev/null | jq -r .version || true)
+          echo "Published: ${published:-none}, this: $VERSION"
+          [ -z "$published" ] || [ "$published" = "null" ] && exit 0
+          python3 - "$published" "$VERSION" <<'EOF'
+          import re, sys
+          def key(v):
+              m = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?(?:\+(\d+))?', v)
+              return tuple(int(x or 0) for x in m.groups())
+          published, this = sys.argv[1:]
+          if key(this) < key(published):
+              sys.exit(f'::error::{this} is older than {published}, which is published: installed apps would not take it')
+          if key(this) == key(published):
+              print(f'::warning::{this} is published already: publishing it again')
+          EOF
+
+  remote:
+    name: Remote server
+    needs: check
+    uses: ./.github/workflows/remote.yml
+
+  macos:
+    name: Build for macOS
+    needs: check
+    runs-on: macos-15
+    env:
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      NOTARY_KEY: ${{ secrets.NOTARY_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+      - name: Put the Developer ID certificate in a keychain
+        if: env.MACOS_CERTIFICATE != ''
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password=$(openssl rand -hex 24)
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "$password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/certificate.p12"
+      - name: Put the notary key in a file
+        if: env.NOTARY_KEY != ''
+        run: |
+          echo "$NOTARY_KEY" > "$RUNNER_TEMP/notary.p8"
+          echo "BAOCODE_NOTARY_KEY=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
+      - name: Install create-dmg
+        run: brew install create-dmg
+      - id: iroh
+        uses: ./.github/actions/bao-iroh-prebuilt
+      - if: steps.iroh.outputs.hit != 'true'
+        uses: ./.github/actions/setup-rust
+      - name: Build
+        run: dart run tool/build_macos.dart --build-only
+      - uses: ./.github/actions/wait-for-artifact
+        with:
+          name: remote
+          path: build/remote
+          job: Remote server / Build the remote server
+      - name: Sign, notarise and package
+        env:
+          BAOCODE_MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          BAOCODE_NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          BAOCODE_NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
+        run: dart run tool/build_macos.dart --skip-build
+      - name: Launch each app, as an update installs it
+        run: |
+          softwareupdate --install-rosetta --agree-to-license > /dev/null 2>&1 || true
+          for arch in arm64 x64; do
+            dir="$RUNNER_TEMP/launch-$arch"
+            mkdir -p "$dir" "$dir-data"
+            ditto -x -k build/installers/Ayte-*-mac-$arch.zip "$dir"
+            AYTE_DATA_DIR="$dir-data" \
+              "$dir/Ayte.app/Contents/MacOS/Ayte" > "$dir.log" 2>&1 &
+            pid=$!
+            sleep 15
+            if ! kill -0 $pid 2>/dev/null; then
+              cat "$dir.log"
+              echo "::error::Ayte ($arch) exited within 15 seconds of launch"
+              exit 1
+            fi
+            echo "Ayte ($arch) is running after 15 seconds"
+            kill $pid
+          done
+      - uses: actions/upload-artifact@v6
+        with:
+          name: macos
+          if-no-files-found: error
+          path: |
+            build/installers/Ayte-*.dmg
+            build/installers/Ayte-*-mac-*.zip
+      - uses: actions/upload-artifact@v6
+        with:
+          name: symbols-macos
+          if-no-files-found: error
+          retention-days: 90
+          path: build/symbols/App.macos.symbols
+      - name: Forget the certificate and the key
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/notary.p8"
+
+  windows:
+    name: Build for Windows (${{ matrix.arch }})
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    env:
+      ARCH_SUFFIX: ${{ matrix.arch == 'arm64' && '-arm64' || '' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: subosito/flutter-action@v2
+        if: matrix.arch == 'x64'
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+      - name: Clone Flutter
+        if: matrix.arch == 'arm64'
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch "$env:FLUTTER_VERSION" https://github.com/flutter/flutter.git "$env:RUNNER_TEMP\flutter"
+          "$env:RUNNER_TEMP\flutter\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$env:RUNNER_TEMP\flutter\bin\flutter.bat" --version
+          & "$env:RUNNER_TEMP\flutter\bin\flutter.bat" precache --windows
+      - name: Install Inno Setup
+        if: matrix.arch == 'x64'
+        run: choco install innosetup --no-progress -y
+      - name: Install Inno Setup
+        if: matrix.arch == 'arm64'
+        shell: pwsh
+        run: |
+          $is = "$env:RUNNER_TEMP\innosetup.exe"
+          Invoke-WebRequest https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe -OutFile $is
+          if ((Get-FileHash $is -Algorithm SHA256).Hash -ne '9C73C3BAE7ED48D44112A0F48E66742C00090BDB5BEF71D9D3C056C66E97B732') { throw 'innosetup-6.7.3.exe: wrong SHA-256' }
+          $setup = Start-Process $is -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-','/ALLUSERS' -Wait -PassThru
+          if ($setup.ExitCode -ne 0) { throw "Inno Setup's installer exited with $($setup.ExitCode)" }
+      - id: iroh
+        uses: ./.github/actions/bao-iroh-prebuilt
+      - if: steps.iroh.outputs.hit != 'true'
+        uses: ./.github/actions/setup-rust
+      - name: Build
+        run: dart run tool/build_windows.dart --build-only --arch ${{ matrix.arch }}
+      - uses: ./.github/actions/wait-for-artifact
+        with:
+          name: remote
+          path: build/remote
+          job: Remote server / Build the remote server
+      - name: Package
+        run: dart run tool/build_windows.dart --skip-build --remote-built --arch ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v6
+        with:
+          name: windows-${{ matrix.arch }}
+          if-no-files-found: error
+          path: build/installers/Ayte-*-setup${{ env.ARCH_SUFFIX }}.exe
+      - uses: actions/upload-artifact@v6
+        with:
+          name: symbols-windows-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 90
+          path: build/symbols/app.windows-${{ matrix.arch }}.symbols
+
+  linux:
+    name: Build for Linux (${{ matrix.arch }})
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ubuntu:20.04
+      options: --dns 8.8.8.8 --dns 1.1.1.1
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    steps:
+      - name: Install the build's tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sed -i 's#http://\(archive\|security\)\.ubuntu\.com#http://azure.archive.ubuntu.com#' \
+            /etc/apt/sources.list
+          for attempt in 1 2 3 4 5; do
+            apt-get -o Acquire::Retries=5 update 2>&1 | tee "$RUNNER_TEMP/apt.log" || true
+            grep -q '^[WE]: Failed to fetch' "$RUNNER_TEMP/apt.log" || break
+            [ "$attempt" = 5 ] && exit 1
+            sleep 15
+          done
+          apt-get -o Acquire::Retries=5 install -y build-essential ca-certificates curl git jq unzip \
+            xz-utils zip file clang cmake ninja-build pkg-config libgtk-3-dev \
+            liblzma-dev python3 procps xvfb xauth dbus-x11 zstd
+          git config --global --add safe.directory '*'
+      - uses: actions/checkout@v5
+      - uses: subosito/flutter-action@v2
+        if: matrix.arch == 'x64'
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+      - name: Clone Flutter
+        if: matrix.arch == 'arm64'
+        run: |
+          git clone --depth 1 --branch "$FLUTTER_VERSION" \
+            https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/flutter/bin/flutter" --version
+      - id: iroh
+        uses: ./.github/actions/bao-iroh-prebuilt
+      - if: steps.iroh.outputs.hit != 'true'
+        uses: ./.github/actions/setup-rust
+      - name: Build
+        run: |
+          mkdir -p build/symbols
+          flutter build linux --release \
+            "--extra-gen-snapshot-options=--save-debugging-info=$PWD/build/symbols/app.linux-${{ matrix.arch }}.symbols"
+      - uses: ./.github/actions/wait-for-artifact
+        with:
+          name: remote
+          path: build/remote
+          job: Remote server / Build the remote server
+      - name: Package the .deb and the tarball
+        run: |
+          sh tool/package_linux_deb.sh
+          dpkg-deb --info build/installers/Ayte-*.deb
+          dpkg-deb --contents build/installers/Ayte-*.deb | grep -q 'lib/libbao_iroh.so$'
+          need=$(dpkg-deb --field build/installers/Ayte-*.deb Depends \
+            | sed -n 's/.*libc6 (>= \([0-9.]*\)).*/\1/p')
+          have=$(ldd --version | head -1 | grep -o '[0-9.]*$')
+          echo "glibc needed: $need, the image's: $have"
+          if [ -z "$need" ] || [ "$(printf '%s\n' "$need" "$have" | sort -V | tail -1)" != "$have" ]; then
+            echo "::error::The package needs glibc $need, newer than the image's $have"
+            exit 1
+          fi
+      - name: Install the package and launch it
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get install -y ./build/installers/Ayte-*.deb
+          log="$RUNNER_TEMP/launch.log"
+          mkdir -p "$HOME/.config/google-chrome"
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/runtime"
+          mkdir -m 700 "$XDG_RUNTIME_DIR"
+          mkdir "$RUNNER_TEMP/launch-data"
+          AYTE_DATA_DIR="$RUNNER_TEMP/launch-data" \
+            dbus-run-session -- xvfb-run -a /opt/ayte/baocode > "$log" 2>&1 &
+          sleep 15
+          if ! pgrep -x baocode > /dev/null; then
+            cat "$log"
+            echo "::error::Ayte exited within 15 seconds of launch"
+            exit 1
+          fi
+          echo "Ayte is running after 15 seconds"
+          manifest="$HOME/.config/google-chrome/NativeMessagingHosts/dev.baocode.browser.json"
+          cat "$manifest"
+          grep -q '"path": "/opt/ayte/baocode-browser-host"' "$manifest"
+          python3 - << 'EOF'
+          import json, signal, struct, subprocess
+          signal.alarm(10)
+          host = subprocess.Popen(
+              ["/opt/ayte/baocode-browser-host",
+               "chrome-extension://jfjagocghaaheooicmdnhcholmgdkngk/"],
+              stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+          while True:
+              n = struct.unpack("<I", host.stdout.read(4))[0]
+              said = json.loads(host.stdout.read(n))
+              print("host said", said)
+              if said == {"type": "bridge", "connected": True}:
+                  break
+          host.stdin.close()
+          host.wait()
+          EOF
+          pkill -x baocode || true
+      - uses: actions/upload-artifact@v6
+        with:
+          name: linux-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            build/installers/Ayte-*.deb
+            build/installers/Ayte-*.tar.gz
+      - uses: actions/upload-artifact@v6
+        with:
+          name: symbols-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 90
+          path: build/symbols/app.linux-${{ matrix.arch }}.symbols
+
+  publish:
+    name: Publish to GitHub Releases
+    needs: [check, remote, macos, windows, linux]
+    if: needs.check.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      MARKETING: ${{ needs.check.outputs.marketing }}
+      GH_TOKEN: ${{ github.token }}
+      SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+      - id: iroh
+        uses: ./.github/actions/bao-iroh-prebuilt
+      - if: steps.iroh.outputs.hit != 'true'
+        uses: ./.github/actions/setup-rust
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+      - name: Gather the files
+        run: |
+          mkdir -p out
+          for arch in arm64 x64; do
+            cp dist/macos/Ayte-$MARKETING-$arch.dmg \
+              dist/macos/Ayte-$MARKETING-mac-$arch.zip out/
+          done
+          cp dist/windows-x64/Ayte-$MARKETING-setup.exe \
+            dist/windows-arm64/Ayte-$MARKETING-setup-arm64.exe out/
+          for arch in x64 arm64; do
+            cp dist/linux-$arch/Ayte-$MARKETING-linux-*.deb \
+              dist/linux-$arch/Ayte-$MARKETING-linux-*.tar.gz out/
+          done
+          cp dist/remote/*.gz dist/remote/servers.json out/
+          find out -type f | sort
+      - name: Sign the release into latest.json
+        if: env.SIGNING_KEY != ''
+        run: |
+          flutter pub get
+          key="$RUNNER_TEMP/update-signing.key"
+          printf '%s\n' "$SIGNING_KEY" > "$key"
+          chmod 600 "$key"
+          notes=()
+          for language in en zh; do
+            file="release-notes/$MARKETING.$language.md"
+            if [ -f "$file" ]; then
+              notes+=(--notes-$language "$file")
+            fi
+          done
+          BAOCODE_UPDATE_SIGNING_KEY="$key" dart run tool/release_manifest.dart \
+            --version "$VERSION" \
+            --windows out/Ayte-$MARKETING-setup.exe \
+            --windows-arm64 out/Ayte-$MARKETING-setup-arm64.exe \
+            --macos-arm64 out/Ayte-$MARKETING-mac-arm64.zip \
+            --macos-x64 out/Ayte-$MARKETING-mac-x64.zip \
+            --dmg-arm64 out/Ayte-$MARKETING-arm64.dmg \
+            --dmg-x64 out/Ayte-$MARKETING-x64.dmg \
+            --linux-x64 out/Ayte-$MARKETING-linux-amd64.deb \
+            --linux-arm64 out/Ayte-$MARKETING-linux-arm64.deb \
+            --manifest out/latest.json \
+            "${notes[@]}"
+          rm -f "$key"
+      - name: Publish the GitHub release
+        run: |
+          body_file="$RUNNER_TEMP/release-body.md"
+          if [ -f "release-notes/$MARKETING.zh.md" ] && [ -f "release-notes/$MARKETING.en.md" ]; then
+            {
+              cat "release-notes/$MARKETING.zh.md"
+              echo ""
+              echo "---"
+              echo ""
+              cat "release-notes/$MARKETING.en.md"
+            } > "$body_file"
+            notes=(--notes-file "$body_file")
+          elif [ -f "release-notes/$MARKETING.zh.md" ]; then
+            notes=(--notes-file "release-notes/$MARKETING.zh.md")
+          elif [ -f "release-notes/$MARKETING.en.md" ]; then
+            notes=(--notes-file "release-notes/$MARKETING.en.md")
+          else
+            notes=(--generate-notes)
+          fi
+          assets=(
+            out/Ayte-$MARKETING-arm64.dmg
+            out/Ayte-$MARKETING-x64.dmg
+            out/Ayte-$MARKETING-mac-arm64.zip
+            out/Ayte-$MARKETING-mac-x64.zip
+            out/Ayte-$MARKETING-setup.exe
+            out/Ayte-$MARKETING-setup-arm64.exe
+            out/Ayte-$MARKETING-linux-amd64.deb
+            out/Ayte-$MARKETING-linux-arm64.deb
+            out/Ayte-$MARKETING-linux-amd64.tar.gz
+            out/Ayte-$MARKETING-linux-arm64.tar.gz
+            out/servers.json
+            out/baocode-server-*.gz
+          )
+          if [ -f out/latest.json ]; then
+            assets+=(out/latest.json)
+          fi
+          gh release delete "v$MARKETING" --yes 2>/dev/null || true
+          gh release create "v$MARKETING" --title "Ayte $MARKETING" "${notes[@]}" "${assets[@]}"

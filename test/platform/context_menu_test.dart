@@ -42,19 +42,19 @@ void main() {
     );
 
     test('on when pluginkit lists it with a +; off otherwise', () async {
-      listed = '     dev.baocode.desktop.FinderExtension(1.0.0)\n';
+      listed = '     dev.ayte.desktop.FinderExtension(1.0.0)\n';
       expect(await menu().status(), ContextMenuStatus.off);
-      listed = '-    dev.baocode.desktop.FinderExtension(1.0.0)\n';
+      listed = '-    dev.ayte.desktop.FinderExtension(1.0.0)\n';
       expect(await menu().status(), ContextMenuStatus.off);
       listed =
-          '     dev.baocode.desktop.FinderExtension(1.0.0)\n'
-          '+    dev.baocode.desktop.FinderExtension(1.0.0)\n';
+          '     dev.ayte.desktop.FinderExtension(1.0.0)\n'
+          '+    dev.ayte.desktop.FinderExtension(1.0.0)\n';
       expect(await menu().status(), ContextMenuStatus.on);
       expect(ran.last, [
         'pluginkit',
         '-m',
         '-i',
-        'dev.baocode.desktop.FinderExtension',
+        'dev.ayte.desktop.FinderExtension',
       ]);
     });
 
@@ -69,7 +69,7 @@ void main() {
             '-e',
             'use',
             '-i',
-            'dev.baocode.desktop.FinderExtension',
+            'dev.ayte.desktop.FinderExtension',
           ],
         ]);
         ran.clear();
@@ -80,7 +80,7 @@ void main() {
             '-e',
             'ignore',
             '-i',
-            'dev.baocode.desktop.FinderExtension',
+            'dev.ayte.desktop.FinderExtension',
           ],
         ]);
       },
@@ -143,12 +143,12 @@ void main() {
         'folder\'s and its background\'s the folder', () {
       final entries = menu().entries(labels);
       expect(entries.map((entry) => entry.key), [
-        r'Software\Classes\*\shell\BaoCode',
-        r'Software\Classes\*\shell\BaoCodeFastIde',
-        r'Software\Classes\Directory\shell\BaoCode',
-        r'Software\Classes\Directory\shell\BaoCodeFastIde',
-        r'Software\Classes\Directory\Background\shell\BaoCode',
-        r'Software\Classes\Directory\Background\shell\BaoCodeFastIde',
+        r'Software\Classes\*\shell\Ayte',
+        r'Software\Classes\*\shell\AyteFastIde',
+        r'Software\Classes\Directory\shell\Ayte',
+        r'Software\Classes\Directory\shell\AyteFastIde',
+        r'Software\Classes\Directory\Background\shell\Ayte',
+        r'Software\Classes\Directory\Background\shell\AyteFastIde',
       ]);
       expect(entries[0].label, 'Open with BaoCode');
       expect(entries[0].command, '"$exe" --baocode-agent "%1"');
@@ -173,7 +173,7 @@ void main() {
       final written = jsonDecode(environment['BAOCODE_MENU']!) as List;
       expect(written, hasLength(6));
       expect(written.first, {
-        'key': r'Software\Classes\*\shell\BaoCode',
+        'key': r'Software\Classes\*\shell\Ayte',
         'label': 'Open with BaoCode',
         'command': '"$exe" --baocode-agent "%1"',
       });
@@ -184,7 +184,7 @@ void main() {
       await menu().uninstall();
       final removed =
           jsonDecode(environments.first!['BAOCODE_MENU']!) as List<Object?>;
-      expect(removed, contains(r'Software\Classes\Directory\shell\BaoCode'));
+      expect(removed, contains(r'Software\Classes\Directory\shell\Ayte'));
       expect(removed, hasLength(6));
 
       where = '0 1';

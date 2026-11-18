@@ -5015,7 +5015,7 @@ abstract class AppLocalizations {
   /// No description provided for @composerPlaceholder.
   ///
   /// In en, this message translates to:
-  /// **'Plan, search, build anything  ·  drop or paste files  / for commands'**
+  /// **'Describe a task or ask a question · drop or paste files · type / for commands'**
   String get composerPlaceholder;
 
   /// No description provided for @composerApprovalTitle.

@@ -53,8 +53,8 @@ const _platforms = [
   'windows-arm64',
 ];
 
-/// Where the gzipped builds are downloaded from: `<base>/<VERSION>/<file>`.
-const _downloadsBase = 'https://dl.baocode.dev/releases/remote';
+/// Where the gzipped builds are downloaded from: `<base>/v<marketing>/<file>`.
+const _downloadsBase = 'https://github.com/pomelo-ccc/ayte/releases/download';
 
 Future<void> main(List<String> arguments) async {
   final root = File.fromUri(Platform.script).parent.parent.absolute;
@@ -158,6 +158,7 @@ Future<void> main(List<String> arguments) async {
   final name = '${version.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '.')}-$hash';
   File('${out.path}/VERSION').writeAsStringSync('$name\n');
 
+  final marketing = version.split('+').first;
   _step('Compressing the builds for download');
   final files = <String, Object?>{};
   for (final platform in _platforms) {
@@ -168,7 +169,7 @@ Future<void> main(List<String> arguments) async {
         .encode(File('${out.path}/baocode-server-$platform').readAsBytesSync());
     File('${out.path}/$file').writeAsBytesSync(bytes);
     files[platform] = {
-      'url': '$_downloadsBase/$name/$file',
+      'url': '$_downloadsBase/v$marketing/$file',
       'size': bytes.length,
       'sha256': '${sha256.convert(bytes)}',
     };

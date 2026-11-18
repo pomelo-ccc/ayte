@@ -218,7 +218,7 @@ class WindowsUpdateInstaller implements UpdateInstaller {
 /// tool/baocode.iss's AppId, which never changes.
 const windowsUninstallKey =
     r'Software\Microsoft\Windows\CurrentVersion\Uninstall\'
-    '{6fdd732b-95c6-4c37-af6f-ff574358deb5}_is1';
+    '{a97e4c1d-82b4-4f63-9c12-7e3a8b51f042}_is1';
 
 /// Whether [executable] is under one of the Program Files folders, where
 /// a per-machine install puts it.
@@ -466,7 +466,7 @@ rm -f "\$0"
 // --- Linux -------------------------------------------------------------------
 
 /// Where the package (tool/package_linux_deb.sh) installs the app.
-const linuxInstallDirectory = '/opt/baocode';
+const linuxInstallDirectory = '/opt/ayte';
 
 /// The Linux build an app updates to: the one for the processor.
 @visibleForTesting
@@ -534,7 +534,7 @@ class LinuxUpdateInstaller implements UpdateInstaller {
       final result = await processes.run('dpkg-query', [
         '-W',
         r'-f=${Status}',
-        'baocode',
+        'ayte',
       ]);
       return result.exitCode == 0 &&
           '${result.stdout}'.contains('install ok installed');

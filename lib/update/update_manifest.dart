@@ -5,15 +5,16 @@ import 'dart:convert';
 import 'version.dart';
 
 /// Where the app looks for its next version: the release manifest
-/// dl.baocode.dev serves (docs/auto-update.md has its format).
-const defaultManifestUrl = 'https://dl.baocode.dev/releases/latest.json';
+/// published on GitHub Releases (docs/auto-update.md has its format).
+const defaultManifestUrl =
+    'https://github.com/pomelo-ccc/ayte/releases/latest/download/latest.json';
 
 /// The environment variable that points the app at another manifest, to
 /// try a release before it is published (a local server's, say).
 const manifestUrlVariable = 'BAOCODE_UPDATE_URL';
 
 /// A manifest that cannot be used: not JSON, a field missing or wrong, a
-/// download not on baocode.dev.
+/// download not on an allowed release host.
 class UpdateManifestException implements Exception {
   const UpdateManifestException(this.message);
 
@@ -23,8 +24,8 @@ class UpdateManifestException implements Exception {
   String toString() => 'Invalid update manifest: $message';
 }
 
-/// Which download links a manifest may give: https on baocode.dev (or a
-/// subdomain of it), and [extraOrigins] besides — the origin of a manifest
+/// Which download links a manifest may give: https on github.com/pomelo-ccc/ayte
+/// (or baocode.dev), and [extraOrigins] besides — the origin of a manifest
 /// [manifestUrlVariable] points at, so a release can be tried from where it
 /// is served before it is published.
 class UpdateUrlPolicy {
@@ -39,6 +40,7 @@ class UpdateUrlPolicy {
       : UpdateUrlPolicy(extraOrigins: {manifest.origin});
 
   static const domain = 'baocode.dev';
+  static const githubRepoReleasesPrefix = '/pomelo-ccc/ayte/releases/';
 
   final Set<String> extraOrigins;
 
@@ -50,10 +52,14 @@ class UpdateUrlPolicy {
       return true;
     }
     final host = url.host.toLowerCase();
-    return url.scheme == 'https' &&
-        !url.hasPort &&
-        url.userInfo.isEmpty &&
-        (host == domain || host.endsWith('.$domain'));
+    if (url.scheme != 'https' || url.hasPort || url.userInfo.isNotEmpty) {
+      return false;
+    }
+    if (host == 'github.com' &&
+        url.path.startsWith(githubRepoReleasesPrefix)) {
+      return true;
+    }
+    return host == domain || host.endsWith('.$domain');
   }
 }
 

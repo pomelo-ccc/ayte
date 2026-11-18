@@ -37,11 +37,18 @@ cd "$REPO"
   release_macos_bundle_flutter_assets
 
 ditto "$STAGE_DIR/Template.app" "$STAGE_DIR/Ayte.app"
+FULL_VER="$(sed -n 's/^version:[[:space:]]*//p' "$REPO/pubspec.yaml")"
+SHORT_VER="${FULL_VER%%+*}"
+BUILD_VER="${FULL_VER#*+}"
+if [[ "$BUILD_VER" == "$FULL_VER" ]]; then BUILD_VER="0"; fi
+
 PLIST="$STAGE_DIR/Ayte.app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName Ayte" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Ayte" "$PLIST" 2>/dev/null || \
   /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Ayte" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier dev.ayte.desktop" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $SHORT_VER" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_VER" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :NSHumanReadableCopyright 'Copyright © 2026 Ayte. All rights reserved.'" "$PLIST" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLName dev.ayte.desktop" "$PLIST" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 ayte" "$PLIST" 2>/dev/null || true
@@ -51,6 +58,8 @@ if [[ -f "$EXT_PLIST" ]]; then
   /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Ayte" "$EXT_PLIST" 2>/dev/null || \
     /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Ayte" "$EXT_PLIST"
   /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier dev.ayte.desktop.FinderExtension" "$EXT_PLIST"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $SHORT_VER" "$EXT_PLIST" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_VER" "$EXT_PLIST" 2>/dev/null || true
 fi
 
 rm -f "$STAGE_DIR/Ayte.app/Contents/Resources/Assets.car"

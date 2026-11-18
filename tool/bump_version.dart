@@ -66,6 +66,21 @@ Future<void> main(List<String> arguments) async {
   source.writeAsStringSync(
     sourceText.replaceFirst(sourcePattern, "const appVersionString = '$next';"),
   );
+  for (final name in ['README.md', 'README_CN.md']) {
+    final readme = File('${root.path}/$name');
+    if (!readme.existsSync()) continue;
+    final before = readme.readAsStringSync();
+    final updated = before
+        .replaceAll(
+          RegExp(r'/releases/download/v\d+\.\d+\.\d+/Ayte-\d+\.\d+\.\d+-'),
+          '/releases/download/v${next.marketing}/Ayte-${next.marketing}-',
+        )
+        .replaceAll(
+          RegExp(r'Ayte-\d+\.\d+\.\d+-'),
+          'Ayte-${next.marketing}-',
+        );
+    if (updated != before) readme.writeAsStringSync(updated);
+  }
   stdout
     ..writeln('$current -> $next')
     ..writeln('  ${pubspec.path}')

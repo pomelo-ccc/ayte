@@ -1,0 +1,130 @@
+# Builds baocode-server (the app's SSH remote host daemon) for Linux, macOS
+# and Windows (x64 & arm64, plus Linux riscv64) and runs smoke tests on each.
+name: Remote server
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: 3.47.5
+
+jobs:
+  windows:
+    name: Build the remote server for Windows (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: subosito/flutter-action@v2
+        if: matrix.arch == 'x64'
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+      - name: Clone Flutter
+        if: matrix.arch == 'arm64'
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch "$env:FLUTTER_VERSION" https://github.com/flutter/flutter.git "$env:RUNNER_TEMP\flutter"
+          "$env:RUNNER_TEMP\flutter\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$env:RUNNER_TEMP\flutter\bin\flutter.bat" --version
+          & "$env:RUNNER_TEMP\flutter\bin\flutter.bat" precache --windows
+      - id: iroh
+        uses: ./.github/actions/bao-iroh-prebuilt
+      - if: steps.iroh.outputs.hit != 'true'
+        uses: ./.github/actions/setup-rust
+      - name: Build
+        run: dart run tool/build_remote_server.dart --out build/remote-windows --only windows-${{ matrix.arch }}
+      - name: Run it here
+        shell: pwsh
+        run: ./tool/test_remote_server_windows.ps1 build/remote-windows/baocode-server-windows-${{ matrix.arch }} ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v6
+        with:
+          name: remote-windows-${{ matrix.arch }}
+          if-no-files-found: error
+          path: build/remote-windows/baocode-server-windows-${{ matrix.arch }}
+
+  build:
+    name: Build the remote server
+    needs: windows
+    runs-on: macos-15
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+      - name: Get the x64 Dart SDK of Flutter's version
+        run: |
+          softwareupdate --install-rosetta --agree-to-license > /dev/null 2>&1 || true
+          version=$(dart --version 2>&1 | sed -n 's/^Dart SDK version: \([^ ]*\) (\([a-z]*\)).*/\1 \2/p')
+          read -r dart channel <<< "$version"
+          echo "Dart $dart ($channel)"
+          curl -fsSL -o "$RUNNER_TEMP/dart-x64.zip" \
+            "https://storage.googleapis.com/dart-archive/channels/$channel/release/$dart/sdk/dartsdk-macos-x64-release.zip"
+          unzip -q "$RUNNER_TEMP/dart-x64.zip" -d "$RUNNER_TEMP/dart-x64"
+          "$RUNNER_TEMP/dart-x64/dart-sdk/bin/dart" --version
+      - id: iroh
+        uses: ./.github/actions/bao-iroh-prebuilt
+      - if: steps.iroh.outputs.hit != 'true'
+        uses: ./.github/actions/setup-rust
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: remote-windows-*
+          merge-multiple: true
+          path: build/remote-windows
+      - name: Build for Linux and macOS, x64 and arm64, Linux riscv64, with Windows'
+        run: |
+          dart run tool/build_remote_server.dart --out build/remote --all \
+            --macos-x64-dart "$RUNNER_TEMP/dart-x64/dart-sdk/bin/dart" \
+            --from build/remote-windows
+      - id: version
+        run: echo "version=$(cat build/remote/VERSION)" >> "$GITHUB_OUTPUT"
+      - name: Run the macOS builds here
+        run: tool/test_remote_server_macos.sh build/remote
+      - uses: actions/upload-artifact@v6
+        with:
+          name: remote
+          if-no-files-found: error
+          path: |
+            build/remote/VERSION
+            build/remote/servers.json
+            build/remote/*.gz
+      - uses: actions/upload-artifact@v6
+        with:
+          name: remote-linux
+          if-no-files-found: error
+          path: |
+            build/remote/VERSION
+            build/remote/baocode-server-linux-*
+            !build/remote/*.gz
+
+  linux:
+    name: Run the remote server on Linux
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
+        with:
+          name: remote-linux
+          path: build/remote
+      - uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64,riscv64
+      - name: Run it on Linux distributions, in Docker
+        run: |
+          chmod 755 build/remote/baocode-server-linux-*
+          tool/test_remote_server.sh build/remote

@@ -51,13 +51,12 @@ import 'package:baocode/update/update_signature.dart';
 import 'package:baocode/update/version.dart';
 import 'package:crypto/crypto.dart' as crypto;
 
-/// Where the downloads go: `<base>/<1.2.0>/<file>`.
-const _releasesBase = 'https://dl.baocode.dev/releases';
+/// Where the downloads go on GitHub Releases: `<base>/v<version>/<file>`.
+const _releasesBase = 'https://github.com/pomelo-ccc/ayte/releases/download';
 
-/// [name]'s link, for the file whose SHA-256 is [sha256].
-Uri _link(AppVersion version, String name, String sha256) => Uri.parse(
-  '$_releasesBase/${version.marketing}/$name?sha256=${sha256.substring(0, 16)}',
-);
+/// [name]'s link on the version's GitHub Release.
+Uri _link(AppVersion version, String name, String sha256) =>
+    Uri.parse('$_releasesBase/v${version.marketing}/$name');
 
 /// The Macs built for, each its own download (tool/build_macos.dart), and
 /// the app takes its processor's (lib/update/installer_io.dart).

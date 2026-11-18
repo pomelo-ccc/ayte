@@ -47,16 +47,16 @@
 ; Base of the identity Windows uses for the installed app. It must not change
 ; between versions, or an upgrade installs beside the old one instead of over
 ; it.
-AppId={{6fdd732b-95c6-4c37-af6f-ff574358deb5}
-AppName=Kestrel
+AppId={{a97e4c1d-82b4-4f63-9c12-7e3a8b51f042}
+AppName=Ayte
 AppVersion={#VersionNumber}
-AppPublisher=Kestrel
-AppVerName=Kestrel {#VersionNumber}
-DefaultDirName={autopf}\Kestrel
-DefaultGroupName=Kestrel
-UninstallDisplayName=Kestrel
+AppPublisher=Ayte
+AppVerName=Ayte {#VersionNumber}
+DefaultDirName={autopf}\Ayte
+DefaultGroupName=Ayte
+UninstallDisplayName=Ayte
 UninstallDisplayIcon={app}\baocode.exe
-OutputBaseFilename=Kestrel-{#VersionNumber}-setup{#ArchSuffix}{#Edition}
+OutputBaseFilename=Ayte-{#VersionNumber}-setup{#ArchSuffix}{#Edition}
 OutputDir={#OutDir}
 ; What Explorer shows for the installer itself. Windows wants four numbers,
 ; where pubspec's version has three.
@@ -99,10 +99,10 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; \
   GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "addtopath"; Description: "Add BaoCode to the PATH"; \
+Name: "addtopath"; Description: "Add Ayte to the PATH"; \
   GroupDescription: "Other:"; Flags: unchecked
 Name: "contextmenu"; \
-  Description: "Add ""Open with BaoCode"" and ""Open with Fast Ide"" to Explorer's context menu"; \
+  Description: "Add ""Open with Ayte"" and ""Open with Fast Ide"" to Explorer's context menu"; \
   GroupDescription: "Other:"
 
 [Files]
@@ -127,9 +127,9 @@ Type: files; Name: "{app}\baocode-browser-host.exe.*.old"
 Type: files; Name: "{app}\baocode-browser-host.exe.*.old"
 
 [Icons]
-Name: "{group}\BaoCode"; Filename: "{app}\baocode.exe"
-Name: "{group}\{cm:UninstallProgram,BaoCode}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\BaoCode"; Filename: "{app}\baocode.exe"; Tasks: desktopicon
+Name: "{group}\Ayte"; Filename: "{app}\baocode.exe"
+Name: "{group}\{cm:UninstallProgram,Ayte}"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\Ayte"; Filename: "{app}\baocode.exe"; Tasks: desktopicon
 
 [Registry]
 ; Only when asked for. Which hive follows the install mode: a per-machine
@@ -159,59 +159,59 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\Windows Error Reporting\RuntimeE
 ; user). Windows 11 lists them under "Show more options". Unticked on a
 ; reinstall, they go. Settings → General writes the same keys under HKCU
 ; (lib/platform/context_menu_io.dart), for the user alone.
-Root: HKA; Subkey: "Software\Classes\*\shell\BaoCode"; ValueType: string; \
-  ValueName: ""; ValueData: "{code:MenuLabel|BaoCode}"; Tasks: contextmenu; \
+Root: HKA; Subkey: "Software\Classes\*\shell\Ayte"; ValueType: string; \
+  ValueName: ""; ValueData: "{code:MenuLabel|Ayte}"; Tasks: contextmenu; \
   Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\*\shell\BaoCode"; ValueType: string; \
+Root: HKA; Subkey: "Software\Classes\*\shell\Ayte"; ValueType: string; \
   ValueName: "Icon"; ValueData: """{app}\baocode.exe"""; Tasks: contextmenu
-Root: HKA; Subkey: "Software\Classes\*\shell\BaoCode\command"; \
+Root: HKA; Subkey: "Software\Classes\*\shell\Ayte\command"; \
   ValueType: string; ValueName: ""; \
   ValueData: """{app}\baocode.exe"" --baocode-agent ""%1"""; Tasks: contextmenu
-Root: HKA; Subkey: "Software\Classes\Directory\shell\BaoCode"; \
-  ValueType: string; ValueName: ""; ValueData: "{code:MenuLabel|BaoCode}"; \
+Root: HKA; Subkey: "Software\Classes\Directory\shell\Ayte"; \
+  ValueType: string; ValueName: ""; ValueData: "{code:MenuLabel|Ayte}"; \
   Tasks: contextmenu; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\Directory\shell\BaoCode"; \
-  ValueType: string; ValueName: "Icon"; ValueData: """{app}\baocode.exe"""; \
+Root: HKA; Subkey: "Software\Classes\Directory\shell\Ayte"; ValueType: string; \
+  ValueName: "Icon"; ValueData: """{app}\baocode.exe"""; \
   Tasks: contextmenu
-Root: HKA; Subkey: "Software\Classes\Directory\shell\BaoCode\command"; \
+Root: HKA; Subkey: "Software\Classes\Directory\shell\Ayte\command"; \
   ValueType: string; ValueName: ""; \
   ValueData: """{app}\baocode.exe"" --baocode-agent ""%V"""; Tasks: contextmenu
-Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\BaoCode"; \
-  ValueType: string; ValueName: ""; ValueData: "{code:MenuLabel|BaoCode}"; \
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\Ayte"; \
+  ValueType: string; ValueName: ""; ValueData: "{code:MenuLabel|Ayte}"; \
   Tasks: contextmenu; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\BaoCode"; \
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\Ayte"; \
   ValueType: string; ValueName: "Icon"; ValueData: """{app}\baocode.exe"""; \
   Tasks: contextmenu
-Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\BaoCode\command"; \
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\Ayte\command"; \
   ValueType: string; ValueName: ""; \
   ValueData: """{app}\baocode.exe"" --baocode-agent ""%V"""; Tasks: contextmenu
-Root: HKA; Subkey: "Software\Classes\*\shell\BaoCodeFastIde"; \
+Root: HKA; Subkey: "Software\Classes\*\shell\AyteFastIde"; \
   ValueType: string; ValueName: ""; ValueData: "{code:MenuLabel|Fast Ide}"; \
   Tasks: contextmenu; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\*\shell\BaoCodeFastIde"; \
+Root: HKA; Subkey: "Software\Classes\*\shell\AyteFastIde"; \
   ValueType: string; ValueName: "Icon"; ValueData: """{app}\baocode.exe"""; \
   Tasks: contextmenu
-Root: HKA; Subkey: "Software\Classes\*\shell\BaoCodeFastIde\command"; \
+Root: HKA; Subkey: "Software\Classes\*\shell\AyteFastIde\command"; \
   ValueType: string; ValueName: ""; \
   ValueData: """{app}\baocode.exe"" --baocode-cli ""%1"" -n ""%1"""; \
   Tasks: contextmenu
-Root: HKA; Subkey: "Software\Classes\Directory\shell\BaoCodeFastIde"; \
+Root: HKA; Subkey: "Software\Classes\Directory\shell\AyteFastIde"; \
   ValueType: string; ValueName: ""; ValueData: "{code:MenuLabel|Fast Ide}"; \
   Tasks: contextmenu; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\Directory\shell\BaoCodeFastIde"; \
+Root: HKA; Subkey: "Software\Classes\Directory\shell\AyteFastIde"; \
   ValueType: string; ValueName: "Icon"; ValueData: """{app}\baocode.exe"""; \
   Tasks: contextmenu
-Root: HKA; Subkey: "Software\Classes\Directory\shell\BaoCodeFastIde\command"; \
+Root: HKA; Subkey: "Software\Classes\Directory\shell\AyteFastIde\command"; \
   ValueType: string; ValueName: ""; \
   ValueData: """{app}\baocode.exe"" --baocode-cli ""%V"" -n ""%V"""; \
   Tasks: contextmenu
-Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\BaoCodeFastIde"; \
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\AyteFastIde"; \
   ValueType: string; ValueName: ""; ValueData: "{code:MenuLabel|Fast Ide}"; \
   Tasks: contextmenu; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\BaoCodeFastIde"; \
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\AyteFastIde"; \
   ValueType: string; ValueName: "Icon"; ValueData: """{app}\baocode.exe"""; \
   Tasks: contextmenu
-Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\BaoCodeFastIde\command"; \
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\AyteFastIde\command"; \
   ValueType: string; ValueName: ""; \
   ValueData: """{app}\baocode.exe"" --baocode-cli ""%V"" -n ""%V"""; \
   Tasks: contextmenu
@@ -222,13 +222,13 @@ Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\BaoCodeFastIde\c
 ; VS Code's vscode://file/… (baocode://file/C:/…:12:5, see FileLink in
 ; lib/window/code_args.dart). The link comes after --baocode-link, which the
 ; runner hands Flutter as a request (windows/runner/open_requests.cpp).
-Root: HKA; Subkey: "Software\Classes\baocode"; ValueType: string; \
-  ValueName: ""; ValueData: "URL:BaoCode"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\baocode"; ValueType: string; \
+Root: HKA; Subkey: "Software\Classes\ayte"; ValueType: string; \
+  ValueName: ""; ValueData: "URL:Ayte"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\ayte"; ValueType: string; \
   ValueName: "URL Protocol"; ValueData: ""
-Root: HKA; Subkey: "Software\Classes\baocode\DefaultIcon"; ValueType: string; \
+Root: HKA; Subkey: "Software\Classes\ayte\DefaultIcon"; ValueType: string; \
   ValueName: ""; ValueData: """{app}\baocode.exe"",0"
-Root: HKA; Subkey: "Software\Classes\baocode\shell\open\command"; \
+Root: HKA; Subkey: "Software\Classes\ayte\shell\open\command"; \
   ValueType: string; ValueName: ""; \
   ValueData: """{app}\baocode.exe"" --baocode-link ""%1"""
 ; The browsers' native messaging host for BaoCode's extension, always
@@ -261,21 +261,21 @@ Root: HKA; Subkey: "Software\Chromium\NativeMessagingHosts\dev.baocode.browser";
   ValueType: string; ValueName: ""; \
   ValueData: "{app}\dev.baocode.browser.json"; Flags: uninsdeletekey
 ; Unticked: what an earlier install added goes.
-Root: HKA; Subkey: "Software\Classes\*\shell\BaoCode"; ValueType: none; \
+Root: HKA; Subkey: "Software\Classes\*\shell\Ayte"; ValueType: none; \
   Tasks: not contextmenu; Flags: deletekey
-Root: HKA; Subkey: "Software\Classes\Directory\shell\BaoCode"; ValueType: none; \
+Root: HKA; Subkey: "Software\Classes\Directory\shell\Ayte"; ValueType: none; \
   Tasks: not contextmenu; Flags: deletekey
-Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\BaoCode"; \
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\Ayte"; \
   ValueType: none; Tasks: not contextmenu; Flags: deletekey
-Root: HKA; Subkey: "Software\Classes\*\shell\BaoCodeFastIde"; ValueType: none; \
+Root: HKA; Subkey: "Software\Classes\*\shell\AyteFastIde"; ValueType: none; \
   Tasks: not contextmenu; Flags: deletekey
-Root: HKA; Subkey: "Software\Classes\Directory\shell\BaoCodeFastIde"; \
+Root: HKA; Subkey: "Software\Classes\Directory\shell\AyteFastIde"; \
   ValueType: none; Tasks: not contextmenu; Flags: deletekey
-Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\BaoCodeFastIde"; \
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\AyteFastIde"; \
   ValueType: none; Tasks: not contextmenu; Flags: deletekey
 
 [Run]
-Filename: "{app}\baocode.exe"; Description: "{cm:LaunchProgram,BaoCode}"; \
+Filename: "{app}\baocode.exe"; Description: "{cm:LaunchProgram,Ayte}"; \
   Flags: nowait postinstall skipifsilent
 ; An update the app ran (lib/update/installer_io.dart) is silent, which
 ; skips the entry above: /RELAUNCH opens the app again once it is in place,

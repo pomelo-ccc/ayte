@@ -47,32 +47,32 @@ fi
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 
-mkdir -p "$stage/opt/baocode" \
+mkdir -p "$stage/opt/ayte" \
   "$stage/usr/bin" \
   "$stage/usr/share/applications" \
   "$stage/usr/share/icons/hicolor/128x128/apps" \
   "$stage/DEBIAN"
 
-cp -a "$bundle/." "$stage/opt/baocode/"
+cp -a "$bundle/." "$stage/opt/ayte/"
 cp "$root/assets/branding/app_icon.png" \
-  "$stage/usr/share/icons/hicolor/128x128/apps/baocode.png"
+  "$stage/usr/share/icons/hicolor/128x128/apps/ayte.png"
 
-cat > "$stage/usr/bin/baocode" << 'EOF'
+cat > "$stage/usr/bin/ayte" << 'EOF'
 #!/bin/sh
-exec /opt/baocode/baocode "$@"
+exec /opt/ayte/baocode "$@"
 EOF
-chmod 755 "$stage/usr/bin/baocode"
+chmod 755 "$stage/usr/bin/ayte"
 
-cat > "$stage/usr/share/applications/baocode.desktop" << 'EOF'
+cat > "$stage/usr/share/applications/ayte.desktop" << 'EOF'
 [Desktop Entry]
-Name=Kestrel
-Comment=Desktop app for Claude Code
-Exec=baocode %U
-Icon=baocode
+Name=Ayte
+Comment=Desktop workbench for Google Antigravity
+Exec=ayte %U
+Icon=ayte
 Terminal=false
 Type=Application
 Categories=Development;
-StartupWMClass=dev.baocode.desktop
+StartupWMClass=dev.ayte.desktop
 EOF
 
 # The newest glibc any of its programs and libraries asks for: what it was
@@ -88,21 +88,21 @@ fi
 # libgtk-3-0 is what the engine links. libblkid1 and liblzma5 are the
 # extra libraries Flutter's Linux bundle expects on the system.
 cat > "$stage/DEBIAN/control" << EOF
-Package: baocode
+Package: ayte
 Version: ${marketing}
 Section: devel
 Priority: optional
 Architecture: ${package_arch}
-Depends: libgtk-3-0, libblkid1, liblzma5${webkit}
-Maintainer: Kestrel <noreply@baocode.dev>
-Homepage: https://baocode.dev
-Description: Kestrel desktop for Linux
- A desktop UI for Claude Code, with a fast IDE built in.
+Depends: libc6 (>= ${glibc}), libgtk-3-0, libblkid1, liblzma5${webkit}
+Maintainer: Ayte <noreply@ayte.dev>
+Homepage: https://github.com/pomelo-ccc/ayte
+Description: Ayte desktop for Linux
+ A native desktop workbench and IDE for Google Antigravity.
 EOF
 
 out="$root/build/installers"
 mkdir -p "$out"
-name="Kestrel-${marketing}-linux-${package_arch}${edition}"
+name="Ayte-${marketing}-linux-${package_arch}${edition}"
 dpkg-deb --build --root-owner-group "$stage" "$out/$name.deb"
 tar -C "$bundle" -czf "$out/$name.tar.gz" .
 echo "Wrote $out/$name.deb"

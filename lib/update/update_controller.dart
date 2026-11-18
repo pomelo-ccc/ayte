@@ -32,11 +32,9 @@ class UpdateController {
   /// Opens a file in the app the system opens it with: the install's log.
   final Future<void> Function(String path)? openFile;
 
-  /// [version]'s notes on the site's changelog (tool/build_changelog.dart
-  /// makes it), the Chinese page for [languageCode] `zh`.
+  /// [version]'s release notes on GitHub Releases.
   static Uri changelogUrl(AppVersion version, String languageCode) => Uri.parse(
-    'https://baocode.dev/${languageCode.startsWith('zh') ? 'zh/' : ''}'
-    'changelog#v${version.marketing}',
+    'https://github.com/pomelo-ccc/ayte/releases/tag/v${version.marketing}',
   );
 
   bool _restarting = false;

@@ -171,6 +171,8 @@ void main() {
         'https://notbaocode.dev/x.exe',
         'https://baocode.dev:8443/x.exe',
         'https://user@baocode.dev/x.exe',
+        'https://github.com/other-org/ayte/releases/download/v2.0.2/x.exe',
+        'http://github.com/pomelo-ccc/ayte/releases/download/v2.0.2/x.exe',
         'ftp://baocode.dev/x.exe',
         'file:///tmp/x.exe',
         '/releases/x.exe',
@@ -185,6 +187,7 @@ void main() {
         'https://baocode.dev/releases/x.exe',
         'https://BAOCODE.dev/releases/x.exe',
         'https://cdn.baocode.dev/x.exe',
+        'https://github.com/pomelo-ccc/ayte/releases/download/v2.0.2/Ayte-2.0.2-setup.exe',
       ]) {
         expect(at(url).assetFor('windows-x64'), isNotNull, reason: url);
       }

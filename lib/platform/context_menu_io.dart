@@ -118,7 +118,7 @@ class WindowsContextMenu implements ContextMenuInstaller {
   final ShellCommandRunner _run;
 
   /// The key whose command tells the menu is there.
-  static const _probeKey = r'Software\Classes\Directory\shell\BaoCode\command';
+  static const _probeKey = r'Software\Classes\Directory\shell\Ayte\command';
 
   /// The keys, named [labels]: a file's item takes the file (`%1`), a
   /// folder's and its background's the folder (`%V`).
@@ -131,12 +131,12 @@ class WindowsContextMenu implements ContextMenuInstaller {
         (r'Directory\Background', '%V'),
       ]) ...[
         (
-          key: 'Software\\Classes\\$kind\\shell\\BaoCode',
+          key: 'Software\\Classes\\$kind\\shell\\Ayte',
           label: labels.agent,
           command: '$app ${CodeArgs.windowsAgentFlag} "$target"',
         ),
         (
-          key: 'Software\\Classes\\$kind\\shell\\BaoCodeFastIde',
+          key: 'Software\\Classes\\$kind\\shell\\AyteFastIde',
           label: labels.ide,
           command: '$app ${CodeArgs.windowsRequestFlag} "$target" -n "$target"',
         ),
