@@ -67,7 +67,7 @@ void main() {
       expect(kernel.loadingHistory, isFalse);
       expect(kernel.model.selected, '@antigravity-cli/gemini-4-hydrogen');
       expect(kernel.effort.selected, 'xhigh');
-      expect(kernel.contextSize.selected, isNull);
+      expect(kernel.contextSize.selected, '256000');
       expect(kernel.contextWindow, 256000);
     },
   );

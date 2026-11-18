@@ -141,9 +141,26 @@ Future<(String, int)> _run(
   final cli = await LocalAntigravity.locate();
   final proxy = await NetworkProxy.instance.environment();
   final certificates = await nodeCertificatesEnvironment(cli.environment);
+  var effectivePrompt = prompt;
+  if (message) {
+    // Extract plain text blocks when called via claudeHaikuMessage JSON.
+    try {
+      if (jsonDecode(prompt.trim()) case {
+        'message': {'content': final List content},
+      }) {
+        final texts = [
+          for (final item in content)
+            if (item case {'type': 'text', 'text': final String t}) t,
+        ];
+        if (texts.isNotEmpty) effectivePrompt = texts.join('\n\n');
+      }
+    } on FormatException {
+      // Keep prompt as-is.
+    }
+  }
   final combinedPrompt = system.trim().isEmpty
-      ? prompt
-      : 'System instruction: $system\n\n$prompt';
+      ? effectivePrompt
+      : 'System instruction: $system\n\n$effectivePrompt';
   final parsed = AntigravityModels.parseVariant(
     model ?? 'gemini-3.8-flash-low',
   );
@@ -153,30 +170,28 @@ Future<(String, int)> _run(
   final cliEffort =
       parsed?.effort ??
       (parsed?.model.effortLevels.contains('low') == true ? 'low' : null);
+  final childEnv = <String, String>{
+    ...cli.environment,
+    ...proxy,
+    ...certificates,
+  };
   final Process process;
   try {
     process = await Process.start(
       cli.executable,
       [
-        '--print',
         '--disable-slash-commands',
         '--dangerously-skip-permissions',
-        '--output-format',
-        'json',
-        '--model',
-        cliModel,
-        if (cliEffort != null) ...['--effort', cliEffort],
-        combinedPrompt,
+        '--output-format=json',
+        '--model=$cliModel',
+        if (cliEffort != null) '--effort=$cliEffort',
+        '--print=$combinedPrompt',
       ],
       workingDirectory: switch (tools?.directory) {
         final directory? when Directory(directory).existsSync() => directory,
         _ => Directory.systemTemp.path,
       },
-      environment: {
-        ...cli.environment,
-        ...proxy,
-        ...certificates,
-      },
+      environment: childEnv,
       includeParentEnvironment: Platform.isWindows,
     );
   } on ProcessException catch (error) {
@@ -208,29 +223,85 @@ Future<(String, int)> _run(
   );
   if (cancelled) throw const ClaudeHaikuCancelled();
   await stdout;
+
+  bool emitDecoded(Object? decoded) {
+    if (decoded is! Map) return false;
+    if (decoded['conversation_id'] case final String convId
+        when convId.isNotEmpty) {
+      _cleanupEphemeralAgyConversation(convId, childEnv);
+    }
+    if (decoded['response'] case final String response) {
+      onLine(
+        jsonEncode({
+          'type': 'result',
+          'subtype': 'success',
+          'is_error': decoded['status'] == 'ERROR',
+          'result': response,
+          if (decoded['usage'] is Map) 'usage': decoded['usage'],
+        }),
+      );
+      return true;
+    }
+    return false;
+  }
+
+  var matched = false;
   for (final raw in stdoutLines) {
     final trimmed = raw.trim();
     if (!trimmed.startsWith('{')) continue;
     try {
-      final decoded = jsonDecode(trimmed);
-      if (decoded is Map && decoded['response'] is String) {
-        onLine(
-          jsonEncode({
-            'type': 'result',
-            'subtype': 'success',
-            'is_error': decoded['status'] == 'ERROR',
-            'result': decoded['response'],
-            if (decoded['usage'] is Map) 'usage': decoded['usage'],
-          }),
-        );
+      if (emitDecoded(jsonDecode(trimmed))) {
+        matched = true;
       } else {
         onLine(trimmed);
       }
     } on FormatException {
-      onLine(trimmed);
+      // May be multi-line JSON; handled below.
+    }
+  }
+  if (!matched && stdoutLines.isNotEmpty) {
+    final joined = stdoutLines.join('\n').trim();
+    final braceStart = joined.indexOf('{');
+    if (braceStart >= 0) {
+      try {
+        matched = emitDecoded(jsonDecode(joined.substring(braceStart)));
+      } on FormatException {
+        // Leave raw lines below.
+      }
+    }
+    if (!matched) {
+      for (final raw in stdoutLines) {
+        onLine(raw);
+      }
     }
   }
   return (await stderr, code);
+}
+
+void _cleanupEphemeralAgyConversation(
+  String convId,
+  Map<String, String> env,
+) {
+  // Guard against any path traversal characters.
+  if (!RegExp(r'^[A-Za-z0-9_-]+$').hasMatch(convId)) return;
+  final home =
+      env['HOME'] ??
+      env['USERPROFILE'] ??
+      Platform.environment['HOME'] ??
+      Platform.environment['USERPROFILE'] ??
+      '';
+  if (home.isEmpty) return;
+  final root = '$home/.gemini/antigravity-cli';
+  for (final ext in const ['.db', '.db-wal', '.db-shm', '.pb']) {
+    unawaited(
+      File('$root/conversations/$convId$ext').delete().catchError((Object _) => File('')),
+    );
+  }
+  unawaited(
+    Directory('$root/brain/$convId')
+        .delete(recursive: true)
+        .catchError((Object _) => Directory('')),
+  );
 }
 
 /// [_run] on BaoCode's own core: one turn of an engine in an isolate of its

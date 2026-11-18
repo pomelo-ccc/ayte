@@ -161,7 +161,7 @@ void main() {
         // and fixed-window Carbon reports Cortex's real 256K compaction limit.
         expect(kernel.model.selected, '@antigravity-cli/gemini-4-carbon');
         expect(kernel.effort.selected, 'medium');
-        expect(kernel.contextSize.selected, isNull);
+        expect(kernel.contextSize.selected, '256000');
         expect(kernel.contextWindow, 256000);
         expect(
           kernel.contextSize.selectedFor('@antigravity-cli/gemini-4-argon'),
@@ -172,7 +172,7 @@ void main() {
             .optionsFor('@antigravity-cli/gemini-4-carbon')
             .map((o) => o.label)
             .toList();
-        expect(carbonContexts, isEmpty);
+        expect(carbonContexts, ['256K（官方固定）']);
 
         final argonContexts = kernel.contextSize
             .optionsFor('@antigravity-cli/gemini-4-argon')
@@ -184,7 +184,7 @@ void main() {
             .optionsFor('@antigravity-cli/gpt-oss-120b')
             .map((o) => o.label)
             .toList();
-        expect(gptContexts, isEmpty);
+        expect(gptContexts, ['128K（官方固定）']);
         expect(
           kernel.effort.optionsFor('@antigravity-cli/gpt-oss-120b'),
           isEmpty,

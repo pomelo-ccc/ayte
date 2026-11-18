@@ -3728,12 +3728,13 @@ class ClaudeCodeKernel
         ];
       }
       if (AntigravityModels.of(model) case final agy?
-          when agy.contextOptions.length > 1) {
+          when agy.contextOptions.isNotEmpty) {
+        final fixed = agy.contextOptions.length == 1;
         return [
           for (final tokens in agy.contextOptions)
             KernelOption(
               '$tokens',
-              formatTokens(tokens),
+              fixed ? '${formatTokens(tokens)}（官方固定）' : formatTokens(tokens),
               Icons.notes_rounded,
               agy.contextOptionDescription(tokens),
             ),
@@ -3751,7 +3752,6 @@ class ClaudeCodeKernel
     selected: () {
       if (_custom case (_, final info)) return '${_windowFor(info)}';
       if (AntigravityModels.of(_model) case final agy?) {
-        if (agy.contextOptions.length <= 1) return null;
         final ref = modelRef(antigravityBuiltinProviderId, agy.id);
         return '${_agyWindowFor(agy, ref)}';
       }
@@ -3774,7 +3774,6 @@ class ClaudeCodeKernel
         return '${info.contextOptions.contains(picked) ? picked : info.initialContext}';
       }
       if (AntigravityModels.of(model) case final agy?) {
-        if (agy.contextOptions.length <= 1) return null;
         final ref = modelRef(antigravityBuiltinProviderId, agy.id);
         return '${_agyWindowFor(agy, ref)}';
       }

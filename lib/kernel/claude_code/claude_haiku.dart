@@ -74,6 +74,7 @@ Future<String> askClaudeHaiku(
       system,
       prompt,
       cancel: cancel,
+      model: exact ? model : null,
       images: images,
       tools: tools,
       session: session,

@@ -58,8 +58,9 @@ class SessionModelPicker extends StatelessWidget {
         group.label,
       model.label,
       for (final setting in session.modelSettings(model.id))
-        if (setting.selected case final selected?)
-          selected.label,
+        if (!setting.toggle && setting.options.length > 1)
+          if (setting.selected case final selected?)
+            selected.label,
     ].join(' · ');
   }
 
