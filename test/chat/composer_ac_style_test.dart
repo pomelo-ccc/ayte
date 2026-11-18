@@ -53,17 +53,21 @@ void main() {
       );
       expect(l10n.composerPlaceholder.contains('、'), isFalse);
 
-      // 2. Left PickersRow contains ONLY ghost buttons (no emphasized fill,
-      //    no permission text, no account text).
-      final leftPickers = find.descendant(
-        of: find.byType(PickersRow),
-        matching: find.byType(ComposerPicker),
-      );
-      expect(leftPickers, findsWidgets);
-      for (final picker in tester.widgetList<ComposerPicker>(leftPickers)) {
+      // 2. Left PickersRow contains ONLY ghost buttons, with the mode picker
+      //    rendered as iconOnly and the model picker keeping its ghost label.
+      final leftPickers = tester
+          .widgetList<ComposerPicker>(
+            find.descendant(
+              of: find.byType(PickersRow),
+              matching: find.byType(ComposerPicker),
+            ),
+          )
+          .toList();
+      expect(leftPickers, isNotEmpty);
+      for (final picker in leftPickers) {
         expect(picker.emphasized, isFalse);
-        expect(picker.iconOnly, isFalse);
       }
+      expect(leftPickers.any((p) => p.iconOnly), isTrue);
       expect(
         find.descendant(
           of: find.byType(PickersRow),
@@ -72,13 +76,15 @@ void main() {
         findsNothing,
       );
 
-      // 3. Permission picker sits outside PickersRow as a compact iconOnly shield.
+      // 3. Mode picker + permission picker are compact iconOnly buttons.
       final allPickers = tester.widgetList<ComposerPicker>(
         find.byType(ComposerPicker),
       );
-      final permissionPickers = allPickers.where((p) => p.iconOnly).toList();
-      expect(permissionPickers.length, 1);
-      expect(permissionPickers.single.tooltip, isNotEmpty);
+      final iconPickers = allPickers.where((p) => p.iconOnly).toList();
+      expect(iconPickers.length, 2);
+      for (final p in iconPickers) {
+        expect(p.tooltip, isNotEmpty);
+      }
 
       // 4. Unified white card with warm border & 3px translucent focus halo when focused.
       final animatedContainers = tester.widgetList<AnimatedContainer>(

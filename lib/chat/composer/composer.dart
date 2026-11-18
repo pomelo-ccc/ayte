@@ -2553,9 +2553,11 @@ class ChatComposerState extends State<ChatComposer>
                     if (mode != null) ...[
                       ComposerPicker(
                         key: _modePickerKey,
+                        iconOnly: true,
+                        menuAlign: FloatingAlign.start,
                         options: mode.options,
                         selected: mode.selected,
-                        tooltip: _hovers.mode,
+                        tooltip: '${mode.selected.label} · ${_hovers.mode}',
                         tapRegionGroupId: widget.tapRegionGroupId,
                         focusNode: _focusNode,
                         onSelected: mode.onSelected,

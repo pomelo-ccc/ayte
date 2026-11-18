@@ -45,6 +45,7 @@ class ComposerPicker extends StatefulWidget {
     this.checks,
     this.emphasized = false,
     this.iconOnly = false,
+    this.menuAlign,
     this.foreground,
     this.title,
     this.tooltip,
@@ -91,9 +92,13 @@ class ComposerPicker extends StatefulWidget {
   /// Draws a filled pill, used for emphasized pickers.
   final bool emphasized;
 
-  /// Renders a compact icon-only ghost button (e.g. permission shield icon)
-  /// whose label/risk details appear in [tooltip] and the popup menu.
+  /// Renders a compact icon-only ghost button (e.g. mode or permission icon)
+  /// whose label/details appear in [tooltip] and the popup menu.
   final bool iconOnly;
+
+  /// Horizontal alignment of the popup menu relative to the pill; defaults to
+  /// [FloatingAlign.end] when [iconOnly] is true, else [FloatingAlign.start].
+  final FloatingAlign? menuAlign;
 
   /// Its label's color, where not cautioned: [AppColors.textMuted] (as the
   /// composer's) by default; fainter in a status line under a card.
@@ -804,7 +809,9 @@ class ComposerPickerState extends State<ComposerPicker> {
       // edited at the top of the window).
       placement: (
         side: FloatingSide.top,
-        align: widget.iconOnly ? FloatingAlign.end : FloatingAlign.start,
+        align:
+            widget.menuAlign ??
+            (widget.iconOnly ? FloatingAlign.end : FloatingAlign.start),
       ),
       tapRegionGroupId: _tapRegion,
       outerTapRegionGroupId: widget.tapRegionGroupId,
