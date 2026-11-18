@@ -47,9 +47,14 @@ PLIST="$STAGE_DIR/Ayte.app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Ayte" "$PLIST" 2>/dev/null || \
   /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Ayte" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier dev.ayte.desktop" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIconFile AppIcon" "$PLIST" 2>/dev/null || \
+  /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" "$PLIST"
+/usr/libexec/PlistBuddy -c "Delete :CFBundleIconName" "$PLIST" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $SHORT_VER" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_VER" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :NSHumanReadableCopyright 'Copyright © 2026 Ayte. All rights reserved.'" "$PLIST" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Set :NSAppleEventsUsageDescription 'A program run in Ayte wants to control another app.'" "$PLIST" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Set :NSLocalNetworkUsageDescription 'Ayte lets the phones paired with it find it on the local network.'" "$PLIST" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLName dev.ayte.desktop" "$PLIST" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 ayte" "$PLIST" 2>/dev/null || true
 
@@ -91,4 +96,7 @@ codesign --force --deep --sign - "$STAGE_DIR/Ayte.app"
 codesign --verify --deep --strict "$STAGE_DIR/Ayte.app"
 rm -rf "/Applications/Ayte.app"
 mv "$STAGE_DIR/Ayte.app" "/Applications/Ayte.app"
+touch "/Applications/Ayte.app"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "/Applications/Ayte.app" || true
+killall iconservicesagent usernoted NotificationCenter 2>/dev/null || true
 echo "✓ Built and installed /Applications/Ayte.app"

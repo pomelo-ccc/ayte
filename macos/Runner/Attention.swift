@@ -297,45 +297,60 @@ final class Attention: NSObject, UNUserNotificationCenterDelegate, NSSoundDelega
     return image
   }
 
-  /// The Kestrel 5-bar rhythm pulse logo in 56×42 units.
-  static let logoCells: [CGRect] = [
-    CGRect(x: 3.5, y: 14, width: 7, height: 14),
-    CGRect(x: 14, y: 7, width: 7, height: 28),
-    CGRect(x: 24.5, y: 0, width: 7, height: 42),
-    CGRect(x: 35, y: 7, width: 7, height: 28),
-    CGRect(x: 45.5, y: 14, width: 7, height: 14),
-  ]
-
-  /// Draws the tray icon into a square of [pixels] (18pt of them), from its
-  /// top left.
+  /// Draws the Ayte 'a' + spark tray icon (matching assets/branding/logo.svg)
+  /// into a square of [pixels] (18pt of them), from its top left.
   private static func drawTray(in context: CGContext, pixels: CGFloat, dot: Bool) {
     let unit = pixels / 18
-    // Flipped, as the logo is drawn: from the top left.
+    // Flipped, as the SVG coordinates are from top-left.
     context.translateBy(x: 0, y: pixels)
     context.scaleBy(x: 1, y: -1)
     context.setFillColor(NSColor.black.cgColor)
-    let k = 16 * unit / 56
-    for cell in logoCells {
-      let x0 = (unit + cell.minX * k).rounded()
-      let y0 = (3 * unit + cell.minY * k).rounded()
-      let x1 = (unit + cell.maxX * k).rounded()
-      let y1 = (3 * unit + cell.maxY * k).rounded()
-      let rect = CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
-      let radius = min(rect.width, rect.height) / 2
-      let path = CGPath(
-        roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil)
-      context.addPath(path)
-      context.fillPath()
+
+    let pad = unit
+    let span = 16 * unit
+    func u(_ x: CGFloat) -> CGFloat { pad + (x - 249) / 512 * span }
+    func v(_ y: CGFloat) -> CGFloat { pad + (y - 234) / 512 * span }
+    func r(_ d: CGFloat) -> CGFloat { d / 512 * span }
+
+    // Ring of the 'a' glyph (even-odd cutout).
+    let ringCenter = CGPoint(x: u(466), y: v(538))
+    let outerR = r(198)
+    let innerR = r(108)
+    let ring = CGMutablePath()
+    ring.addEllipse(in: CGRect(
+      x: ringCenter.x - outerR, y: ringCenter.y - outerR,
+      width: outerR * 2, height: outerR * 2))
+    ring.addEllipse(in: CGRect(
+      x: ringCenter.x - innerR, y: ringCenter.y - innerR,
+      width: innerR * 2, height: innerR * 2))
+    context.addPath(ring)
+    context.fillPath(using: .evenOdd)
+
+    // Vertical rounded stem on the right of the ring.
+    let stemRect = CGRect(
+      x: u(580), y: v(340),
+      width: r(88), height: r(396))
+    let stemRadius = min(stemRect.width, stemRect.height) / 2
+    context.addPath(CGPath(
+      roundedRect: stemRect, cornerWidth: stemRadius, cornerHeight: stemRadius, transform: nil))
+    context.fillPath()
+
+    // Top-right spark dot (expanded with cutout halo when [dot] signals attention).
+    let sparkCenter = CGPoint(x: u(704), y: v(282))
+    if dot {
+      context.setBlendMode(.clear)
+      context.fillEllipse(in: CGRect(
+        x: sparkCenter.x - 3.4 * unit, y: sparkCenter.y - 3.4 * unit,
+        width: 6.8 * unit, height: 6.8 * unit))
+      context.setBlendMode(.normal)
+      context.fillEllipse(in: CGRect(
+        x: sparkCenter.x - 2.4 * unit, y: sparkCenter.y - 2.4 * unit,
+        width: 4.8 * unit, height: 4.8 * unit))
+    } else {
+      let sparkR = r(44)
+      context.fillEllipse(in: CGRect(
+        x: sparkCenter.x - sparkR, y: sparkCenter.y - sparkR,
+        width: sparkR * 2, height: sparkR * 2))
     }
-    guard dot else { return }
-    let center = CGPoint(x: 15.5 * unit, y: 2.5 * unit)
-    context.setBlendMode(.clear)
-    context.fillEllipse(in: CGRect(
-      x: center.x - 3.5 * unit, y: center.y - 3.5 * unit,
-      width: 7 * unit, height: 7 * unit))
-    context.setBlendMode(.normal)
-    context.fillEllipse(in: CGRect(
-      x: center.x - 2.5 * unit, y: center.y - 2.5 * unit,
-      width: 5 * unit, height: 5 * unit))
   }
 }

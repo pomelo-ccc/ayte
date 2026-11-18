@@ -164,6 +164,44 @@ class Canvas {
     }
   }
 
+  // A vertical rounded capsule centered at |cx| between |y0| and |y1| with
+  // |radius|, smoothed with 4×4 MSAA like Disc.
+  void Capsule(double cx, double y0, double y1, double radius, uint32_t rgb) {
+    constexpr int kSamples = 4;
+    for (int y = 0; y < size_; y++) {
+      for (int x = 0; x < size_; x++) {
+        int inside = 0;
+        for (int sy = 0; sy < kSamples; sy++) {
+          for (int sx = 0; sx < kSamples; sx++) {
+            const double px = x + (sx + 0.5) / kSamples - cx;
+            const double py = y + (sy + 0.5) / kSamples;
+            const double cy = (std::max)(y0, (std::min)(y1, py));
+            const double dy = py - cy;
+            if (px * px + dy * dy <= radius * radius) {
+              inside++;
+            }
+          }
+        }
+        if (inside == 0) {
+          continue;
+        }
+        const double coverage =
+            static_cast<double>(inside) / (kSamples * kSamples);
+        uint32_t& pixel = pixels_[static_cast<size_t>(y) * size_ + x];
+        const double below = (pixel >> 24) / 255.0;
+        const double alpha = coverage + below * (1 - coverage);
+        auto channel = [&](int shift) {
+          const double top = (rgb >> shift) & 0xFF;
+          const double under = (pixel >> shift) & 0xFF;
+          return static_cast<uint32_t>(std::lround(
+              (top * coverage + under * below * (1 - coverage)) / alpha));
+        };
+        pixel = (static_cast<uint32_t>(std::lround(alpha * 255)) << 24) |
+                (channel(16) << 16) | (channel(8) << 8) | channel(0);
+      }
+    }
+  }
+
   // An icon of the pixels; the caller destroys it.
   HICON Icon() const {
     BITMAPV5HEADER header = {};
@@ -204,16 +242,6 @@ class Canvas {
  private:
   int size_;
   std::vector<uint32_t> pixels_;
-};
-
-// The logo's cells, in its own 56×42 units (bao.svg; the same as
-// Attention.swift's).
-struct Cell {
-  int x, y, width, height;
-};
-constexpr Cell kLogoCells[] = {
-    {14, 0, 28, 7}, {7, 7, 7, 7},   {42, 7, 7, 7},  {0, 14, 7, 21},
-    {49, 14, 7, 21}, {14, 21, 8, 7}, {35, 21, 8, 7}, {7, 35, 42, 7},
 };
 
 // Digits and a plus, 3×5 pixels each, top row first, a row's bits from the
@@ -513,25 +541,26 @@ void Attention::SetTray(const flutter::EncodableValue* value) {
 HICON Attention::TrayIcon(bool dot) const {
   const int size = ::GetSystemMetrics(SM_CXSMICON);
   Canvas canvas(size);
-  // Whole pixels for each of the logo's 8×6 cells, as large as fit.
-  const int cell = (std::max)(1, size / 8);
-  const double k = cell / 7.0;
-  const int left = (size - 8 * cell) / 2;
-  const int top = (size - 6 * cell) / 2;
   const uint32_t ink = TaskbarIsLight() ? 0x1F1F1F : 0xFFFFFF;
-  for (const Cell& c : kLogoCells) {
-    canvas.Fill(left + static_cast<int>(std::lround(c.x * k)),
-                top + static_cast<int>(std::lround(c.y * k)),
-                left + static_cast<int>(std::lround((c.x + c.width) * k)),
-                top + static_cast<int>(std::lround((c.y + c.height) * k)),
-                ink);
-  }
+  const double pad = size / 18.0;
+  const double span = size - 2.0 * pad;
+  auto u = [&](double x) { return pad + (x - 249.0) / 512.0 * span; };
+  auto v = [&](double y) { return pad + (y - 234.0) / 512.0 * span; };
+  auto r = [&](double d) { return d / 512.0 * span; };
+
+  // Ayte 'a' ring + vertical rounded stem + top-right spark dot.
+  canvas.Disc(u(466.0), v(538.0), r(198.0), ink, false);
+  canvas.Disc(u(466.0), v(538.0), r(108.0), 0, true);
+  canvas.Capsule(u(624.0), v(384.0), v(692.0), r(44.0), ink);
+
   if (dot) {
     const double radius = size * 0.17;
-    const double cx = size - radius;
-    const double cy = radius;
+    const double cx = u(704.0);
+    const double cy = v(282.0);
     canvas.Disc(cx, cy, radius + (std::max)(1.0, size / 16.0), 0, true);
     canvas.Disc(cx, cy, radius, kBadgeRed, false);
+  } else {
+    canvas.Disc(u(704.0), v(282.0), r(44.0), 0xF59E0B, false);
   }
   return canvas.Icon();
 }
