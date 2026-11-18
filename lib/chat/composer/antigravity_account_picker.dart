@@ -58,17 +58,38 @@ class _AntigravityAccountPickerState extends State<AntigravityAccountPicker> {
     return (fiveHour: fiveHour, weekly: weekly);
   }
 
+  static bool _hasExpiredResetWindow(AntigravityAccount? account) {
+    final now = DateTime.now().toUtc();
+    for (final group in account?.quota?.resolvedUsageGroups ?? const []) {
+      for (final b in group.buckets) {
+        if (b.resetTime.isEmpty) continue;
+        final dt = DateTime.tryParse(b.resetTime)?.toUtc();
+        if (dt != null && !dt.isAfter(now)) return true;
+      }
+    }
+    return false;
+  }
+
   void _openUsagePopover(BuildContext pillContext) {
     final box = pillContext.findRenderObject() as RenderBox?;
     if (box == null) return;
     final anchor = box.localToGlobal(Offset.zero) & box.size;
     final openSettings = SettingsOpener.maybeOf(pillContext);
 
-    // Refresh active account quota if older than 45 seconds.
-    if (_store.currentAccount case final active?) {
-      final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    // Refresh active (or all stale) accounts on open, especially whenever any
+    // bucket's reset timestamp has passed (`Resets soon`).
+    final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final anyOtherStale = _store.accounts.any(
+      (a) =>
+          !a.disabled &&
+          a.id != _store.currentAccountId &&
+          nowSec - (a.quota?.lastUpdated ?? 0) > 120,
+    );
+    if (anyOtherStale) {
+      unawaited(_store.refreshAllQuotas(silent: true));
+    } else if (_store.currentAccount case final active?) {
       final last = active.quota?.lastUpdated ?? 0;
-      if (nowSec - last > 45) {
+      if (nowSec - last > 30 || _hasExpiredResetWindow(active)) {
         unawaited(_store.refreshQuota(active.id));
       }
     }
@@ -224,7 +245,7 @@ class _AntigravityAccountPickerState extends State<AntigravityAccountPicker> {
   }
 }
 
-class _AntigravityUsagePopover extends StatelessWidget {
+class _AntigravityUsagePopover extends StatefulWidget {
   const _AntigravityUsagePopover({
     required this.anchor,
     required this.store,
@@ -236,13 +257,49 @@ class _AntigravityUsagePopover extends StatelessWidget {
   final VoidCallback? onManageAccounts;
 
   @override
+  State<_AntigravityUsagePopover> createState() =>
+      _AntigravityUsagePopoverState();
+}
+
+class _AntigravityUsagePopoverState extends State<_AntigravityUsagePopover> {
+  Timer? _countdownTicker;
+  int _lastAutoResetRefreshSec = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _countdownTicker = Timer.periodic(const Duration(seconds: 20), (_) {
+      if (!mounted) return;
+      final active = widget.store.currentAccount;
+      final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      if (active != null &&
+          !widget.store.isRefreshing(active.id) &&
+          !widget.store.isRefreshingAll &&
+          nowSec - _lastAutoResetRefreshSec >= 25 &&
+          _AntigravityAccountPickerState._hasExpiredResetWindow(active)) {
+        _lastAutoResetRefreshSec = nowSec;
+        unawaited(widget.store.refreshQuota(active.id));
+      }
+      setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _countdownTicker?.cancel();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final store = widget.store;
+    final onManageAccounts = widget.onManageAccounts;
     final screen = MediaQuery.sizeOf(context);
     const width = 320.0;
-    final left = anchor.left
+    final left = widget.anchor.left
         .clamp(12.0, math.max(12.0, screen.width - width - 12.0))
         .toDouble();
-    final bottom = (screen.height - anchor.top + 8.0)
+    final bottom = (screen.height - widget.anchor.top + 8.0)
         .clamp(12.0, math.max(12.0, screen.height - 80.0))
         .toDouble();
     final dark = themeColors.dark;
@@ -278,6 +335,7 @@ class _AntigravityUsagePopover extends StatelessWidget {
                 final refreshing =
                     store.isRefreshingAll ||
                     (active != null && store.isRefreshing(active.id));
+                final err = store.lastRefreshError;
 
                 return Container(
                   constraints: BoxConstraints(
@@ -289,7 +347,9 @@ class _AntigravityUsagePopover extends StatelessWidget {
                     border: Border.all(color: border),
                     boxShadow: [
                       BoxShadow(
-                        color: Colors.black.withValues(alpha: dark ? 0.42 : 0.12),
+                        color: Colors.black.withValues(
+                          alpha: dark ? 0.42 : 0.12,
+                        ),
                         blurRadius: 24,
                         offset: const Offset(0, 8),
                       ),
@@ -335,30 +395,25 @@ class _AntigravityUsagePopover extends StatelessWidget {
                             ],
                             const Spacer(),
                             GestureDetector(
+                              behavior: HitTestBehavior.opaque,
                               onTap: refreshing
                                   ? null
-                                  : () {
-                                      if (active != null) {
-                                        unawaited(store.refreshQuota(active.id));
-                                      } else {
-                                        unawaited(store.refreshAllQuotas());
-                                      }
-                                    },
+                                  : () => unawaited(store.refreshAllQuotas()),
                               child: MouseRegion(
                                 cursor: SystemMouseCursors.click,
                                 child: Padding(
-                                  padding: const EdgeInsets.all(2),
+                                  padding: const EdgeInsets.all(5),
                                   child: refreshing
                                       ? IdeSpinning(
                                           Icon(
                                             Codicons.sync,
-                                            size: 13,
+                                            size: 13.5,
                                             color: subColor,
                                           ),
                                         )
                                       : Icon(
                                           Codicons.refresh,
-                                          size: 13,
+                                          size: 13.5,
                                           color: subColor,
                                         ),
                                 ),
@@ -366,6 +421,29 @@ class _AntigravityUsagePopover extends StatelessWidget {
                             ),
                           ],
                         ),
+                        if (err != null && !refreshing) ...[
+                          const SizedBox(height: 8),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 6,
+                            ),
+                            decoration: BoxDecoration(
+                              color: const Color(0x18DF4B44),
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: Text(
+                              err,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontSize: 11,
+                                color: Color(0xFFDF4B44),
+                                height: 1.35,
+                              ),
+                            ),
+                          ),
+                        ],
                         const SizedBox(height: 12),
                         if (groups.isNotEmpty)
                           AntigravityUsageGroupsStack(

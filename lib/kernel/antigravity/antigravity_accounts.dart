@@ -40,6 +40,8 @@ class AntigravityAccounts extends ChangeNotifier {
   final Set<String> _refreshingIds = {};
   bool _refreshingAll = false;
   String? _switchingId;
+  String? _lastRefreshError;
+  int _backgroundTick = 0;
 
   List<AntigravityAccount> get accounts => List.unmodifiable(_accounts);
   String? get currentAccountId => _currentAccountId;
@@ -47,6 +49,7 @@ class AntigravityAccounts extends ChangeNotifier {
   AntigravityQuotaWindow get quotaWindow => _quotaWindow;
   bool get isRefreshingAll => _refreshingAll;
   String? get switchingId => _switchingId;
+  String? get lastRefreshError => _lastRefreshError;
   bool isRefreshing(String id) => _refreshingIds.contains(id);
 
   AntigravityAccount? get currentAccount {
@@ -270,8 +273,13 @@ class AntigravityAccounts extends ChangeNotifier {
 
   void _startBackgroundRefreshTimer() {
     _refreshTimer?.cancel();
-    _refreshTimer = Timer.periodic(const Duration(minutes: 10), (_) {
-      unawaited(refreshAllQuotas(silent: true));
+    _refreshTimer = Timer.periodic(const Duration(minutes: 3), (_) {
+      _backgroundTick++;
+      if (_backgroundTick % 3 == 0) {
+        unawaited(refreshAllQuotas(silent: true));
+      } else if (currentAccount case final active?) {
+        unawaited(refreshQuota(active.id));
+      }
     });
   }
 
@@ -395,7 +403,10 @@ class AntigravityAccounts extends ChangeNotifier {
   }
 
   /// Refreshes quota & subscription tier for a single account.
-  Future<AntigravityAccount?> refreshQuota(String accountId) async {
+  Future<AntigravityAccount?> refreshQuota(
+    String accountId, {
+    bool rethrowOnError = false,
+  }) async {
     await ensureInitialized();
     if (_refreshingIds.contains(accountId)) return null;
     final idx = _accounts.indexWhere((a) => a.id == accountId);
@@ -413,30 +424,47 @@ class AntigravityAccounts extends ChangeNotifier {
         await _saveAccount(updated);
         await _saveIndex();
       }
+      if (accountId == _currentAccountId) {
+        _lastRefreshError = null;
+      }
       return updated;
+    } on Object catch (error) {
+      debugPrint('Antigravity quota refresh failed ($accountId): $error');
+      if (accountId == _currentAccountId) {
+        _lastRefreshError = '$error';
+      }
+      if (rethrowOnError) rethrow;
+      return null;
     } finally {
       _refreshingIds.remove(accountId);
       notifyListeners();
     }
   }
 
-  /// Refreshes quotas for all non-disabled, non-forbidden accounts.
+  /// Refreshes quotas for all non-disabled accounts, prioritizing the active
+  /// account first so the Usage pill & popover update immediately.
   Future<void> refreshAllQuotas({bool silent = false}) async {
     await ensureInitialized();
     if (_refreshingAll) return;
     _refreshingAll = true;
     if (!silent) notifyListeners();
     try {
-      final targets = [
+      final activeId = _currentAccountId;
+      final targets = <String>[
+        if (activeId != null)
+          for (final a in _accounts)
+            if (a.id == activeId &&
+                !a.disabled &&
+                (!silent || !(a.quota?.isForbidden ?? false)))
+              a.id,
         for (final a in _accounts)
-          if (!a.disabled && !(a.quota?.isForbidden ?? false)) a.id,
+          if (a.id != activeId &&
+              !a.disabled &&
+              (!silent || !(a.quota?.isForbidden ?? false)))
+            a.id,
       ];
       for (final id in targets) {
-        try {
-          await refreshQuota(id);
-        } on Object {
-          // Continue refreshing remaining accounts.
-        }
+        await refreshQuota(id);
       }
     } finally {
       _refreshingAll = false;

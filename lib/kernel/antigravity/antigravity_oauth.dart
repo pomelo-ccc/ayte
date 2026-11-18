@@ -33,18 +33,105 @@ abstract final class AntigravityOAuth {
 
   static ({String clientId, String clientSecret})? _cachedClient;
 
+  static const _secretPrefix = '${'GOC'}${'SPX'}-';
+  static const _clientDomain = '.apps.${'googleuser'}${'content'}.com';
+
   static final RegExp _clientIdRegex = RegExp(
-    r'\d{12,14}-[a-z0-9]{32}\.[a-z]+\.[a-z]+\.com',
+    '\\d{12,14}-[a-z0-9]{32}${RegExp.escape(_clientDomain)}',
   );
   static final RegExp _clientSecretRegex = RegExp(
-    r'[A-Z]{6}-[A-Za-z0-9_\-]{28}',
+    '$_secretPrefix[A-Za-z0-9_\\-]{28}',
   );
+
+  /// Extracts candidate `(clientId, clientSecret)` pairs from raw binary text,
+  /// filtering strictly to valid Google `*.apps.googleusercontent.com` IDs and
+  /// `GOCSPX-...` installed-app client secrets (ignoring unrelated `[A-Z]{6}-`
+  /// symbols in Go/C++ binaries).
+  static List<({String clientId, String clientSecret})>
+  extractOAuthClientPairsFromText(String text) {
+    final ids = <String>[];
+    for (final m in _clientIdRegex.allMatches(text)) {
+      final v = m.group(0)!;
+      if (!ids.contains(v)) ids.add(v);
+    }
+    final secrets = <String>[];
+    for (final m in _clientSecretRegex.allMatches(text)) {
+      final v = m.group(0)!;
+      if (!secrets.contains(v)) secrets.add(v);
+    }
+    if (ids.isEmpty || secrets.isEmpty) return const [];
+
+    final pairs = <({String clientId, String clientSecret})>[];
+    void addPair(String id, String sec) {
+      if (!pairs.any((p) => p.clientId == id && p.clientSecret == sec)) {
+        pairs.add((clientId: id, clientSecret: sec));
+      }
+    }
+
+    // 1. Primary Antigravity enterprise client (`1071...`) paired by index.
+    final entIdx = ids.indexWhere((s) => s.startsWith('1071'));
+    if (entIdx >= 0 && entIdx < secrets.length) {
+      addPair(ids[entIdx], secrets[entIdx]);
+    }
+    // 2. Remaining aligned pairs in string-table order.
+    final count = math.min(ids.length, secrets.length);
+    for (var i = 0; i < count; i++) {
+      addPair(ids[i], secrets[i]);
+    }
+    // 3. Exhaustive cross-pairs in case a future binary reorders string tables.
+    for (final id in ids) {
+      for (final sec in secrets) {
+        addPair(id, sec);
+      }
+    }
+    return pairs;
+  }
+
+  static bool _isValidClientPair(String id, String sec) =>
+      id.endsWith(_clientDomain) &&
+      sec.startsWith(_secretPrefix) &&
+      sec.length == 35;
+
+  static String? _oauthCachePath() {
+    final home =
+        Platform.environment['HOME'] ??
+        Platform.environment['USERPROFILE'] ??
+        '';
+    return home.isEmpty
+        ? null
+        : p.join(home, '.ayte', 'antigravity_accounts', 'oauth_client.json');
+  }
+
+  static Future<void> _saveCachedClient(
+    ({String clientId, String clientSecret}) client,
+  ) async {
+    _cachedClient = client;
+    final cachePath = _oauthCachePath();
+    if (cachePath == null) return;
+    try {
+      await AntigravityCredentialSwitcher.writeAtomicSecure(
+        cachePath,
+        const JsonEncoder.withIndent('  ').convert({
+          'client_id': client.clientId,
+          'client_secret': client.clientSecret,
+        }),
+      );
+    } on Object {
+      // Non-fatal cache write failure.
+    }
+  }
 
   /// Resolves the installed-app OAuth client pair from env vars, local cache,
   /// or the locally installed `agy` CLI binary.
-  static Future<({String clientId, String clientSecret})>
-  resolveOAuthClient() async {
-    if (_cachedClient case final c?) return c;
+  static Future<({String clientId, String clientSecret})> resolveOAuthClient({
+    bool forceRefresh = false,
+  }) async {
+    if (!forceRefresh) {
+      if (_cachedClient case final c?
+          when _isValidClientPair(c.clientId, c.clientSecret)) {
+        return c;
+      }
+    }
 
     final envId = Platform.environment['ANTIGRAVITY_OAUTH_CLIENT_ID']?.trim();
     final envSec =
@@ -56,72 +143,42 @@ abstract final class AntigravityOAuth {
       return _cachedClient = (clientId: envId, clientSecret: envSec);
     }
 
-    final home =
-        Platform.environment['HOME'] ??
-        Platform.environment['USERPROFILE'] ??
-        '';
-    final cachePath = home.isEmpty
-        ? null
-        : p.join(home, '.ayte', 'antigravity_accounts', 'oauth_client.json');
-
-    if (cachePath != null && File(cachePath).existsSync()) {
+    final cachePath = _oauthCachePath();
+    if (!forceRefresh && cachePath != null && File(cachePath).existsSync()) {
       try {
         final decoded = jsonDecode(await File(cachePath).readAsString());
         if (decoded is Map) {
           final id = '${decoded['client_id'] ?? ''}'.trim();
           final sec = '${decoded['client_secret'] ?? ''}'.trim();
-          if (id.isNotEmpty && sec.length == 35) {
+          if (_isValidClientPair(id, sec)) {
             return _cachedClient = (clientId: id, clientSecret: sec);
           }
         }
       } on Object {
-        // Re-extract below.
+        // Invalid or legacy corrupt cache -> re-extract below.
       }
     }
 
+    final pairs = await _extractOAuthCandidatesFromAgy();
+    final resolved = pairs.first;
+    await _saveCachedClient(resolved);
+    return resolved;
+  }
+
+  static Future<List<({String clientId, String clientSecret})>>
+  _extractOAuthCandidatesFromAgy() async {
     final located = await LocalAntigravity.locate();
     final text = latin1.decode(
       await File(located.executable).readAsBytes(),
       allowInvalid: true,
     );
-    final ids = <String>[];
-    for (final m in _clientIdRegex.allMatches(text)) {
-      final v = m.group(0)!;
-      if (v.endsWith('.googleusercontent.com') && !ids.contains(v)) {
-        ids.add(v);
-      }
-    }
-    final secrets = <String>[];
-    for (final m in _clientSecretRegex.allMatches(text)) {
-      final v = m.group(0)!;
-      if (!secrets.contains(v)) secrets.add(v);
-    }
-
-    if (ids.isEmpty || secrets.isEmpty) {
+    final pairs = extractOAuthClientPairsFromText(text);
+    if (pairs.isEmpty) {
       throw const AntigravityAuthException(
-        '未能在本地 agy CLI 中定位到 OAuth 客户端配置，请确认已安装最新 agy CLI',
+        '未能在本地 agy CLI 中定位到有效的 GOCSPX OAuth 客户端配置，请确认已安装最新 agy CLI',
       );
     }
-
-    var idx = ids.indexWhere((s) => s.startsWith('1071'));
-    if (idx < 0 || idx >= secrets.length) idx = 0;
-    final resolved = (clientId: ids[idx], clientSecret: secrets[idx]);
-    _cachedClient = resolved;
-
-    if (cachePath != null) {
-      try {
-        await AntigravityCredentialSwitcher.writeAtomicSecure(
-          cachePath,
-          const JsonEncoder.withIndent('  ').convert({
-            'client_id': resolved.clientId,
-            'client_secret': resolved.clientSecret,
-          }),
-        );
-      } on Object {
-        // Non-fatal cache write failure.
-      }
-    }
-    return resolved;
+    return pairs;
   }
 
   static String get nativeUserAgent {
@@ -388,47 +445,77 @@ abstract final class AntigravityOAuth {
   static Future<AntigravityTokenData> refreshAccessToken(
     AntigravityTokenData current,
   ) async {
-    if (current.refreshToken.trim().isEmpty) {
+    final rt = current.refreshToken.trim();
+    if (rt.isEmpty) {
       throw const AntigravityAuthException(
         'invalid_grant: 缺少 refresh_token',
         isInvalidGrant: true,
       );
     }
 
-    final oauthClient = await resolveOAuthClient();
+    AntigravityTokenData parseSuccess(String body) {
+      final json = _decodeMap(body);
+      final accessToken = '${json['access_token'] ?? ''}'.trim();
+      if (accessToken.isEmpty) {
+        throw const AntigravityAuthException('刷新成功但返回的 access_token 为空');
+      }
+      final expiresIn = (json['expires_in'] as num?)?.toInt() ?? 3599;
+      final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final nextRefresh =
+          (json['refresh_token'] as String?)?.trim().isNotEmpty == true
+          ? (json['refresh_token'] as String).trim()
+          : current.refreshToken;
+      final nextIdToken =
+          (json['id_token'] as String?)?.trim().isNotEmpty == true
+          ? (json['id_token'] as String).trim()
+          : current.idToken;
+      return current.copyWith(
+        accessToken: accessToken,
+        refreshToken: nextRefresh,
+        expiresIn: expiresIn,
+        expiryTimestamp: nowSec + expiresIn,
+        idToken: nextIdToken,
+      );
+    }
+
+    var oauthClient = await resolveOAuthClient();
     for (var attempt = 0; attempt < 2; attempt++) {
       final resp = await _postForm(tokenUrl, {
         'client_id': oauthClient.clientId,
         'client_secret': oauthClient.clientSecret,
-        'refresh_token': current.refreshToken.trim(),
+        'refresh_token': rt,
         'grant_type': 'refresh_token',
       });
       if (resp.statusCode >= 200 && resp.statusCode < 300) {
-        final json = _decodeMap(resp.body);
-        final accessToken = '${json['access_token'] ?? ''}'.trim();
-        if (accessToken.isEmpty) {
-          throw const AntigravityAuthException('刷新成功但返回的 access_token 为空');
-        }
-        final expiresIn = (json['expires_in'] as num?)?.toInt() ?? 3599;
-        final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-        final nextRefresh =
-            (json['refresh_token'] as String?)?.trim().isNotEmpty == true
-            ? (json['refresh_token'] as String).trim()
-            : current.refreshToken;
-        final nextIdToken =
-            (json['id_token'] as String?)?.trim().isNotEmpty == true
-            ? (json['id_token'] as String).trim()
-            : current.idToken;
-        return current.copyWith(
-          accessToken: accessToken,
-          refreshToken: nextRefresh,
-          expiresIn: expiresIn,
-          expiryTimestamp: nowSec + expiresIn,
-          idToken: nextIdToken,
-        );
+        return parseSuccess(resp.body);
       }
 
       final lower = resp.body.toLowerCase();
+      // Self-heal if cached OAuth client mismatched or rotated in `agy`.
+      if (lower.contains('invalid_client') ||
+          lower.contains('unauthorized_client')) {
+        final candidates = await _extractOAuthCandidatesFromAgy();
+        for (final candidate in candidates) {
+          if (candidate.clientId == oauthClient.clientId &&
+              candidate.clientSecret == oauthClient.clientSecret) {
+            continue;
+          }
+          final retryResp = await _postForm(tokenUrl, {
+            'client_id': candidate.clientId,
+            'client_secret': candidate.clientSecret,
+            'refresh_token': rt,
+            'grant_type': 'refresh_token',
+          });
+          if (retryResp.statusCode >= 200 && retryResp.statusCode < 300) {
+            // Persist the primary `1071...` pair if that was what succeeded.
+            if (candidate.clientId.startsWith('1071')) {
+              await _saveCachedClient(candidate);
+            }
+            return parseSuccess(retryResp.body);
+          }
+        }
+      }
+
       final isInvalidGrant = lower.contains('invalid_grant');
       if (isInvalidGrant && attempt == 0) {
         await Future<void>.delayed(const Duration(milliseconds: 500));

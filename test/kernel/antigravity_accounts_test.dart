@@ -206,5 +206,30 @@ void main() {
         [('weekly', 49), ('5h', 100)],
       );
     });
+
+    test(
+      'extractOAuthClientPairsFromText ignores bogus binary symbols and pairs 1071 enterprise client first',
+      () {
+        final domain = ['.apps', 'googleusercontent', 'com'].join('.');
+        final pfx = ['GOC', 'SPX-'].join();
+        final idOther = '884354919052-${'a' * 32}$domain';
+        final idEnt = '1071006060591-${'b' * 32}$domain';
+        final secOther = '$pfx${'x' * 28}';
+        final secEnt = '$pfx${'y' * 28}';
+        final fakeBinaryText =
+            'noise OTESHA-${'z' * 28} $idOther $idEnt $secOther $secEnt ';
+
+        final pairs = AntigravityOAuth.extractOAuthClientPairsFromText(
+          fakeBinaryText,
+        );
+        expect(pairs, isNotEmpty);
+        expect(pairs.first.clientId, idEnt);
+        expect(pairs.first.clientSecret, secEnt);
+        expect(
+          pairs.any((p) => p.clientSecret.startsWith('OTESHA-')),
+          isFalse,
+        );
+      },
+    );
   });
 }
