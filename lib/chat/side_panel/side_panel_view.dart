@@ -9,6 +9,12 @@ import 'package:path/path.dart' as p;
 import '../../base/shown_when_ready.dart';
 import '../../theme/wb_motion.dart';
 import '../../browser/browser_bridge.dart';
+import '../../browser/embedded/embedded_browser_controller.dart';
+import '../../browser/embedded/embedded_browser_view.dart';
+import '../../canvas/canvas_controller.dart';
+import '../../canvas/infinite_canvas_view.dart';
+import '../../computer_use/computer_use_bubble.dart';
+import '../../settings/settings_dialog.dart' show SettingsOpener, SettingsSection;
 import '../../ide/file_service.dart';
 import '../../ide/git/git_model.dart';
 import '../../ide/git/commit_message.dart';
@@ -712,6 +718,8 @@ class AgentSidePanelView extends StatelessWidget {
       ..._gits,
       ?terminals,
       BrowserBridge.instance,
+      EmbeddedBrowserController.instance,
+      CanvasController.instance,
       // Its first call kept: its usage page offered.
       UsageLedger.current,
     ]),
@@ -742,6 +750,17 @@ class AgentSidePanelView extends StatelessWidget {
           SidePanelSection.files => _filesPage(context, tabs),
           SidePanelSection.changes => _changesPage(context, tabs),
           SidePanelSection.terminal => _terminalPage(context, tabs),
+          SidePanelSection.browser => EmbeddedBrowserView(
+            key: const ValueKey(('page', SidePanelSection.browser)),
+            onOpenSettings: switch (SettingsOpener.maybeOf(context)) {
+              final open? => () => open(SettingsSection.browser),
+              null => null,
+            },
+          ),
+          SidePanelSection.canvas => InfiniteCanvasView(
+            key: ValueKey(('page', SidePanelSection.canvas, session)),
+            session: session,
+          ),
           SidePanelSection.usage => ConversationUsageView(
             key: ValueKey(('page', SidePanelSection.usage, session)),
             session: session,
@@ -1506,6 +1525,8 @@ extension SidePanelSectionUi on SidePanelSection {
     SidePanelSection.files => Codicons.files,
     SidePanelSection.changes => Codicons.sourceControl,
     SidePanelSection.terminal => Codicons.terminal,
+    SidePanelSection.browser => Codicons.globe,
+    SidePanelSection.canvas => Codicons.layout,
     SidePanelSection.usage => SvgIcons.usage,
     SidePanelSection.plan => Codicons.checklist,
     SidePanelSection.ports => Codicons.plug,
@@ -1517,13 +1538,20 @@ extension SidePanelSectionUi on SidePanelSection {
     SidePanelSection.changes => ChatCommandIds.sidePanelChanges,
     SidePanelSection.terminal => ChatCommandIds.sidePanelTerminal,
     SidePanelSection.usage => ChatCommandIds.sidePanelUsage,
-    SidePanelSection.plan || SidePanelSection.ports => null,
+    SidePanelSection.browser ||
+    SidePanelSection.canvas ||
+    SidePanelSection.plan ||
+    SidePanelSection.ports => null,
   };
 
   String label(BuildContext context) => switch (this) {
     SidePanelSection.files => context.l10n.sidePanelFiles,
     SidePanelSection.changes => context.l10n.sidePanelChanges,
     SidePanelSection.terminal => context.l10n.sidePanelTerminal,
+    SidePanelSection.browser =>
+      Localizations.localeOf(context).languageCode == 'zh' ? '浏览器' : 'Browser',
+    SidePanelSection.canvas =>
+      Localizations.localeOf(context).languageCode == 'zh' ? '画布' : 'Canvas',
     SidePanelSection.usage => context.l10n.sidePanelUsage,
     SidePanelSection.plan => context.l10n.sidePanelPlan,
     SidePanelSection.ports => context.l10n.sidePanelPorts,
@@ -1632,6 +1660,8 @@ class SidePanelRail extends StatelessWidget {
               .where((task) => task.status == CommandStatus.running)
               .length ??
           0,
+    SidePanelSection.browser => EmbeddedBrowserController.instance.tabs.length,
+    SidePanelSection.canvas => CanvasController.instance.sidePanelBadgeCount,
     SidePanelSection.files ||
     SidePanelSection.usage ||
     SidePanelSection.plan ||
@@ -1927,6 +1957,10 @@ class _SectionBar extends StatelessWidget {
                     SidePanelSection.ports => 0,
                     SidePanelSection.changes => changes,
                     SidePanelSection.terminal => running,
+                    SidePanelSection.browser =>
+                      EmbeddedBrowserController.instance.tabs.length,
+                    SidePanelSection.canvas =>
+                      CanvasController.instance.sidePanelBadgeCount,
                   },
                   onTap: () => panel.showSection(session, section),
                   onRemove:
@@ -1966,6 +2000,17 @@ class _SectionBar extends StatelessWidget {
                 ),
               ),
               const Spacer(),
+              Center(
+                child: Padding(
+                  padding: const EdgeInsets.only(right: 4),
+                  child: ComputerUsePill(
+                    onOpenSettings: switch (SettingsOpener.maybeOf(context)) {
+                      final open? => () => open(SettingsSection.computerUse),
+                      null => null,
+                    },
+                  ),
+                ),
+              ),
               Center(
                 child: IdeActionButton(
                   key: const ValueKey('side-panel-maximize'),

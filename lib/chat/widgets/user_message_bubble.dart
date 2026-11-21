@@ -5,12 +5,15 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 
+import '../../ide/ide_hover.dart';
+import '../../l10n/l10n.dart';
 import '../../theme/app_theme.dart';
 import '../chat_find.dart';
 import '../chat_models.dart';
 import '../composer/composer_embeds.dart';
 import '../user_message_style.dart';
 import 'assistant_text.dart';
+import 'copy_button.dart';
 import 'fade_curve.dart';
 import 'image_thumbnails.dart';
 import 'inline_code.dart';
@@ -367,7 +370,9 @@ class _UserMessageViewerState extends State<UserMessageViewer> {
   @override
   Widget build(BuildContext context) {
     final UserMessageViewer(:text, :images, :controller) = widget;
+    final l10n = context.l10n;
     final vocabulary = ComposerVocabulary.of(context);
+    final copyText = userPromptCopyText(text, images: images);
     return Focus(
       focusNode: _focus,
       onKeyEvent: (node, event) {
@@ -390,36 +395,109 @@ class _UserMessageViewerState extends State<UserMessageViewer> {
             maxHeight: UserMessageViewer.maxHeight(context),
           ),
           // A slim bar, as the editor's.
-          child: ScrollbarTheme(
-            data: ScrollbarTheme.of(context).copyWith(
-              thickness: WidgetStateProperty.resolveWith(
-                (states) =>
-                    states.contains(WidgetState.hovered) ||
-                        states.contains(WidgetState.dragged)
-                    ? 5.5
-                    : 3.5,
-              ),
-              radius: const Radius.circular(999),
-              crossAxisMargin: 2.5,
-              mainAxisMargin: 3.0,
-            ),
-            child: Scrollbar(
-              controller: controller,
-              child: ScrollConfiguration(
-                behavior: ScrollConfiguration.of(context)
-                    .copyWith(scrollbars: false),
-                child: SingleChildScrollView(
+          child: Stack(
+            children: [
+              ScrollbarTheme(
+                data: ScrollbarTheme.of(context).copyWith(
+                  thickness: WidgetStateProperty.resolveWith(
+                    (states) =>
+                        states.contains(WidgetState.hovered) ||
+                            states.contains(WidgetState.dragged)
+                        ? 5.5
+                        : 3.5,
+                  ),
+                  radius: const Radius.circular(999),
+                  crossAxisMargin: 2.5,
+                  mainAxisMargin: 3.0,
+                ),
+                child: Scrollbar(
                   controller: controller,
-                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 11),
-                  // Its own selection: not the history's.
-                  child: SelectionArea(
-                    child: InlineCodeText(
-                      _messageSpan(text, vocabulary, images),
+                  child: ScrollConfiguration(
+                    behavior: ScrollConfiguration.of(context)
+                        .copyWith(scrollbars: false),
+                    child: SingleChildScrollView(
+                      controller: controller,
+                      padding: EdgeInsets.fromLTRB(
+                        12,
+                        10,
+                        copyText.isNotEmpty ? 34 : 12,
+                        11,
+                      ),
+                      // Its own selection: not the history's.
+                      child: SelectionArea(
+                        child: InlineCodeText(
+                          _messageSpan(text, vocabulary, images),
+                        ),
+                      ),
                     ),
                   ),
                 ),
               ),
-            ),
+              if (copyText.isNotEmpty)
+                Positioned(
+                  top: 7,
+                  right: 8,
+                  child: SelectionContainer.disabled(
+                    child: CopyButton(text: copyText, tooltip: l10n.promptCopy),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Quiet metadata strip below a sent user message: concrete send timestamp and
+/// a one-click copy button (cleanly omitting attached `[Image #N]` tags).
+class UserMessageMeta extends StatelessWidget {
+  const UserMessageMeta({
+    super.key,
+    required this.text,
+    this.images = const [],
+    this.sentAt,
+    this.now,
+  });
+
+  final String text;
+  final List<ImageAttachment> images;
+  final DateTime? sentAt;
+  final DateTime? now;
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = context.l10n;
+    final copyText = userPromptCopyText(text, images: images);
+    final sentAt = this.sentAt;
+    if (sentAt == null && copyText.isEmpty) return const SizedBox.shrink();
+    return SelectionContainer.disabled(
+      child: Padding(
+        padding: const EdgeInsets.only(top: 4, right: 2),
+        child: Align(
+          alignment: Alignment.centerRight,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (sentAt != null)
+                IdeHover(
+                  message: l10n.promptSentAtHint(
+                    formatChatFullTimestamp(sentAt),
+                  ),
+                  child: Text(
+                    formatChatTimestamp(sentAt, now: now),
+                    style: TextStyle(
+                      color: AppColors.textFaint,
+                      fontSize: 11.5,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                ),
+              if (sentAt != null && copyText.isNotEmpty)
+                const SizedBox(width: 6),
+              if (copyText.isNotEmpty)
+                CopyButton(text: copyText, tooltip: l10n.promptCopy),
+            ],
           ),
         ),
       ),

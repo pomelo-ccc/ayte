@@ -117,6 +117,8 @@ class ChatScreen extends StatefulWidget {
     this.onFork,
     this.asideAt,
     this.back,
+    this.archived = false,
+    this.onUnarchive,
   });
 
   final String title;
@@ -292,6 +294,10 @@ class ChatScreen extends StatefulWidget {
   /// Over the conversation, as over a subagent's: the way back to the one
   /// it was asked beside, [label] that one's title. None for most.
   final ({String label, VoidCallback onBack})? back;
+
+  /// Whether this conversation is currently archived, and how to restore it.
+  final bool archived;
+  final VoidCallback? onUnarchive;
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
@@ -1745,6 +1751,11 @@ class _ChatScreenState extends State<ChatScreen>
               padding: const EdgeInsets.only(bottom: 8),
               child: start,
             ),
+          if (widget.archived && widget.onUnarchive != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: _ArchivedBanner(onUnarchive: widget.onUnarchive!),
+            ),
           // A subagent's conversation takes no messages.
           _BottomSwitcher(
             child: _agentShown == null
@@ -2428,4 +2439,83 @@ class _ByteStudioGlyphPainter extends CustomPainter {
       oldDelegate.dark != dark ||
       oldDelegate.surfaceColor != surfaceColor ||
       oldDelegate.borderColor != borderColor;
+}
+
+class _ArchivedBanner extends StatelessWidget {
+  const _ArchivedBanner({required this.onUnarchive});
+
+  final VoidCallback onUnarchive;
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = context.l10n;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceRaised,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            Icons.inventory_2_outlined,
+            size: 14,
+            color: AppColors.textMuted,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              l10n.chatArchivedBanner,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(color: AppColors.textMuted, fontSize: 12),
+            ),
+          ),
+          const SizedBox(width: 8),
+          HoverBuilder(
+            cursor: SystemMouseCursors.click,
+            builder: (context, hovered) => Semantics(
+              button: true,
+              label: l10n.chatRestoreFromArchive,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: onUnarchive,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 4,
+                  ),
+                  decoration: BoxDecoration(
+                    color: hovered ? AppColors.hover : AppColors.surface,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: AppColors.border),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.unarchive_outlined,
+                        size: 13,
+                        color: AppColors.textPrimary,
+                      ),
+                      const SizedBox(width: 5),
+                      Text(
+                        l10n.chatRestoreFromArchive,
+                        style: TextStyle(
+                          color: AppColors.textPrimary,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }

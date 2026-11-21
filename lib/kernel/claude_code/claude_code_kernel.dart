@@ -24,6 +24,7 @@ import '../../workspace/editor_launcher.dart' show openExternal;
 import '../agent_kernel.dart';
 import '../antigravity/antigravity_cli.dart';
 import '../antigravity/antigravity_transport.dart' show AntigravityTransport;
+import '../codebuddy/codebuddy_cli.dart';
 import '../commit_attribution.dart';
 import '../extension_switches.dart';
 import '../kernel_event.dart';
@@ -160,7 +161,22 @@ class ClaudeCodeKernel
     _hasExplicitSessionModel = settings['__explicitSessionModel'] == '1';
     _model = rawInitialModel;
     String? legacyAgyEffort;
-    if (AntigravityModels.parseVariant(rawInitialModel) case final parsed?) {
+    if (descriptor.id == codebuddyBuiltinProviderId) {
+      if (CodeBuddyModels.of(rawInitialModel) case final cb?) {
+        _model = modelRef(codebuddyBuiltinProviderId, cb.id);
+      } else if (_providers.resolve(_model) == null) {
+        _model = modelRef(
+          codebuddyBuiltinProviderId,
+          CodeBuddyModels.current.first.id,
+        );
+      }
+    } else if (descriptor.id == 'claude-code') {
+      if (AntigravityModels.isAntigravityModel(_model) ||
+          CodeBuddyModels.isCodeBuddyModel(_model)) {
+        _model = 'default';
+      }
+    } else if (AntigravityModels.parseVariant(rawInitialModel)
+        case final parsed?) {
       _model = modelRef(antigravityBuiltinProviderId, parsed.model.id);
       legacyAgyEffort = parsed.effort;
     } else if (descriptor.id == antigravityBuiltinProviderId &&
@@ -374,7 +390,10 @@ class ClaudeCodeKernel
   static List<_ModelInfo> _keptModels() => [
     for (final raw
         in _modelCache?.get<List<Object?>>(modelCacheKey) ?? const [])
-      if (raw is Map && raw['value'] is String)
+      if (raw is Map &&
+          raw['value'] is String &&
+          !AntigravityModels.isAntigravityModel(raw['value'] as String) &&
+          !CodeBuddyModels.isCodeBuddyModel(raw['value'] as String))
         _ModelInfo.from(raw.cast<String, Object?>()),
   ];
 
@@ -401,6 +420,25 @@ class ClaudeCodeKernel
   /// if offered there, else to the first upstream's.
   String? get _model {
     final picked = _pickedModel;
+    if (descriptor.id == codebuddyBuiltinProviderId) {
+      if (CodeBuddyModels.of(picked) case final cb?) {
+        return modelRef(codebuddyBuiltinProviderId, cb.id);
+      }
+      if (_providers.resolve(picked) != null) return picked;
+      return modelRef(
+        codebuddyBuiltinProviderId,
+        CodeBuddyModels.current.first.id,
+      );
+    }
+    if (descriptor.id == 'claude-code') {
+      if (_providers.resolve(picked) != null) return picked;
+      if (picked != null &&
+          picked.isNotEmpty &&
+          parseModelRef(picked) == null) {
+        return picked;
+      }
+      return 'default';
+    }
     if (AntigravityModels.of(picked) case final agy?
         when _providers.antigravityOffered) {
       return modelRef(antigravityBuiltinProviderId, agy.id);
@@ -603,6 +641,23 @@ class ClaudeCodeKernel
   /// the CLI's.
   ({String provider, String? model, String? effort}) get _launchTarget {
     final custom = _custom;
+    if (custom == null &&
+        (CodeBuddyModels.isCodeBuddyModel(_model) ||
+            descriptor.id == codebuddyBuiltinProviderId)) {
+      final cb = CodeBuddyModels.of(_model) ?? CodeBuddyModels.current.first;
+      final ref = modelRef(codebuddyBuiltinProviderId, cb.id);
+      return (
+        provider: codebuddyBuiltinProviderId,
+        model: ref,
+        effort: _cbEffortFor(cb, ref),
+      );
+    }
+    if (custom == null && descriptor.id == 'claude-code') {
+      final m = (_model == null || parseModelRef(_model) != null)
+          ? 'default'
+          : _model;
+      return (provider: 'claude-code', model: m, effort: _effort);
+    }
     if (custom == null &&
         (AntigravityModels.isAntigravityModel(_model) ||
             descriptor.id == antigravityBuiltinProviderId ||
@@ -3206,7 +3261,11 @@ class ClaudeCodeKernel
   void _applyInitialize(Map<String, Object?> response) {
     // Claude Code's own models are those it lists set up as the user has
     // it: one on a provider lists what the provider's names stand in for.
-    final own = _launchedProvider.isEmpty;
+    // Never let Antigravity or CodeBuddy pollute Claude Code's cached models.
+    final own =
+        descriptor.id != antigravityBuiltinProviderId &&
+        descriptor.id != codebuddyBuiltinProviderId &&
+        (_launchedProvider.isEmpty || _launchedProvider == 'claude-code');
     if (_planName(response['account']) case final plan?) {
       _usage?.providerName = plan;
     }
@@ -3214,16 +3273,19 @@ class ClaudeCodeKernel
       for (final raw in response['models'] as List? ?? const [])
         if (raw is Map) raw.cast<Object?, Object?>(),
     ];
-    if (own) _keepModels(listed);
-    _catalog = _lastCatalog = _catalog.copyWith(
+    if (own && listed.isNotEmpty) _keepModels(listed);
+    _catalog = _catalog.copyWith(
       commands: _commandsFrom(response['commands']),
-      models: own
+      models: own && listed.isNotEmpty
           ? [
               for (final raw in listed)
                 _ModelInfo.from(raw.cast<String, Object?>()),
             ]
-          : _lastCatalog.models,
+          : _catalog.models,
     );
+    if (own) {
+      _lastCatalog = _catalog;
+    }
     // Its mode is the one it was started in: what it changes later comes
     // in `init` and `status` messages.
     emitInfoChanged();
@@ -3348,14 +3410,21 @@ class ClaudeCodeKernel
   /// What a session on [model] is started on: '' for Claude Code as the
   /// user set it up, else the provider and its setup.
   String _providerKeyOf(String? model) {
+    if (CodeBuddyModels.isCodeBuddyModel(model)) {
+      return codebuddyBuiltinProviderId;
+    }
     if (AntigravityModels.isAntigravityModel(model)) {
       return antigravityBuiltinProviderId;
     }
     return switch (_providers.resolve(model)) {
       (final provider, _) => '${provider.id}|${provider.launchFingerprint}',
       null =>
-        descriptor.id == antigravityBuiltinProviderId ||
-                ClaudeCore.current() == ClaudeCore.antigravity
+        descriptor.id == codebuddyBuiltinProviderId
+            ? codebuddyBuiltinProviderId
+            : descriptor.id == 'claude-code'
+            ? 'claude-code'
+            : descriptor.id == antigravityBuiltinProviderId ||
+                  ClaudeCore.current() == ClaudeCore.antigravity
             ? antigravityBuiltinProviderId
             : '',
     };
@@ -3412,6 +3481,20 @@ class ClaudeCodeKernel
     iconBuilder: _providerIcon(antigravityBuiltinProviderId),
   );
 
+  /// The heading CodeBuddy CLI's own models are listed under.
+  static final _codebuddyGroup = KernelOptionGroup(
+    codebuddyBuiltinProviderId,
+    'CodeBuddy CLI',
+    iconBuilder: _providerIcon(codebuddyBuiltinProviderId),
+  );
+
+  /// The heading Claude Code CLI's own models are listed under.
+  static final _claudeCliGroup = KernelOptionGroup(
+    'claude-code',
+    'Claude Code CLI',
+    iconBuilder: _providerIcon('claude-code'),
+  );
+
   /// Provider [id]'s icon, as its models' heading shows it.
   static Widget Function(double, Color) _providerIcon(String id) =>
       (size, color) => ProviderIcon(id, size: size, color: color);
@@ -3447,6 +3530,33 @@ class ClaudeCodeKernel
         : _pickedWindows[id] == null
         ? _variantOf(id)
         : _variantFor(id, long: _window! > _windows['200k']!);
+    if (sameProvider && CodeBuddyModels.of(id) != null) {
+      final cb = CodeBuddyModels.of(id)!;
+      final ref = modelRef(codebuddyBuiltinProviderId, cb.id);
+      _model = ref;
+      final effort = _cbEffortFor(cb, ref, active: false);
+      final window = _cbWindowFor(cb, ref);
+      _effort = effort;
+      _window = window;
+      _contextWindow = window;
+      _contextReported = true;
+      _appliedEffort = effort;
+      _change([
+        ('set_model', {'model': cb.effectiveCliModel}),
+        (
+          'apply_flag_settings',
+          {
+            'settings': {
+              'effortLevel': ?effort,
+              'contextWindow': window,
+            },
+          },
+        ),
+      ]);
+      _reportContext();
+      emitInfoChanged();
+      return;
+    }
     if (sameProvider && AntigravityModels.of(id) != null) {
       final agy = AntigravityModels.of(id)!;
       final ref = modelRef(antigravityBuiltinProviderId, agy.id);
@@ -3597,16 +3707,36 @@ class ClaudeCodeKernel
     return agy.effortLevels.contains(candidate) ? candidate : agy.defaultEffort;
   }
 
+  int _cbWindowFor(CodeBuddyModel cb, String ref) =>
+      cb.resolveContextWindow(_pickedWindows[ref]);
+
+  String? _cbEffortFor(
+    CodeBuddyModel cb,
+    String ref, {
+    bool active = true,
+  }) {
+    if (cb.effortLevels.isEmpty) return null;
+    final candidate =
+        _pickedEfforts[ref] ?? (active ? _effort : null) ?? cb.initialEffort;
+    return cb.effortLevels.contains(candidate) ? candidate : cb.initialEffort;
+  }
+
   /// The context the session compacts at: a provider's model's, else as
   /// picked (null for the CLI's own).
   int? get _autocompact => switch (_custom) {
     (_, final info) => _windowFor(info),
-    null => switch (AntigravityModels.of(_model)) {
-      final agy? => _agyWindowFor(
-        agy,
-        modelRef(antigravityBuiltinProviderId, agy.id),
+    null => switch (CodeBuddyModels.of(_model)) {
+      final cb? => _cbWindowFor(
+        cb,
+        modelRef(codebuddyBuiltinProviderId, cb.id),
       ),
-      null => _window,
+      null => switch (AntigravityModels.of(_model)) {
+        final agy? => _agyWindowFor(
+          agy,
+          modelRef(antigravityBuiltinProviderId, agy.id),
+        ),
+        null => _window,
+      },
     },
   };
 
@@ -3628,6 +3758,9 @@ class ClaudeCodeKernel
     if (_providers.resolve(model) case (_, final info)) {
       return info.effortLevels;
     }
+    if (CodeBuddyModels.of(model) case final cb?) {
+      return cb.effortLevels;
+    }
     if (AntigravityModels.of(model) case final agy?) {
       return agy.effortLevels;
     }
@@ -3647,18 +3780,83 @@ class ClaudeCodeKernel
       ),
   ];
 
+  List<KernelOption> _codebuddyModelOptions() => [
+    for (final m in CodeBuddyModels.current)
+      KernelOption(
+        modelRef(codebuddyBuiltinProviderId, m.id),
+        m.label,
+        Icons.auto_awesome_rounded,
+        m.description,
+        group: _codebuddyGroup,
+        iconBuilder: _modelIcon(codebuddyBuiltinProviderId, m.id),
+      ),
+  ];
+
+  List<KernelOption> _claudeCliModelOptions() {
+    if (_models.isNotEmpty) {
+      return [
+        for (final entry in _models.entries)
+          KernelOption(
+            entry.key,
+            entry.value.first.label,
+            Icons.terminal_rounded,
+            entry.value.first.description,
+            group: _claudeCliGroup,
+            iconBuilder: _modelIcon(
+              'claude-code',
+              entry.value.first.resolved ?? entry.key,
+            ),
+          ),
+      ];
+    }
+    return [
+      KernelOption(
+        'default',
+        'Default (Claude CLI)',
+        Icons.terminal_rounded,
+        'Use local Claude Code default model',
+        group: _claudeCliGroup,
+        iconBuilder: _modelIcon('claude-code', 'claude-sonnet'),
+      ),
+      KernelOption(
+        'opus',
+        'Claude Opus',
+        Icons.terminal_rounded,
+        'Highest capability',
+        group: _claudeCliGroup,
+        iconBuilder: _modelIcon('claude-code', 'claude-opus'),
+      ),
+      KernelOption(
+        'sonnet',
+        'Claude Sonnet',
+        Icons.terminal_rounded,
+        'Balanced coding model',
+        group: _claudeCliGroup,
+        iconBuilder: _modelIcon('claude-code', 'claude-sonnet'),
+      ),
+      KernelOption(
+        'haiku',
+        'Claude Haiku',
+        Icons.terminal_rounded,
+        'Fastest responses',
+        group: _claudeCliGroup,
+        iconBuilder: _modelIcon('claude-code', 'claude-haiku'),
+      ),
+    ];
+  }
+
   @override
   late final KernelChoiceSource model = _Choice(
     options: () {
       final providers = _providers.enabled;
-      final preferAntigravity =
-          ClaudeCore.current() == ClaudeCore.antigravity;
-      final includeAntigravity = _providers.antigravityOffered;
+      final isCodeBuddy = descriptor.id == codebuddyBuiltinProviderId;
+      final isClaudeCli = descriptor.id == 'claude-code';
+      final includeAntigravity =
+          !isCodeBuddy && !isClaudeCli && _providers.antigravityOffered;
       return [
-        if (preferAntigravity && includeAntigravity)
-          ..._antigravityModelOptions(),
-        if (!preferAntigravity && includeAntigravity)
-          ..._antigravityModelOptions(),
+        if (isCodeBuddy) ..._codebuddyModelOptions(),
+        if (isClaudeCli) ..._claudeCliModelOptions(),
+        if (includeAntigravity) ..._antigravityModelOptions(),
         for (final provider in providers)
           for (final info in provider.enabledModels)
             KernelOption(
@@ -3681,6 +3879,16 @@ class ClaudeCodeKernel
     },
     selected: () {
       if (_custom != null) return _model;
+      if (descriptor.id == codebuddyBuiltinProviderId ||
+          CodeBuddyModels.isCodeBuddyModel(_model)) {
+        final bare = CodeBuddyModels.bareModelId(_model);
+        return modelRef(codebuddyBuiltinProviderId, bare);
+      }
+      if (descriptor.id == 'claude-code') {
+        final current = _model;
+        if (current != null && parseModelRef(current) == null) return current;
+        return 'default';
+      }
       if (AntigravityModels.isAntigravityModel(_model)) {
         final bare = AntigravityModels.bareModelId(_model);
         return modelRef(antigravityBuiltinProviderId, bare);
@@ -3729,12 +3937,11 @@ class ClaudeCodeKernel
       }
       if (AntigravityModels.of(model) case final agy?
           when agy.contextOptions.isNotEmpty) {
-        final fixed = agy.contextOptions.length == 1;
         return [
           for (final tokens in agy.contextOptions)
             KernelOption(
               '$tokens',
-              fixed ? '${formatTokens(tokens)}（官方固定）' : formatTokens(tokens),
+              agy.contextOptionLabel(formatTokens(tokens), tokens),
               Icons.notes_rounded,
               agy.contextOptionDescription(tokens),
             ),

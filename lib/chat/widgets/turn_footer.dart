@@ -74,6 +74,7 @@ class TurnFooter extends StatefulWidget {
     super.key,
     this.answer,
     this.worked,
+    this.sentAt,
     this.usage,
     this.live,
     this.since,
@@ -86,6 +87,9 @@ class TurnFooter extends StatefulWidget {
   /// What the copy button copies; no button when null.
   final String? answer;
   final Duration? worked;
+
+  /// When the turn's question was sent, shown as a concrete wall-clock range.
+  final DateTime? sentAt;
   final TurnUsage? usage;
 
   /// What the turn under way has written so far, and how fast.
@@ -216,6 +220,7 @@ class _TurnFooterState extends State<TurnFooter> {
   List<Widget> _stats(AppLocalizations l10n) {
     final usage = widget.usage;
     final worked = widget.worked;
+    final sentAt = widget.sentAt;
     final speed = usage?.tokensPerSecond;
     final cost = usage?.costUsd;
     final tokens = usage?.totalTokens;
@@ -225,6 +230,17 @@ class _TurnFooterState extends State<TurnFooter> {
           icon: _clockIcon,
           text: AgentStep.formatDuration(worked, l10n: l10n),
           hint: l10n.turnDurationHint,
+        ),
+      if (sentAt != null)
+        _Stat(
+          icon: worked == null ? _clockIcon : null,
+          text: formatTurnTimeRange(sentAt, worked: worked),
+          hint: worked != null
+              ? l10n.turnTimeRangeHint(
+                  formatChatFullTimestamp(sentAt),
+                  formatChatFullTimestamp(sentAt.add(worked)),
+                )
+              : l10n.promptSentAtHint(formatChatFullTimestamp(sentAt)),
         ),
       if (speed != null)
         _Stat(
@@ -314,6 +330,11 @@ class _LiveStatsState extends State<_LiveStats> {
           elapsed: elapsed,
           text: AgentStep.formatDuration(elapsed, l10n: l10n),
           hint: l10n.turnDurationHint,
+        ),
+      if (since != null)
+        _Stat(
+          text: formatChatTimestamp(since),
+          hint: l10n.turnStartedAtHint(formatChatFullTimestamp(since)),
         ),
       if (speed != null)
         _Stat(

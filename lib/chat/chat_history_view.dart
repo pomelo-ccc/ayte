@@ -288,6 +288,7 @@ class _ChatHistoryViewState extends State<ChatHistoryView>
       builder: (context, _) => TurnFooter(
         answer: answer,
         worked: message.worked,
+        sentAt: message.sentAt,
         usage: message.usage,
         summary: summary,
         feed: _feed,

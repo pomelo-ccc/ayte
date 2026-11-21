@@ -16,6 +16,10 @@ import 'theme/wb_motion.dart';
 import 'browser/browser_bridge.dart';
 import 'browser/browser_tools.dart';
 import 'browser/browser_welcome.dart';
+import 'browser/embedded/embedded_browser_controller.dart';
+import 'browser/embedded/embedded_browser_settings.dart';
+import 'browser/embedded/embedded_browser_tools.dart';
+import 'computer_use/computer_use_tools.dart';
 import 'images/image_tools.dart';
 import 'usage/usage_tools.dart';
 import 'channel/channel_setup.dart';
@@ -149,6 +153,7 @@ import 'stash/stash_host.dart' show StashCapture;
 import 'stash/stash_note.dart';
 import 'stash/stash_thread_view.dart' show sidebarStashes;
 import 'stash/stash_view.dart';
+import 'workspace/workspace_hub_view.dart';
 import 'stash/stash_welcome.dart' show showStashWelcome;
 import 'workspace/agent_work_path.dart';
 import 'workspace/aside_card.dart';
@@ -644,6 +649,15 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
       FileViews.registerOpener(webPageOpener);
       // The user's browsers, for agents (see browser_bridge.dart).
       unawaited(BrowserTools.start());
+      // Workspace built-in browser tabs & desktop Computer Use tools.
+      EmbeddedBrowserController.instance.onRevealBrowserPanel = () {
+        final thread = _agentThread ?? _workspace.current;
+        if (thread != null) {
+          _sidePanel.showSection(thread.session, SidePanelSection.browser);
+        }
+      };
+      EmbeddedBrowserTools.start();
+      ComputerUseTools.start();
       // Pictures, for agents, while an image model is turned on.
       ImageTools.start();
       // The calls kept and the models' prices, for agents.
@@ -1043,6 +1057,7 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
         if (BrowserBridge.instance.supported)
           browserWelcomeCommandId: _showBrowserWelcome,
         modelWelcomeCommandId: _showModelWelcome,
+        ChatCommandIds.searchAgents: _searchAgents,
         ChatCommandIds.search: () => unawaited(_openPalette()),
         ..._sidePanelCommands(),
         ..._terminalCommands(),
@@ -1172,7 +1187,12 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
     final thread = _agentThread ?? _workspace.current;
     switch (link.type) {
       case TerminalLinkType.url:
-        unawaited(openExternal(link.text));
+        unawaited(
+          EmbeddedBrowserController.instance.openLink(
+            link.text,
+            source: LinkSource.terminal,
+          ),
+        );
       case TerminalLinkType.localFile when thread != null:
         final at = LspPosition(
           math.max(0, (link.line ?? 1) - 1),
@@ -1279,6 +1299,13 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
     _focusChat(thread);
   }
 
+  /// Opens [thread] picked from the search palette, making sure it is visible
+  /// and unfolded in the left sidebar as well.
+  void _openSearchedAgent(AgentThread thread) {
+    _workspace.revealInSidebar(thread);
+    _agentWindow ? _showInWindow(thread) : _openAgent(thread);
+  }
+
   /// An agent picked in a notification or the tray's menu: in the IDE's
   /// chat while the IDE shows (its folder's IDE, if another shows), else as
   /// the sidebar opens it.
@@ -1372,14 +1399,19 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
     setState(() {
       _customizing = true;
       _stashing = false;
+      _workspacePage = null;
       if (kind != null) _customizeKind = kind;
     });
   }
 
-  /// The conversations show again, in place of Customize or the stashes.
+  /// The conversations show again, in place of Customize, Stash, or a workspace page.
   void _closeCustomize() {
-    if (_customizing || _stashing) {
-      setState(() => _customizing = _stashing = false);
+    if (_customizing || _stashing || _workspacePage != null) {
+      setState(() {
+        _customizing = false;
+        _stashing = false;
+        _workspacePage = null;
+      });
     }
   }
 
@@ -1393,8 +1425,25 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
   int? _stashShown;
   final GlobalKey<StashViewState> _stashKey = GlobalKey();
 
+  /// Workspace hub pages (Tasks / Automations / Library / Canvas) opened from
+  /// the left sidebar beside Customize ("插件") and Stash.
+  WorkspacePage? _workspacePage;
+
+  void _showWorkspacePage(WorkspacePage page) {
+    _closeDrawer();
+    setState(() {
+      if (_workspacePage == page) {
+        _workspacePage = null;
+      } else {
+        _workspacePage = page;
+        _customizing = false;
+        _stashing = false;
+      }
+    });
+  }
+
   /// Something shows in place of the conversations.
-  bool get _replacingChat => _customizing || _stashing;
+  bool get _replacingChat => _customizing || _stashing || _workspacePage != null;
 
   /// Shows the stashes, [id]'s if given.
   void _showStash([int? id]) {
@@ -1404,6 +1453,7 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
     setState(() {
       _stashing = true;
       _customizing = false;
+      _workspacePage = null;
       _stashShown = id;
     });
   }
@@ -1655,12 +1705,13 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
         recentActions: List.of(_recentActions),
         settings: _paletteSettings(),
         filter: filter,
-        onOpenAgent: _agentWindow ? _showInWindow : _openAgent,
+        onOpenAgent: _openSearchedAgent,
         // A hit in what was said: found in the conversation, once shown.
         onFindInAgent: (thread, query) {
-          _agentWindow ? _showInWindow(thread) : _openAgent(thread);
+          _openSearchedAgent(thread);
           _findInChat(thread, query);
         },
+        onUnarchiveAgent: (thread) => _workspace.setArchived(thread, false),
         onOpenFile: (path) {
           if (_windows case final windows? when _multi || _agentWindow) {
             unawaited(
@@ -3582,6 +3633,8 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
           ? null
           : () => _stashing ? _closeCustomize() : _showStash(),
       stashing: _stashing,
+      activePage: agent != null ? null : _workspacePage,
+      onSelectPage: agent != null ? null : _showWorkspacePage,
       // Opened on the Stash page, which an agent's window has not.
       stashes: switch (StashController.current) {
         final stash? when agent == null => sidebarStashes(
@@ -4280,7 +4333,7 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
       ChatCommandIds.attachSelection: _addSidePanelSelectionToChat,
     },
     for (final section in alwaysShownSections)
-      section.command!: () => _showSidePanelSection(section),
+      ?section.command: () => _showSidePanelSection(section),
   };
 
   /// The focus of the focused agent's side panel: its pane's, of agents
@@ -4938,6 +4991,12 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
       };
 
   Widget _buildGrid({required bool showToggle}) {
+    if (_workspacePage case final page?) {
+      return _footless(
+        context,
+        _buildWorkspacePage(page, showToggle: showToggle),
+      );
+    }
     if (_stashing) {
       if (StashController.current case final stash?) {
         return _footless(context, _buildStash(stash, showToggle: showToggle));
@@ -4974,6 +5033,26 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
             : chat;
       },
       onLinesMoved: _workspace.keepGridLines,
+    );
+  }
+
+  /// Full-width workspace page (Tasks / Automations / Library / Canvas) opened
+  /// from the left sidebar alongside Customize and Stash.
+  Widget _buildWorkspacePage(WorkspacePage page, {required bool showToggle}) {
+    final header = WindowControls.drawsHeader;
+    final thread = _workspace.current;
+    return WorkspacePageView(
+      key: ValueKey(('workspace-page', page)),
+      page: page,
+      session: thread?.session,
+      onClose: _closeCustomize,
+      island: AppColors.conversationSurface,
+      leading: !header && showToggle && !_sidebarAtRight
+          ? _showSidebarButton()
+          : null,
+      titleBarInset: !header && (showToggle || _sidebarAtRight)
+          ? AppMetrics.trafficLightsWidth + 8
+          : 12.0,
     );
   }
 
@@ -5480,6 +5559,8 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
           ),
           null => null,
         },
+        archived: thread.archived,
+        onUnarchive: () => _workspace.setArchived(thread, false),
       ),
     );
     if (!layered) return chat;
@@ -5521,6 +5602,11 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
     final isZh = Localizations.maybeLocaleOf(context)?.languageCode == 'zh';
     final terminals = _terminals;
     final sessionGroup = <IdeMenuAction>[
+      if (thread != null)
+        IdeMenuAction(
+          thread.archived ? l10n.chatRestoreFromArchive : l10n.sidebarArchive,
+          onSelected: () => _workspace.setArchived(thread, !thread.archived),
+        ),
       if (includeCardTools && thread != null && _reloadable(thread))
         IdeMenuAction(l10n.chatReload, onSelected: () => _reload(thread)),
       if (includeCardTools &&
@@ -5778,6 +5864,8 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
         null => null,
       },
       SidePanelSection.terminal ||
+      SidePanelSection.browser ||
+      SidePanelSection.canvas ||
       SidePanelSection.usage ||
       SidePanelSection.ports ||
       SidePanelSection.plan => null,

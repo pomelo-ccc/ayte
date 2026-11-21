@@ -433,10 +433,24 @@ final List<KeybindingEntry> chatExtraKeybindings = [
     when: _window,
   ),
   const KeybindingEntry(
+    key: 'ctrl+shift+k',
+    mac: 'shift+cmd+k',
+    command: ChatCommandIds.search,
+    when: _window,
+  ),
+  const KeybindingEntry(
     key: 'ctrl+shift+p',
     mac: 'shift+cmd+p',
     command: ChatCommandIds.search,
     when: _window,
+  ),
+  const KeybindingEntry(
+    key: 'ctrl+f',
+    mac: 'cmd+f',
+    command: ChatCommandIds.searchAgents,
+    when:
+        '$_window && !${ChatContextKeys.inChat} && '
+        '!terminalFocus && !textInputFocus',
   ),
   const KeybindingEntry(
     key: 'ctrl+shift+f',

@@ -1,10 +1,14 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as p;
 import 'package:baocode/chat/panels/context_usage_panel.dart';
 import 'package:baocode/kernel/agent_kernel.dart';
 import 'package:baocode/kernel/antigravity/antigravity_cli.dart';
 import 'package:baocode/kernel/antigravity/antigravity_transport.dart';
 import 'package:baocode/kernel/claude_code/claude_code_kernel.dart';
+import 'package:baocode/kernel/claude_code/claude_code_transport.dart';
 import 'package:baocode/kernel/claude_code/claude_core_setting.dart';
 import 'package:baocode/kernel/kernel_event.dart';
 import 'package:baocode/models/model_providers.dart';
@@ -12,12 +16,16 @@ import 'package:baocode/models/model_providers.dart';
 void main() {
   group('AntigravityModels deduplication & context windows', () {
     test(
-      'updateFromJson collapses 22 raw agy model variants into 9 clean families with agy 1.5.10 context windows',
+      'updateFromJson collapses raw agy 1.5.12 model variants into clean families with selectable 512K override',
       () {
         const rawJson = {
           'command': {
             'data': {
               'models': [
+                {'id': 'gemini-4-neon-high', 'label': 'Gemini 4 Neon (High)'},
+                {'id': 'gemini-4-neon-xhigh', 'label': 'Gemini 4 Neon (XHigh)'},
+                {'id': 'gemini-4-neon-medium', 'label': 'Gemini 4 Neon (Medium)'},
+                {'id': 'gemini-4-neon-low', 'label': 'Gemini 4 Neon (Low)'},
                 {'id': 'gemini-4-carbon-medium', 'label': 'Gemini 4 Carbon (Medium)'},
                 {'id': 'gemini-4-carbon-high', 'label': 'Gemini 4 Carbon (High)'},
                 {'id': 'gemini-4-carbon-low', 'label': 'Gemini 4 Carbon (Low)'},
@@ -28,6 +36,7 @@ void main() {
                 {'id': 'gemini-4-hydrogen-xhigh', 'label': 'Gemini 4 Hydrogen (XHigh)'},
                 {'id': 'gemini-4-hydrogen-medium', 'label': 'Gemini 4 Hydrogen (Medium)'},
                 {'id': 'gemini-4-hydrogen-low', 'label': 'Gemini 4 Hydrogen (Low)'},
+                {'id': 'gemini-pro-orchestrator-neon', 'label': 'Orchestrator (Neon)'},
                 {'id': 'gemini-pro-orchestrator', 'label': 'Orchestrator (Carbon)'},
                 {'id': 'gemini-pro-orchestrator-argon', 'label': 'Orchestrator (Argon)'},
                 {'id': 'gemini-3.8-flash-high', 'label': 'Gemini 3.8 Flash (High)'},
@@ -49,9 +58,11 @@ void main() {
         final families = AntigravityModels.current;
 
         expect(families.map((m) => m.id).toList(), [
+          'gemini-4-neon',
           'gemini-4-carbon',
           'gemini-4-argon',
           'gemini-4-hydrogen',
+          'gemini-pro-orchestrator-neon',
           'gemini-pro-orchestrator',
           'gemini-pro-orchestrator-argon',
           'gemini-3.8-flash',
@@ -60,17 +71,13 @@ void main() {
           'gpt-oss-120b',
         ]);
 
-        expect(families.map((m) => m.label).toList(), [
-          'Gemini 4 Carbon',
-          'Gemini 4 Argon',
-          'Gemini 4 Hydrogen',
-          'Orchestrator (Carbon)',
-          'Orchestrator (Argon)',
-          'Gemini 3.8 Flash',
-          'Claude Opus 5.5',
-          'Claude Sonnet 5.5',
-          'GPT-OSS 120B',
-        ]);
+        final neon = AntigravityModels.of('gemini-4-neon')!;
+        expect(neon.label, 'Gemini 4 Neon');
+        expect(neon.effortLevels, ['low', 'medium', 'high', 'xhigh']);
+        expect(neon.contextOptions, [256000, 512000]);
+        expect(neon.defaultContext, 256000);
+        expect(neon.supportsPresetContextWindow, isFalse);
+        expect(neon.resolveContextWindow(512000), 512000);
 
         final argon = AntigravityModels.of('gemini-4-argon')!;
         expect(argon.effortLevels, ['low', 'medium', 'high']);
@@ -82,19 +89,19 @@ void main() {
 
         final hydrogen = AntigravityModels.of('gemini-4-hydrogen')!;
         expect(hydrogen.effortLevels, ['low', 'medium', 'high', 'xhigh']);
-        expect(hydrogen.contextOptions, [256000]);
+        expect(hydrogen.contextOptions, [256000, 512000]);
         expect(hydrogen.defaultContext, 256000);
         expect(hydrogen.supportsPresetContextWindow, isFalse);
         expect(hydrogen.effectiveCliModel, 'gemini-4-hydrogen');
-        expect(hydrogen.resolveContextWindow(512000), 256000);
+        expect(hydrogen.resolveContextWindow(512000), 512000);
 
         final orchestrator = AntigravityModels.of('gemini-pro-orchestrator')!;
         expect(orchestrator.effortLevels, isEmpty);
-        expect(orchestrator.contextOptions, [256000]);
+        expect(orchestrator.contextOptions, [256000, 512000]);
 
         final claudeOpus = AntigravityModels.of('claude-opus-5-5')!;
         expect(claudeOpus.effortLevels, ['low', 'medium', 'high']);
-        expect(claudeOpus.contextOptions, [256000]);
+        expect(claudeOpus.contextOptions, [256000, 512000]);
         expect(claudeOpus.defaultContext, 256000);
 
         final gptOss = AntigravityModels.of('gpt-oss-120b')!;
@@ -168,11 +175,25 @@ void main() {
           '512000',
         );
 
+        final neonContexts = kernel.contextSize
+            .optionsFor('@antigravity-cli/gemini-4-neon')
+            .map((o) => o.label)
+            .toList();
+        expect(neonContexts, ['256K', '512K（强制）']);
+
         final carbonContexts = kernel.contextSize
             .optionsFor('@antigravity-cli/gemini-4-carbon')
             .map((o) => o.label)
             .toList();
-        expect(carbonContexts, ['256K（官方固定）']);
+        expect(carbonContexts, ['256K', '512K（强制）']);
+
+        // Forcing 512K on Gemini 4 Neon updates contextWindow immediately.
+        kernel.model.select('@antigravity-cli/gemini-4-neon');
+        kernel.contextSize.select('@antigravity-cli/gemini-4-neon', '512000');
+        await Future<void>.delayed(Duration.zero);
+        expect(kernel.contextSize.selected, '512000');
+        expect(kernel.contextWindow, 512000);
+        expect(reported.last.usage.window, 512000);
 
         final argonContexts = kernel.contextSize
             .optionsFor('@antigravity-cli/gemini-4-argon')
@@ -258,6 +279,21 @@ void main() {
         carbonArgs.any((arg) => arg.startsWith('--settings=')),
         isFalse,
       );
+
+      final neon512Args = AntigravityTransport.buildCliArguments(
+        model: 'gemini-4-neon',
+        effort: 'high',
+        permissionMode: 'default',
+        maxContextTokens: 512000,
+      );
+      expect(neon512Args, contains('--settings={"contextWindow":"512K"}'));
+
+      final neon512Env = AntigravityTransport.buildProcessEnvironment(
+        baseEnvironment: const {'PATH': '/usr/bin'},
+        model: 'gemini-4-neon',
+        maxContextTokens: 512000,
+      );
+      expect(neon512Env['AGY_CLI_AUTO_COMPACT_OVERRIDE'], '512000');
 
       final hydrogenEnv = AntigravityTransport.buildProcessEnvironment(
         baseEnvironment: const {
@@ -387,5 +423,111 @@ void main() {
       expect(bashMapped.input['command'], 'pnpm run dev:docs');
       expect(bashMapped.input['description'], 'Start docs server');
     });
+  });
+
+  group('AntigravityTransport per-turn duration', () {
+    test(
+      'reports current turn elapsed duration_ms instead of cumulative session duration_seconds',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp('ayte_agy_dur_');
+        addTearDown(() => tmp.delete(recursive: true));
+
+        final script = File(p.join(tmp.path, 'fake_agy.sh'));
+        await script.writeAsString('''#!/bin/sh
+set -eu
+DIR="${tmp.path}"
+
+IFS= read -r _line1
+printf '%s\\n' '{"event":"init","conversation_id":"conv-duration-test"}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_index":0,"step_type":"agent_response","state":"RUNNING","text_delta":"t1"}}'
+while [ ! -f "\$DIR/go1" ]; do sleep 0.01; done
+printf '%s\\n' '{"event":"result","result":{"status":"ERROR","error":"FAILED_PRECONDITION (code 400): User location is not supported for the API use.","duration_seconds":69120.5}}'
+
+IFS= read -r _line2
+printf '%s\\n' '{"event":"step_update","step_update":{"step_index":1,"step_type":"agent_response","state":"RUNNING","text_delta":"t2"}}'
+while [ ! -f "\$DIR/go2" ]; do sleep 0.01; done
+printf '%s\\n' '{"event":"result","result":{"status":"SUCCESS","response":"done","duration_seconds":70440.25}}'
+''');
+        await Process.run('chmod', ['+x', script.path]);
+
+        var now = DateTime.utc(2026, 11, 19, 11, 0, 0);
+        final transport = AntigravityTransport.forTesting(
+          executable: script.path,
+          environment: {'HOME': tmp.path},
+          launch: ClaudeLaunch(
+            cwd: tmp.path,
+            model: '@antigravity-cli/gemini-4-hydrogen',
+            persist: false,
+          ),
+          now: () => now,
+        );
+        addTearDown(transport.close);
+
+        final events = <Map<String, Object?>>[];
+        final sub = transport.messages.listen(events.add);
+        addTearDown(sub.cancel);
+
+        Future<Map<String, Object?>> waitForEvent(
+          bool Function(Map<String, Object?> e) testFn, {
+          int fromIndex = 0,
+        }) async {
+          for (var i = fromIndex; i < events.length; i++) {
+            if (testFn(events[i])) return events[i];
+          }
+          await for (final e in transport.messages) {
+            if (testFn(e)) return e;
+          }
+          throw StateError('Stream closed before matching event');
+        }
+
+        // Turn 1: agy reports 19h12m (69120.5s) cumulative session duration,
+        // while this turn only ran for 12s.
+        transport.write({
+          'type': 'user',
+          'uuid': 'turn-1',
+          'message': {'role': 'user', 'content': 'first'},
+        });
+        await waitForEvent((e) => e['type'] == 'stream_event');
+        now = now.add(const Duration(seconds: 12));
+        await File(p.join(tmp.path, 'go1')).writeAsString('1');
+
+        final result1 = await waitForEvent((e) => e['type'] == 'result');
+        expect(result1['subtype'], 'error');
+        expect(result1['duration_ms'], 12000);
+
+        final turn2StartIdx = events.length;
+        // Idle 5 minutes between turns, then Turn 2 runs for 7s while agy
+        // reports 19h34m (70440.25s) cumulative duration.
+        now = now.add(const Duration(minutes: 5));
+        transport.write({
+          'type': 'user',
+          'uuid': 'turn-2',
+          'message': {'role': 'user', 'content': 'second'},
+        });
+        await waitForEvent(
+          (e) => e['type'] == 'stream_event',
+          fromIndex: turn2StartIdx,
+        );
+        now = now.add(const Duration(seconds: 7));
+        await File(p.join(tmp.path, 'go2')).writeAsString('1');
+
+        final result2 = await waitForEvent(
+          (e) => e['type'] == 'result',
+          fromIndex: turn2StartIdx,
+        );
+        expect(result2['subtype'], 'success');
+        expect(result2['duration_ms'], 7000);
+
+        final startedIds = events
+            .where(
+              (e) =>
+                  e['type'] == 'command_lifecycle' && e['state'] == 'started',
+            )
+            .map((e) => e['command_uuid'])
+            .toList();
+        expect(startedIds, ['turn-1', 'turn-2']);
+      },
+      skip: Platform.isWindows ? 'Requires POSIX /bin/sh' : false,
+    );
   });
 }

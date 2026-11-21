@@ -1639,6 +1639,19 @@
       }
     }
   },
+  "promptCopy": "Copy question",
+  "@promptCopy": {
+    "description": "Hint of the button under a sent user message that copies its text."
+  },
+  "promptSentAtHint": "Sent at {time}",
+  "@promptSentAtHint": {
+    "description": "Tooltip showing the exact date and time a user question was sent.",
+    "placeholders": {
+      "time": {
+        "type": "String"
+      }
+    }
+  },
   "turnCopy": "Copy reply",
   "@turnCopy": {
     "description": "Hint of the button at the end of a finished turn that copies its answer."
@@ -1677,6 +1690,25 @@
   "turnOutputTokensHint": "Written so far this turn",
   "turnSpeedLiveHint": "Output speed, sampled over the last 2 seconds",
   "turnDurationHint": "Time this turn took",
+  "turnStartedAtHint": "Started at {time}",
+  "@turnStartedAtHint": {
+    "placeholders": {
+      "time": {
+        "type": "String"
+      }
+    }
+  },
+  "turnTimeRangeHint": "Started: {start}\nFinished: {end}",
+  "@turnTimeRangeHint": {
+    "placeholders": {
+      "start": {
+        "type": "String"
+      },
+      "end": {
+        "type": "String"
+      }
+    }
+  },
   "turnCostHint": "Cost of this turn",
   "turnWorked": "Worked for {duration}",
   "@turnWorked": {
@@ -10319,5 +10351,7 @@
         "type": "String"
       }
     }
-  }
+  },
+  "chatArchivedBanner": "This conversation is archived.",
+  "chatRestoreFromArchive": "Restore from archive"
 }

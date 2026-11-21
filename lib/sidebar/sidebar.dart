@@ -36,6 +36,11 @@ import '../models/model_providers.dart';
 import '../remote/remote_location.dart';
 import '../remote/remote_status.dart' show sshErrorText;
 import '../remote/ssh_host.dart' show SshHost, SshHostState, SshHosts;
+import 'sidebar_nav_config.dart';
+import 'sidebar_nav_manager_dialog.dart';
+import '../tags/tag_manager_dialog.dart';
+import '../tags/tag_store.dart';
+import '../tasks/task_queue_service.dart';
 import '../theme/app_theme.dart';
 import '../theme/codicons.dart';
 import '../theme/workbench_theme.dart' show WorkbenchThemeService, themeColors;
@@ -45,6 +50,7 @@ import '../workspace/editor_launcher.dart';
 import '../workspace/islands.dart';
 import '../workspace/title_bar_double_click.dart';
 import '../workspace/window_controls.dart';
+import '../workspace/workspace_hub_view.dart' show WorkspacePage;
 import '../workspace/workspace.dart';
 import '../workspace/workspace_dialog.dart';
 import 'sidebar_menu.dart';
@@ -150,7 +156,7 @@ typedef _Rows = ({List<AgentThread> threads, int more, bool less});
 enum _ListRowKind { header, thread, more, pinZone, projectsBar }
 
 const _projectsBarGroup = _Group('#projectsBar', '', []);
-const _pinnedRowHeight = 42.0;
+const _pinnedRowHeight = 54.0;
 
 /// Visible row data, independent of whether the list built its widget.
 class _ListRow {
@@ -208,6 +214,8 @@ class Sidebar extends StatefulWidget {
     this.onStash,
     this.stashing = false,
     this.stashes,
+    this.activePage,
+    this.onSelectPage,
     this.drag,
     this.link,
     this.current,
@@ -298,6 +306,13 @@ class Sidebar extends StatefulWidget {
   /// They show: the Stash row is selected.
   final bool stashing;
 
+  /// Top-level workspace page (Tasks / Automations / Library / Canvas) open in
+  /// place of the chat.
+  final WorkspacePage? activePage;
+
+  /// Opens or toggles a top-level workspace page from the left sidebar.
+  final ValueChanged<WorkspacePage>? onSelectPage;
+
   /// The stashes each conversation carries out, on its row; none without
   /// the Stash.
   final SidebarStashes? stashes;
@@ -350,6 +365,7 @@ class _SidebarState extends State<Sidebar>
 
   bool _rowsDirty = true;
   AgentThread? _listedCurrent;
+  bool? _listedCurrentArchived;
 
   /// The agent whose row was just clicked to open it: in view, under the
   /// pointer, it is not scrolled to (see [_revealCurrent]).
@@ -463,15 +479,19 @@ class _SidebarState extends State<Sidebar>
       _detachDrag(oldWidget.drag);
       _attachDrag(widget.drag);
     }
-    // Customize or the Stash shown: its row is the one picked, not the
-    // conversation picked before it.
-    if (_onPage && !(oldWidget.customizing || oldWidget.stashing)) {
+    // Customize, Stash, or a workspace page shown: its row is the one picked,
+    // not the conversation picked before it.
+    if (_onPage &&
+        !(oldWidget.customizing ||
+            oldWidget.stashing ||
+            oldWidget.activePage != null)) {
       _listSelection.select(null);
     }
   }
 
-  /// Customize or the Stash is shown in place of the chat.
-  bool get _onPage => widget.customizing || widget.stashing;
+  /// Customize, Stash, or a workspace page is shown in place of the chat.
+  bool get _onPage =>
+      widget.customizing || widget.stashing || widget.activePage != null;
 
   @override
   void dispose() {
@@ -568,6 +588,7 @@ class _SidebarState extends State<Sidebar>
   bool _listed(AgentThread thread) =>
       !_workspace.isHidden(thread.project) &&
       _workspace.listsHost(thread.project.host) &&
+      TagStore.instance.matchesFilter(thread) &&
       (!thread.untouched ||
           identical(thread, _current) ||
           _workspace.grid.contains(thread));
@@ -1057,7 +1078,10 @@ class _SidebarState extends State<Sidebar>
   @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
-      listenable: WorkbenchThemeService.instance,
+      listenable: Listenable.merge([
+        WorkbenchThemeService.instance,
+        TagStore.instance,
+      ]),
       builder: (context, _) => Material(
         color: widget.surface ?? AppColors.sidebarSurface,
         child: Listener(
@@ -1082,6 +1106,10 @@ class _SidebarState extends State<Sidebar>
       widget.onStash?.call();
       return;
     }
+    if (widget.activePage case final page?) {
+      widget.onSelectPage?.call(page);
+      return;
+    }
     _workspace.navigate(back: true);
   }
 
@@ -1103,8 +1131,10 @@ class _SidebarState extends State<Sidebar>
       listenable: Listenable.merge([
         _workspace,
         WorkbenchThemeService.instance,
+        SidebarNavConfig.instance,
       ]),
       builder: (context, _) {
+        unawaited(SidebarNavConfig.instance.load());
         final cardBg = AppColors.conversationSurface;
         final body = Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1113,54 +1143,41 @@ class _SidebarState extends State<Sidebar>
               padding: const EdgeInsets.fromLTRB(8, 2, 8, 5),
               // A new chat picks its folder over its input (see
               // NewChatFolderBar): a folder first only without any.
-              child: _NewAgentButton(
-                onTap: switch (_workspace.sidebarHost) {
-                  final host? when _workspace.sidebarProjectsOn(host).isEmpty =>
-                    () => widget.onOpenFolderOn?.call(host),
-                  null when _workspace.sidebarProjectsHere.isEmpty =>
-                    widget.onOpenFolder ?? () {},
-                  _ => _create,
-                },
+              child: Row(
+                children: [
+                  Expanded(
+                    child: _NewAgentButton(
+                      onTap: switch (_workspace.sidebarHost) {
+                        final host?
+                            when _workspace.sidebarProjectsOn(host).isEmpty =>
+                          () => widget.onOpenFolderOn?.call(host),
+                        null when _workspace.sidebarProjectsHere.isEmpty =>
+                          widget.onOpenFolder ?? () {},
+                        _ => _create,
+                      },
+                    ),
+                  ),
+                  if (widget.onCustomize != null ||
+                      widget.onStash != null ||
+                      widget.onSelectPage != null) ...[
+                    const SizedBox(width: 4),
+                    SidebarIconButton(
+                      icon: Codicons.settings,
+                      tooltip: isZh
+                          ? '管理导航入口（添加 / 移除 / 排序）'
+                          : 'Manage sidebar navigation',
+                      size: 28,
+                      onTap: () => unawaited(
+                        showSidebarNavManagerDialog(context),
+                      ),
+                    ),
+                  ],
+                ],
               ),
             ),
-            if (widget.onCustomize case final customize?)
-              _NavRow(
-                icon: Codicons.sparkle,
-                glyph: AntigravitySidebarGlyph.customizations,
-                label: isZh ? '插件' : context.l10n.sidebarCustomize,
-                semanticsLabel: context.l10n.sidebarCustomize,
-                selected: widget.customizing,
-                onTap: customize,
-              ),
-            if (widget.onStash case final stash?)
-              switch (widget.stashes) {
-                final stashes? => ListenableBuilder(
-                  listenable: stashes.changes,
-                  builder: (context, _) {
-                    final news = stashes.news();
-                    final total = stashes.count();
-                    return _NavRow(
-                      icon: Codicons.note,
-                      glyph: AntigravitySidebarGlyph.stash,
-                      label: context.l10n.stashTitle,
-                      selected: widget.stashing,
-                      badge: news > 0 ? news : total,
-                      badgeHover: news > 0
-                          ? context.l10n.stashNewsSidebar(news)
-                          : null,
-                      onTap: stash,
-                    );
-                  },
-                ),
-                null => _NavRow(
-                  icon: Codicons.note,
-                  glyph: AntigravitySidebarGlyph.stash,
-                  label: context.l10n.stashTitle,
-                  selected: widget.stashing,
-                  onTap: stash,
-                ),
-              },
-            const SizedBox(height: 4),
+            ..._buildManagedNavRows(isZh),
+            const SizedBox(height: 6),
+            _SidebarTagFilterBar(onManage: () => showTagManagerDialog(context)),
             if (_speedQuery.isNotEmpty)
               Padding(
                 padding: const EdgeInsets.fromLTRB(8, 2, 8, 2),
@@ -1196,6 +1213,213 @@ class _SidebarState extends State<Sidebar>
         );
       },
     );
+  }
+
+  /// Renders the user-ordered visible top navigation rows plus a compact
+  /// "More" overflow menu for any tucked-away entries.
+  List<Widget> _buildManagedNavRows(bool isZh) {
+    final config = SidebarNavConfig.instance;
+    final visible = config.visibleItems;
+    final hidden = [
+      for (final item in config.hiddenItems)
+        if (_canOpenNavItem(item)) item,
+    ];
+
+    List<SidebarMenuItem> navContextMenu(SidebarNavItem item) {
+      final idx = visible.indexOf(item);
+      return [
+        if (idx > 0)
+          SidebarMenuItem(
+            isZh ? '上移' : 'Move Up',
+            icon: Codicons.arrowUp,
+            onSelected: () => config.moveUp(item),
+          ),
+        if (idx >= 0 && idx < visible.length - 1)
+          SidebarMenuItem(
+            isZh ? '下移' : 'Move Down',
+            icon: Codicons.arrowDown,
+            onSelected: () => config.moveDown(item),
+          ),
+        SidebarMenuItem(
+          isZh ? '从侧边栏收起到「更多」' : 'Move to "More"',
+          icon: Codicons.eyeClosed,
+          onSelected: () => config.hideItem(item),
+        ),
+        const SidebarMenuItem.divider(),
+        SidebarMenuItem(
+          isZh ? '管理导航入口（添加 / 移除 / 排序）…' : 'Manage Navigation…',
+          icon: Codicons.settings,
+          onSelected: () => unawaited(showSidebarNavManagerDialog(context)),
+        ),
+      ];
+    }
+
+    Widget? buildRow(SidebarNavItem item) {
+      List<SidebarMenuItem> menu() => navContextMenu(item);
+      return switch (item) {
+        SidebarNavItem.customize => switch (widget.onCustomize) {
+          final customize? => _NavRow(
+            icon: Codicons.sparkle,
+            glyph: AntigravitySidebarGlyph.customizations,
+            label: isZh ? '插件' : context.l10n.sidebarCustomize,
+            semanticsLabel: context.l10n.sidebarCustomize,
+            selected: widget.customizing,
+            contextMenuItems: menu,
+            onTap: customize,
+          ),
+          null => null,
+        },
+        SidebarNavItem.stash => switch (widget.onStash) {
+          final stash? => switch (widget.stashes) {
+            final stashes? => ListenableBuilder(
+              listenable: stashes.changes,
+              builder: (context, _) {
+                final news = stashes.news();
+                final total = stashes.count();
+                return _NavRow(
+                  icon: Codicons.note,
+                  glyph: AntigravitySidebarGlyph.stash,
+                  label: context.l10n.stashTitle,
+                  selected: widget.stashing,
+                  badge: news > 0 ? news : total,
+                  badgeHover: news > 0
+                      ? context.l10n.stashNewsSidebar(news)
+                      : null,
+                  contextMenuItems: menu,
+                  onTap: stash,
+                );
+              },
+            ),
+            null => _NavRow(
+              icon: Codicons.note,
+              glyph: AntigravitySidebarGlyph.stash,
+              label: context.l10n.stashTitle,
+              selected: widget.stashing,
+              contextMenuItems: menu,
+              onTap: stash,
+            ),
+          },
+          null => null,
+        },
+        SidebarNavItem.tasks => switch (widget.onSelectPage) {
+          final selectPage? => ListenableBuilder(
+            listenable: TaskQueueService.instance,
+            builder: (context, _) => _NavRow(
+              icon: WorkspacePage.tasks.icon,
+              label: WorkspacePage.tasks.label(isZh),
+              selected: widget.activePage == WorkspacePage.tasks,
+              badge: TaskQueueService.instance.reviewCount,
+              contextMenuItems: menu,
+              onTap: () => selectPage(WorkspacePage.tasks),
+            ),
+          ),
+          null => null,
+        },
+        SidebarNavItem.automations => switch (widget.onSelectPage) {
+          final selectPage? => _NavRow(
+            icon: WorkspacePage.automations.icon,
+            label: WorkspacePage.automations.label(isZh),
+            selected: widget.activePage == WorkspacePage.automations,
+            contextMenuItems: menu,
+            onTap: () => selectPage(WorkspacePage.automations),
+          ),
+          null => null,
+        },
+        SidebarNavItem.library => switch (widget.onSelectPage) {
+          final selectPage? => _NavRow(
+            icon: WorkspacePage.library.icon,
+            label: WorkspacePage.library.label(isZh),
+            selected: widget.activePage == WorkspacePage.library,
+            contextMenuItems: menu,
+            onTap: () => selectPage(WorkspacePage.library),
+          ),
+          null => null,
+        },
+        SidebarNavItem.canvas => switch (widget.onSelectPage) {
+          final selectPage? => _NavRow(
+            icon: WorkspacePage.canvas.icon,
+            label: WorkspacePage.canvas.label(isZh),
+            selected: widget.activePage == WorkspacePage.canvas,
+            contextMenuItems: menu,
+            onTap: () => selectPage(WorkspacePage.canvas),
+          ),
+          null => null,
+        },
+      };
+    }
+
+    final rows = <Widget>[
+      for (final item in visible) ?buildRow(item),
+    ];
+
+    if (hidden.isNotEmpty) {
+      final anyHiddenActive = hidden.any(_isNavItemSelected);
+      rows.add(
+        SidebarMenu(
+          width: 210,
+          placement: (side: FloatingSide.bottom, align: FloatingAlign.start),
+          items: () => [
+            for (final item in hidden)
+              SidebarMenuItem(
+                item.label(isZh),
+                icon: item.icon,
+                checked: _isNavItemSelected(item),
+                onSelected: () => _openNavItem(item),
+              ),
+            const SidebarMenuItem.divider(),
+            SidebarMenuItem(
+              isZh ? '管理导航入口…' : 'Manage Navigation…',
+              icon: Codicons.settings,
+              onSelected: () => unawaited(showSidebarNavManagerDialog(context)),
+            ),
+          ],
+          builder: (context, menu) => _NavRow(
+            icon: Codicons.ellipsis,
+            label: isZh ? '更多 (${hidden.length})' : 'More (${hidden.length})',
+            selected: anyHiddenActive,
+            onTap: menu.open,
+          ),
+        ),
+      );
+    }
+
+    return rows;
+  }
+
+  bool _canOpenNavItem(SidebarNavItem item) => switch (item) {
+    SidebarNavItem.customize => widget.onCustomize != null,
+    SidebarNavItem.stash => widget.onStash != null,
+    SidebarNavItem.tasks ||
+    SidebarNavItem.automations ||
+    SidebarNavItem.library ||
+    SidebarNavItem.canvas => widget.onSelectPage != null,
+  };
+
+  bool _isNavItemSelected(SidebarNavItem item) => switch (item) {
+    SidebarNavItem.customize => widget.customizing,
+    SidebarNavItem.stash => widget.stashing,
+    SidebarNavItem.tasks => widget.activePage == WorkspacePage.tasks,
+    SidebarNavItem.automations =>
+      widget.activePage == WorkspacePage.automations,
+    SidebarNavItem.library => widget.activePage == WorkspacePage.library,
+    SidebarNavItem.canvas => widget.activePage == WorkspacePage.canvas,
+  };
+
+  void _openNavItem(SidebarNavItem item) {
+    switch (item) {
+      case SidebarNavItem.customize:
+        widget.onCustomize?.call();
+      case SidebarNavItem.stash:
+        widget.onStash?.call();
+      case SidebarNavItem.tasks:
+        widget.onSelectPage?.call(WorkspacePage.tasks);
+      case SidebarNavItem.automations:
+        widget.onSelectPage?.call(WorkspacePage.automations);
+      case SidebarNavItem.library:
+        widget.onSelectPage?.call(WorkspacePage.library);
+      case SidebarNavItem.canvas:
+        widget.onSelectPage?.call(WorkspacePage.canvas);
+    }
   }
 
   /// Antigravity-style top header row right next to macOS traffic lights:
@@ -1308,35 +1532,48 @@ class _SidebarState extends State<Sidebar>
     final allCollapsed =
         canCollapseAll && collapsibleGroups.every(_workspace.isCollapsed);
 
+    final hasPinnedAbove = _listGroups.any((g) => g.pinned);
     return SizedBox(
-      height: 30,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(14, 6, 8, 2),
-        child: Row(
-          children: [
-            if (_workspace.sshHosts.isNotEmpty)
-              Expanded(
-                child: Align(
-                  alignment: Alignment.centerLeft,
-                  child: _buildHostSwitcher(),
-                ),
-              )
-            else
-              Expanded(
-                child: Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    sectionLabel,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      color: AppColors.textMuted,
-                      fontSize: 11.5,
-                      fontWeight: FontWeight.w500,
+      height: hasPinnedAbove ? 42 : 30,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (hasPinnedAbove)
+            Container(
+              height: 1,
+              margin: const EdgeInsets.fromLTRB(12, 6, 12, 5),
+              color: AppColors.partBorder.withValues(alpha: 0.45),
+            ),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(14, 2, 8, 2),
+              child: Row(
+                children: [
+                  if (_workspace.sshHosts.isNotEmpty)
+                    Expanded(
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: _buildHostSwitcher(),
+                      ),
+                    )
+                  else
+                    Expanded(
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          sectionLabel,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: AppColors.textMuted,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            letterSpacing: 0.2,
+                          ),
+                        ),
+                      ),
                     ),
-                  ),
-                ),
-              ),
             if (canCollapseAll)
               SizedBox(
                 width: 1,
@@ -1355,13 +1592,15 @@ class _SidebarState extends State<Sidebar>
               width: 184,
               placement: (side: FloatingSide.bottom, align: FloatingAlign.end),
               items: () => [
-                SidebarMenuItem(
-                  isZh ? '显示已归档对话' : 'Show Archived',
-                  icon: Icons.inventory_2_outlined,
-                  checked: _showArchived,
-                  onSelected: _toggleArchived,
-                ),
-                if (_archivedCount > 0) ..._archivedItems(l10n),
+                if (_archivedCount > 0)
+                  ..._archivedItems(l10n)
+                else
+                  SidebarMenuItem(
+                    isZh ? '显示已归档对话' : 'Show Archived',
+                    icon: Icons.inventory_2_outlined,
+                    checked: _showArchived,
+                    onSelected: _toggleArchived,
+                  ),
                 const SidebarMenuItem.divider(),
                 for (final grouping in SidebarGrouping.values)
                   SidebarMenuItem(
@@ -1512,6 +1751,9 @@ class _SidebarState extends State<Sidebar>
             ],
           ],
         ),
+      ),
+          ),
+        ],
       ),
     );
   }
@@ -1874,9 +2116,14 @@ class _SidebarState extends State<Sidebar>
 
   Widget _buildList(VoidCallback? openProject) {
     final switched = !identical(_listedCurrent, _current);
-    if (switched) _rowsDirty = true;
+    final archivedChanged =
+        !switched && _listedCurrentArchived != _current?.archived;
+    if (switched || archivedChanged) _rowsDirty = true;
     if (_rowsDirty) {
+      final hadCurrent =
+          _current != null && _threadIndices.containsKey(_current);
       _listedCurrent = _current;
+      _listedCurrentArchived = _current?.archived;
       final all = [
         for (final group in _groups())
           // Empty projects stay to start an agent in; other empty groups go.
@@ -1896,12 +2143,13 @@ class _SidebarState extends State<Sidebar>
       var addedProjectsBar = _speedQuery.isNotEmpty || groups.isEmpty;
       for (final group in groups) {
         if (!addedProjectsBar && !group.pinned) {
+          final hasPinnedAbove = rows.isNotEmpty;
           rows.add(
-            const _ListRow(
+            _ListRow(
               _ListRowKind.projectsBar,
               _projectsBarGroup,
-              ValueKey(#projectsBar),
-              30,
+              const ValueKey(#projectsBar),
+              hasPinnedAbove ? 42 : 30,
             ),
           );
           addedProjectsBar = true;
@@ -1911,7 +2159,7 @@ class _SidebarState extends State<Sidebar>
             _ListRowKind.header,
             group,
             ValueKey(group.id),
-            group.pinned ? 28 : 32,
+            group.pinned ? 30 : 32,
           ),
         );
         if (group.pinned && group.threads.isEmpty) {
@@ -1975,16 +2223,18 @@ class _SidebarState extends State<Sidebar>
       _threadIndices = {
         for (final (index, row) in rows.indexed) ?row.thread: index,
       };
+      final hasCurrent =
+          _current != null && _threadIndices.containsKey(_current);
+      final revealed =
+          switched || archivedChanged || (!hadCurrent && hasCurrent);
       // Another agent shown, opened from wherever (a new one, the search,
-      // a shortcut): the rows picked follow it, not left on the one before.
-      if (switched && !_listSelection.values.contains(_current)) {
-        _listSelection.select(
-          _onPage || !_threadIndices.containsKey(_current) ? null : _current,
-        );
+      // a shortcut), or just unarchived / revealed: the rows picked follow it.
+      if (revealed && !_listSelection.values.contains(_current)) {
+        _listSelection.select(_onPage || !hasCurrent ? null : _current);
       }
       // And the list goes to it, laid out first; not from its own row,
       // clicked: that moving away under the pointer.
-      if (switched) {
+      if (revealed) {
         final clicked = identical(_current, _clickedOpen);
         _clickedOpen = null;
         if (!clicked) {
@@ -2272,6 +2522,18 @@ class _SidebarState extends State<Sidebar>
         _workspace.fork(thread).then((forked) {
           if (forked != null && mounted) _open(forked);
         }),
+      ),
+      onManageTags: () => unawaited(showThreadTagPickerDialog(context, thread)),
+      onHandoff: () => unawaited(
+        showSessionHandoffDialog(
+          context,
+          thread: thread,
+          onStartNewSession: (brief) {
+            final created = _workspace.create(project: thread.project);
+            created.session.draft.content = brief;
+            _open(created);
+          },
+        ),
       ),
       onDetach: aside ? () => _workspace.detach(thread) : null,
       asides: switch (_asides[thread]?.length) {
@@ -2676,10 +2938,16 @@ class _SidebarState extends State<Sidebar>
             padding: const EdgeInsets.fromLTRB(8, 2, 8, 4),
             child: setup,
           ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(8, 2, 8, 8),
-          child: _buildFooterButtons(count, settings, update),
-        ),
+        if (count > 0)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(8, 2, 8, 2),
+            child: _buildArchivedToggle(count),
+          ),
+        if (settings != null || update != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(8, 2, 8, 8),
+            child: _buildFooterButtons(settings, update),
+          ),
       ],
     );
   }
@@ -2688,7 +2956,6 @@ class _SidebarState extends State<Sidebar>
   static const _footerRowHeight = Sidebar.rowHeight;
 
   Widget _buildFooterButtons(
-    int count,
     VoidCallback? settings,
     Widget? update,
   ) {
@@ -2766,20 +3033,6 @@ class _SidebarState extends State<Sidebar>
           )
         else
           const Spacer(),
-        if (count > 0)
-          SizedBox(
-            width: 1,
-            height: _footerRowHeight,
-            child: OverflowBox(
-              maxWidth: 44,
-              maxHeight: _footerRowHeight,
-              child: Opacity(
-                opacity: 0,
-                alwaysIncludeSemantics: true,
-                child: _buildArchivedToggle(count),
-              ),
-            ),
-          ),
         if (update != null) ...[
           const SizedBox(width: 6),
           update,
@@ -3171,17 +3424,18 @@ class _NewAgentButton extends StatelessWidget {
 class _NavRow extends StatelessWidget {
   const _NavRow({
     required this.icon,
-    required this.glyph,
+    this.glyph,
     required this.label,
     required this.onTap,
     this.semanticsLabel,
     this.selected = false,
     this.badge = 0,
     this.badgeHover,
+    this.contextMenuItems,
   });
 
   final IconData icon;
-  final AntigravitySidebarGlyph glyph;
+  final AntigravitySidebarGlyph? glyph;
   final String label;
   final String? semanticsLabel;
   final VoidCallback onTap;
@@ -3194,8 +3448,22 @@ class _NavRow extends StatelessWidget {
   /// What it opens shows.
   final bool selected;
 
+  /// Optional right-click context menu items (reorder / hide / manage).
+  final List<SidebarMenuItem> Function()? contextMenuItems;
+
   @override
   Widget build(BuildContext context) {
+    final menuItems = contextMenuItems;
+    if (menuItems == null) return _buildRow(context, null);
+    return SidebarMenu(
+      width: 210,
+      placement: (side: FloatingSide.bottom, align: FloatingAlign.start),
+      items: menuItems,
+      builder: (context, menu) => _buildRow(context, menu),
+    );
+  }
+
+  Widget _buildRow(BuildContext context, SidebarMenuState? menu) {
     final row = Semantics(
       button: true,
       selected: selected,
@@ -3212,6 +3480,9 @@ class _NavRow extends StatelessWidget {
             return GestureDetector(
               behavior: HitTestBehavior.opaque,
               onTap: onTap,
+              onSecondaryTapUp: menu == null
+                  ? null
+                  : (details) => menu.open(details.globalPosition),
               child: Container(
                 height: Sidebar.rowHeight,
                 padding: const EdgeInsets.symmetric(horizontal: 6),
@@ -3229,20 +3500,23 @@ class _NavRow extends StatelessWidget {
                       SizedBox(
                         width: 14,
                         height: 14,
-                        child: Stack(
-                          alignment: Alignment.center,
-                          children: [
-                            Opacity(
-                              opacity: 0,
-                              child: Icon(icon, size: 14, color: iconColor),
-                            ),
-                            AntigravitySidebarIcon(
-                              glyph,
-                              size: 14,
-                              color: iconColor,
-                            ),
-                          ],
-                        ),
+                        child: switch (glyph) {
+                          final g? => Stack(
+                            alignment: Alignment.center,
+                            children: [
+                              Opacity(
+                                opacity: 0,
+                                child: Icon(icon, size: 14, color: iconColor),
+                              ),
+                              AntigravitySidebarIcon(
+                                g,
+                                size: 14,
+                                color: iconColor,
+                              ),
+                            ],
+                          ),
+                          null => Icon(icon, size: 14, color: iconColor),
+                        },
                       ),
                       const SizedBox(width: 6),
                       Expanded(
@@ -3415,17 +3689,24 @@ class _GroupHeader extends StatelessWidget {
     if (group.pinned) {
       final isZh = Localizations.localeOf(context).languageCode == 'zh';
       final shownLabel = isZh ? '置顶对话' : 'Pinned Conversations';
+      final count = group.threads.length;
       return HoverBuilder(
         cursor: onToggle == null ? MouseCursor.defer : SystemMouseCursors.click,
         builder: (context, hovered) => GestureDetector(
           behavior: HitTestBehavior.opaque,
           onTap: onToggle,
           child: Container(
-            height: 28,
-            padding: const EdgeInsets.fromLTRB(14, 6, 10, 2),
+            height: 30,
+            padding: const EdgeInsets.fromLTRB(14, 6, 12, 2),
             alignment: Alignment.centerLeft,
             child: Row(
               children: [
+                Icon(
+                  Codicons.pinned,
+                  size: 11,
+                  color: hovered ? AppColors.text : AppColors.textMuted,
+                ),
+                const SizedBox(width: 5),
                 Expanded(
                   child: Stack(
                     alignment: Alignment.centerLeft,
@@ -3439,8 +3720,9 @@ class _GroupHeader extends StatelessWidget {
                           color: hovered
                               ? AppColors.text
                               : AppColors.textMuted,
-                          fontSize: 11.5,
-                          fontWeight: FontWeight.w500,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: 0.2,
                         ),
                       ),
                       if (shownLabel != group.label)
@@ -3460,12 +3742,25 @@ class _GroupHeader extends StatelessWidget {
                     ],
                   ),
                 ),
-                if (collapsed && group.threads.isNotEmpty)
-                  Text(
-                    '${group.threads.length}',
-                    style: TextStyle(
-                      color: AppColors.textFaint,
-                      fontSize: 11,
+                if (count > 0)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 5.5,
+                      vertical: 1,
+                    ),
+                    decoration: BoxDecoration(
+                      color: (themeColors.dark ? Colors.white : Colors.black)
+                          .withValues(alpha: themeColors.dark ? 0.08 : 0.055),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      '$count',
+                      style: TextStyle(
+                        color: AppColors.textMuted,
+                        fontSize: 10,
+                        fontWeight: FontWeight.w500,
+                        fontFeatures: const [FontFeature.tabularFigures()],
+                      ),
                     ),
                   ),
               ],
@@ -4125,6 +4420,8 @@ class _ThreadRow extends StatelessWidget {
     required this.onPin,
     required this.onArchive,
     required this.onFork,
+    this.onManageTags,
+    this.onHandoff,
     required this.onDelete,
     this.onDetach,
     this.asides,
@@ -4179,6 +4476,8 @@ class _ThreadRow extends StatelessWidget {
 
   /// Copies the conversation into a new agent, shown.
   final VoidCallback onFork;
+  final VoidCallback? onManageTags;
+  final VoidCallback? onHandoff;
   final VoidCallback onDelete;
 
   /// Given, it is a conversation asked beside another (`/btw`), listed
@@ -4254,6 +4553,18 @@ class _ThreadRow extends StatelessWidget {
         icon: Icons.edit_outlined,
         onSelected: onRename,
       ),
+      if (onManageTags case final manageTags?)
+        SidebarMenuItem(
+          isZh ? '标签与分组…' : 'Tags & Groups…',
+          icon: Codicons.tag,
+          onSelected: manageTags,
+        ),
+      if (onHandoff case final handoff?)
+        SidebarMenuItem(
+          isZh ? '交接到新会话 (Handoff)…' : 'Handoff to New Session…',
+          icon: Codicons.arrowSwap,
+          onSelected: handoff,
+        ),
       if (onAutoTitle case final autoTitle? when thread.titled)
         SidebarMenuItem(
           l10n.chatTitleSummarize,
@@ -4309,8 +4620,10 @@ class _ThreadRow extends StatelessWidget {
       placement: (side: FloatingSide.bottom, align: FloatingAlign.end),
       builder: (context, menu) => IdeListRow(
         height: height,
-        margin: const EdgeInsets.fromLTRB(8, 0.5, 6, 0.5),
-        borderRadius: BorderRadius.circular(7),
+        margin: pinnedRow
+            ? const EdgeInsets.fromLTRB(8, 2, 8, 2)
+            : const EdgeInsets.fromLTRB(8, 0.5, 6, 0.5),
+        borderRadius: BorderRadius.circular(pinnedRow ? 8 : 7),
         selectedColor: _SidebarPalette.pillCard,
         hoverColor: _SidebarPalette.rowHover,
         showOutline: false,
@@ -4332,7 +4645,7 @@ class _ThreadRow extends StatelessWidget {
               ? AppColors.textPrimary
               : AppColors.text;
           final leftPad = pinnedRow
-              ? 6.0
+              ? 10.0
               : (onDetach == null ? 26.0 : 26.0 + _asideIndent);
           final titleRow = GiveWayRow(
             children: [
@@ -4354,34 +4667,82 @@ class _ThreadRow extends StatelessWidget {
                         ),
                       ),
               ),
-              if (!renaming)
+              if (!renaming) ...[
+                for (final tag in TagStore.instance.tagsOf(thread).take(2))
+                  GiveWay(
+                    Padding(
+                      padding: const EdgeInsets.only(left: 3),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 5,
+                          vertical: 1,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Color(tag.colorValue).withValues(alpha: 0.16),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                            color: Color(tag.colorValue).withValues(alpha: 0.5),
+                            width: 0.7,
+                          ),
+                        ),
+                        child: Text(
+                          tag.name,
+                          style: TextStyle(
+                            fontSize: 9.5,
+                            height: 1.1,
+                            color: Color(tag.colorValue),
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ),
+                    priority: 2,
+                  ),
                 ..._buildTrailing(
                   active,
                   context.l10n,
                   foreground,
+                  suppressTime: pinnedRow,
                   onOpenMenu: () {
                     onContextMenu();
                     menu.open();
                   },
                 ),
+              ],
             ],
           );
 
           if (pinnedRow) {
-            return Padding(
-              padding: EdgeInsets.fromLTRB(leftPad, 4, 6, 4),
+            final dark = themeColors.dark;
+            final cardFill = selected || hovered
+                ? Colors.transparent
+                : (dark ? Colors.white : Colors.black).withValues(
+                    alpha: dark ? 0.032 : 0.025,
+                  );
+            return Container(
+              decoration: BoxDecoration(
+                color: cardFill,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: AppColors.partBorder.withValues(
+                    alpha: selected ? 0.6 : 0.35,
+                  ),
+                  width: 0.8,
+                ),
+              ),
+              padding: EdgeInsets.fromLTRB(leftPad, 6, 8, 6),
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   SizedBox(height: 18, child: titleRow),
-                  const SizedBox(height: 1.5),
+                  const SizedBox(height: 4),
                   Row(
                     children: [
                       AntigravitySidebarIcon(
                         AntigravitySidebarGlyph.folder,
                         size: 11,
-                        color: AppColors.textMuted,
+                        color: AppColors.textFaint,
                       ),
                       const SizedBox(width: 4),
                       Expanded(
@@ -4392,13 +4753,26 @@ class _ThreadRow extends StatelessWidget {
                             text: thread.project.name,
                             style: DefaultTextStyle.of(context).style.copyWith(
                               color: AppColors.textMuted,
-                              fontSize: 11.5,
+                              fontSize: 11,
                               height: 1.15,
                               fontWeight: FontWeight.w400,
                             ),
                           ),
                         ),
                       ),
+                      if (showTime) ...[
+                        const SizedBox(width: 6),
+                        Text(
+                          relativeTime(thread.updatedAt, DateTime.now()),
+                          maxLines: 1,
+                          style: TextStyle(
+                            color: AppColors.textFaint,
+                            fontSize: 10.5,
+                            height: 1.1,
+                            fontFeatures: const [FontFeature.tabularFigures()],
+                          ),
+                        ),
+                      ],
                     ],
                   ),
                 ],
@@ -4546,6 +4920,7 @@ class _ThreadRow extends StatelessWidget {
     bool active,
     AppLocalizations l10n,
     Color foreground, {
+    bool suppressTime = false,
     required VoidCallback onOpenMenu,
   }) {
     Widget gap(Widget child) =>
@@ -4693,7 +5068,7 @@ class _ThreadRow extends StatelessWidget {
             ),
           ),
         )
-      else if (showTime)
+      else if (showTime && !suppressTime)
         GiveWay(
           priority: 1,
           gap(
@@ -5898,4 +6273,244 @@ class SidebarTopBarButtonVisibility extends InheritedWidget {
   @override
   bool updateShouldNotify(SidebarTopBarButtonVisibility oldWidget) =>
       oldWidget.visible != visible;
+}
+
+/// Compact grouped-tag filter strip at the top of the sidebar session list.
+class _SidebarTagFilterBar extends StatefulWidget {
+  const _SidebarTagFilterBar({required this.onManage});
+
+  final VoidCallback onManage;
+
+  @override
+  State<_SidebarTagFilterBar> createState() => _SidebarTagFilterBarState();
+}
+
+class _SidebarTagFilterBarState extends State<_SidebarTagFilterBar> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final store = TagStore.instance;
+    final isZh = Localizations.localeOf(context).languageCode == 'zh';
+    final colors = themeColors;
+    final activeTag = store.filterTagId == null
+        ? null
+        : store.tagById(store.filterTagId!);
+    final activeGroup = store.filterGroupId == null
+        ? null
+        : store.groupById(store.filterGroupId!);
+
+    final dark = themeColors.dark;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 0, 8, 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Container(
+            height: 26,
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            decoration: BoxDecoration(
+              color: store.hasFilter
+                  ? colors['button.background'].withValues(alpha: 0.12)
+                  : (dark ? Colors.white : Colors.black).withValues(
+                      alpha: dark ? 0.03 : 0.025,
+                    ),
+              borderRadius: BorderRadius.circular(7),
+              border: Border.all(
+                color: store.hasFilter
+                    ? colors['button.background'].withValues(alpha: 0.45)
+                    : AppColors.partBorder.withValues(alpha: 0.35),
+                width: 0.8,
+              ),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => setState(() => _expanded = !_expanded),
+                    child: MouseRegion(
+                      cursor: SystemMouseCursors.click,
+                      child: Row(
+                        children: [
+                          Icon(
+                            Codicons.tag,
+                            size: 11,
+                            color: store.hasFilter
+                                ? colors['button.background']
+                                : AppColors.textMuted,
+                          ),
+                          const SizedBox(width: 5),
+                          Expanded(
+                            child: Text(
+                              activeTag != null
+                                  ? '${isZh ? "标签" : "Tag"}: ${activeTag.name}'
+                                  : activeGroup != null
+                                  ? '${isZh ? "分组" : "Group"}: ${activeGroup.name}'
+                                  : (isZh ? '标签筛选' : 'Filter Tags'),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: store.hasFilter
+                                    ? colors['foreground']
+                                    : AppColors.textMuted,
+                                fontWeight: store.hasFilter
+                                    ? FontWeight.w600
+                                    : FontWeight.w500,
+                              ),
+                            ),
+                          ),
+                          Icon(
+                            _expanded
+                                ? Codicons.chevronDown
+                                : Codicons.chevronRight,
+                            size: 11,
+                            color: AppColors.textFaint,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+                if (store.hasFilter) ...[
+                  const SizedBox(width: 4),
+                  InkWell(
+                    borderRadius: BorderRadius.circular(4),
+                    onTap: store.clearFilter,
+                    child: Padding(
+                      padding: const EdgeInsets.all(2),
+                      child: Icon(
+                        Codicons.close,
+                        size: 11,
+                        color: AppColors.textMuted,
+                      ),
+                    ),
+                  ),
+                ],
+                const SizedBox(width: 2),
+                Tooltip(
+                  message: isZh ? '管理标签与分组' : 'Manage Tags & Groups',
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(4),
+                    onTap: widget.onManage,
+                    child: Padding(
+                      padding: const EdgeInsets.all(2),
+                      child: Icon(
+                        Codicons.settingsGear,
+                        size: 11,
+                        color: AppColors.textMuted,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (_expanded) ...[
+            const SizedBox(height: 5),
+            Container(
+              padding: const EdgeInsets.fromLTRB(8, 6, 8, 4),
+              decoration: BoxDecoration(
+                color: (dark ? Colors.white : Colors.black).withValues(
+                  alpha: dark ? 0.025 : 0.02,
+                ),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: AppColors.partBorder.withValues(alpha: 0.35),
+                  width: 0.8,
+                ),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  for (final group in store.groups)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 5),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          GestureDetector(
+                            onTap: () => store.setFilterGroup(group.id),
+                            child: MouseRegion(
+                              cursor: SystemMouseCursors.click,
+                              child: Row(
+                                children: [
+                                  Container(
+                                    width: 6,
+                                    height: 6,
+                                    decoration: BoxDecoration(
+                                      color: Color(group.colorValue),
+                                      shape: BoxShape.circle,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 5),
+                                  Text(
+                                    group.name,
+                                    style: TextStyle(
+                                      fontSize: 10.5,
+                                      fontWeight: store.filterGroupId == group.id
+                                          ? FontWeight.w700
+                                          : FontWeight.w500,
+                                      color: store.filterGroupId == group.id
+                                          ? Color(group.colorValue)
+                                          : AppColors.textMuted,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Wrap(
+                            spacing: 4,
+                            runSpacing: 4,
+                            children: [
+                              for (final tag in store.tagsInGroup(group.id))
+                                InkWell(
+                                  borderRadius: BorderRadius.circular(8),
+                                  onTap: () => store.setFilterTag(tag.id),
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 6.5,
+                                      vertical: 2,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: store.filterTagId == tag.id
+                                          ? Color(tag.colorValue)
+                                          : Color(
+                                              tag.colorValue,
+                                            ).withValues(alpha: 0.14),
+                                      borderRadius: BorderRadius.circular(8),
+                                      border: Border.all(
+                                        color: Color(
+                                          tag.colorValue,
+                                        ).withValues(alpha: 0.5),
+                                        width: 0.8,
+                                      ),
+                                    ),
+                                    child: Text(
+                                      tag.name,
+                                      style: TextStyle(
+                                        fontSize: 10.5,
+                                        color: store.filterTagId == tag.id
+                                            ? Colors.white
+                                            : Color(tag.colorValue),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
 }

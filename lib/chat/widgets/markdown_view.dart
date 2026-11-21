@@ -1,7 +1,13 @@
+import 'dart:async';
+
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:markdown/markdown.dart' as md;
 import 'package:path/path.dart' as p;
+
+import '../../browser/embedded/embedded_browser_controller.dart';
+import '../../browser/embedded/embedded_browser_settings.dart';
 
 import '../../ide/ide_hover.dart';
 import '../../theme/app_theme.dart';
@@ -22,6 +28,7 @@ import 'markdown_cjk.dart';
 import 'markdown_math.dart';
 import 'markdown_tags.dart';
 import 'mermaid_code_block.dart';
+import 'spec_render_block.dart';
 import 'table_selection.dart';
 import 'will_change_paint.dart';
 
@@ -694,6 +701,10 @@ Widget? _block(md.Node node, TextStyle style, MarkdownOptions options) {
           writing: node.attributes.containsKey(_writingAttribute),
         );
       }
+      if (name?.toLowerCase() == 'spec' ||
+          name?.toLowerCase() == 'json-render') {
+        return SpecRenderBlock(code: body);
+      }
       return MarkdownCodeBlock(
         code: body,
         language: name == null || name.isEmpty ? null : name,
@@ -1175,7 +1186,23 @@ GestureRecognizer? _linkRecognizer(String? href) {
   if (uri == null || !const {'http', 'https', 'mailto'}.contains(uri.scheme)) {
     return null;
   }
-  return TapGestureRecognizer()..onTap = () => openExternal(uri.toString());
+  return TapGestureRecognizer()
+    ..onTap = () {
+      if (uri.scheme == 'mailto') {
+        unawaited(openExternal(uri.toString()));
+        return;
+      }
+      final invert =
+          HardwareKeyboard.instance.isMetaPressed ||
+          HardwareKeyboard.instance.isControlPressed;
+      unawaited(
+        EmbeddedBrowserController.instance.openLink(
+          uri.toString(),
+          source: LinkSource.chat,
+          invertChoice: invert,
+        ),
+      );
+    };
 }
 
 /// Whether [text] is HTML comments alone (`<!-- note -->`), which do not

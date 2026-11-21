@@ -771,6 +771,8 @@
   "stepsUsed": "{count, plural, other{使用 {count} 个工具}}",
   "stepsSeparator": "，",
   "stepsThought": "思考 {duration}",
+  "promptCopy": "复制问题",
+  "promptSentAtHint": "发送于 {time}",
   "turnCopy": "复制回复",
   "turnCopied": "已复制",
   "turnSpeed": "{speed} tok/s",
@@ -780,6 +782,8 @@
   "turnOutputTokensHint": "本轮已输出",
   "turnSpeedLiveHint": "输出速度（最近 2 秒采样）",
   "turnDurationHint": "本轮耗时",
+  "turnStartedAtHint": "开始于 {time}",
+  "turnTimeRangeHint": "开始：{start}\n完成：{end}",
   "turnCostHint": "本轮花费",
   "turnWorked": "已处理 {duration}",
   "turnStopped": "处理 {duration} 后停止",
@@ -3860,5 +3864,7 @@
   "remoteBrowserSaveAction": "另存为",
   "remoteBrowserSaveName": "保存为：",
   "remoteBrowserSave": "保存",
-  "remoteBrowserReplace": "“{name}”已存在，要替换它吗？"
+  "remoteBrowserReplace": "“{name}”已存在，要替换它吗？",
+  "chatArchivedBanner": "此对话已归档",
+  "chatRestoreFromArchive": "从归档恢复"
 }

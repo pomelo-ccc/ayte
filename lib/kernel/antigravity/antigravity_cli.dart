@@ -100,6 +100,16 @@ class AntigravityModel {
     return best;
   }
 
+  /// Menu label for a selectable context window option (`baseLabel` is e.g.
+  /// `256K` or `512K`).
+  String contextOptionLabel(String baseLabel, int tokens) {
+    if (contextOptions.length == 1) return '$baseLabel（官方固定）';
+    if (!supportsPresetContextWindow && tokens > defaultContext) {
+      return '$baseLabel（强制）';
+    }
+    return baseLabel;
+  }
+
   /// Human-readable description for a selectable context window option.
   String contextOptionDescription(int tokens) {
     if (supportsPresetContextWindow) {
@@ -111,12 +121,15 @@ class AntigravityModel {
       };
     }
     if (tokens == defaultContext) return '默认完整窗口';
+    if (tokens > defaultContext) {
+      return '强制 ${antigravityPresetContextChoices[tokens] ?? '$tokens'} 上下文窗口';
+    }
     return switch (tokens) {
       64000 => '64K 自动压缩阈值',
       256000 => '256K 自动压缩阈值',
       512000 => '512K 自动压缩阈值',
       900000 => '900K 自动压缩阈值',
-      _ => tokens < defaultContext ? '提前自动压缩，降低长对话延迟' : '超长上下文窗口',
+      _ => '提前自动压缩，降低长对话延迟',
     };
   }
 }
@@ -125,12 +138,21 @@ class AntigravityModel {
 abstract final class AntigravityModels {
   static const List<AntigravityModel> defaults = [
     AntigravityModel(
+      id: 'gemini-4-neon',
+      label: 'Gemini 4 Neon',
+      description: '256K–512K context · Frontier reasoning & coding',
+      effortLevels: ['low', 'medium', 'high', 'xhigh'],
+      defaultEffort: 'high',
+      contextOptions: [256000, 512000],
+      defaultContext: 256000,
+    ),
+    AntigravityModel(
       id: 'gemini-4-carbon',
       label: 'Gemini 4 Carbon',
-      description: '256K context · Frontier deep reasoning',
+      description: '256K–512K context · Frontier deep reasoning',
       effortLevels: ['low', 'medium', 'high'],
       defaultEffort: 'high',
-      contextOptions: [256000],
+      contextOptions: [256000, 512000],
       defaultContext: 256000,
     ),
     AntigravityModel(
@@ -146,51 +168,58 @@ abstract final class AntigravityModels {
     AntigravityModel(
       id: 'gemini-4-hydrogen',
       label: 'Gemini 4 Hydrogen',
-      description: '256K context · High-speed agentic engine',
+      description: '256K–512K context · High-speed agentic engine',
       effortLevels: ['low', 'medium', 'high', 'xhigh'],
       defaultEffort: 'high',
-      contextOptions: [256000],
+      contextOptions: [256000, 512000],
+      defaultContext: 256000,
+    ),
+    AntigravityModel(
+      id: 'gemini-pro-orchestrator-neon',
+      label: 'Orchestrator (Neon)',
+      description: '256K–512K context · Neon planner + Hydrogen executor',
+      contextOptions: [256000, 512000],
       defaultContext: 256000,
     ),
     AntigravityModel(
       id: 'gemini-pro-orchestrator',
       label: 'Orchestrator (Carbon)',
-      description: '256K context · Carbon planner + Hydrogen executor',
-      contextOptions: [256000],
+      description: '256K–512K context · Carbon planner + Hydrogen executor',
+      contextOptions: [256000, 512000],
       defaultContext: 256000,
     ),
     AntigravityModel(
       id: 'gemini-pro-orchestrator-argon',
       label: 'Orchestrator (Argon)',
-      description: '256K context · Argon planner + Hydrogen executor',
-      contextOptions: [256000],
+      description: '256K–512K context · Argon planner + Hydrogen executor',
+      contextOptions: [256000, 512000],
       defaultContext: 256000,
     ),
     AntigravityModel(
       id: 'gemini-3.8-flash',
       label: 'Gemini 3.8 Flash',
-      description: '256K context · Low-latency coding & sub-tasks',
+      description: '256K–512K context · Low-latency coding & sub-tasks',
       effortLevels: ['low', 'medium', 'high'],
       defaultEffort: 'high',
-      contextOptions: [256000],
+      contextOptions: [256000, 512000],
       defaultContext: 256000,
     ),
     AntigravityModel(
       id: 'claude-opus-5-5',
       label: 'Claude Opus 5.5',
-      description: '256K context · Anthropic flagship reasoning',
+      description: '256K–512K context · Anthropic flagship reasoning',
       effortLevels: ['low', 'medium', 'high'],
       defaultEffort: 'high',
-      contextOptions: [256000],
+      contextOptions: [256000, 512000],
       defaultContext: 256000,
     ),
     AntigravityModel(
       id: 'claude-sonnet-5-5',
       label: 'Claude Sonnet 5.5',
-      description: '256K context · Balanced Anthropic coding model',
+      description: '256K–512K context · Balanced Anthropic coding model',
       effortLevels: ['low', 'medium', 'high'],
       defaultEffort: 'medium',
-      contextOptions: [256000],
+      contextOptions: [256000, 512000],
       defaultContext: 256000,
     ),
     AntigravityModel(
@@ -334,16 +363,16 @@ abstract final class AntigravityModels {
     }
     if (lower.startsWith('claude-')) {
       return (
-        options: const [256000],
+        options: const [256000, 512000],
         defaultContext: 256000,
-        summary: '256K context · Anthropic coding model',
+        summary: '256K–512K context · Anthropic coding model',
         supportsPreset: false,
       );
     }
     return (
-      options: const [256000],
+      options: const [256000, 512000],
       defaultContext: 256000,
-      summary: '256K context · Google Antigravity',
+      summary: '256K–512K context · Google Antigravity',
       supportsPreset: false,
     );
   }

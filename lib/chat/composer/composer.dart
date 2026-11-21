@@ -37,6 +37,7 @@ import 'composer_images.dart';
 import 'composer_mock_data.dart';
 import 'composer_picker.dart';
 import 'antigravity_account_picker.dart';
+import 'codebuddy_account_picker.dart';
 import 'composer_polish.dart';
 import 'pickers_row.dart';
 import 'session_model_picker.dart';
@@ -2604,6 +2605,7 @@ class ChatComposerState extends State<ChatComposer>
           ],
           if (model != null) ...[
             AntigravityAccountPicker(modelId: model.selected.id),
+            CodeBuddyAccountPicker(modelId: model.selected.id),
             const SizedBox(width: 3),
           ],
           if ((widget.onToggleContextPanel, context) case (

@@ -30,9 +30,11 @@ import 'app_locale.dart';
 import 'pages/about_page.dart';
 import 'pages/accounts_page.dart';
 import 'pages/antigravity_accounts_section.dart';
+import 'pages/codebuddy_accounts_section.dart';
 import 'pages/appearance_page.dart';
 import 'pages/browser_page.dart';
 import 'pages/channel_account_page.dart';
+import 'pages/computer_use_page.dart';
 import 'pages/customize_page.dart';
 import 'pages/data_dir_page.dart';
 import 'pages/general_page.dart';
@@ -187,6 +189,8 @@ class AppSettings {
         );
       case SettingsSection.antigravityAccounts:
         return const AntigravityAccountsPage();
+      case SettingsSection.codebuddyAccounts:
+        return const CodeBuddyAccountsPage();
       case SettingsSection.usage:
         return UsageSettingsPage(workspace: workspace);
       case SettingsSection.network:
@@ -204,6 +208,8 @@ class AppSettings {
         };
       case SettingsSection.browser:
         return BrowserSettingsPage(settings: files?.settings);
+      case SettingsSection.computerUse:
+        return ComputerUseSettingsPage(settings: files?.settings);
       case SettingsSection.notifications:
         return NotificationsSettingsPage(settings: files?.settings);
       case SettingsSection.stash:

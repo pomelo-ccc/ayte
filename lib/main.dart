@@ -13,12 +13,21 @@ import 'package:bao_markdown/bao_markdown.dart'
 
 import 'package:bao_editor/monaco/flutter/language_assets.dart';
 
+import 'acp/acp_agent_service.dart';
+import 'acp/ayte_ipc_server.dart';
+import 'automations/automation_service.dart';
 import 'base/quiet_view.dart';
 import 'base/smooth_scroll.dart' show BaoScrollBehavior;
 import 'bash_exe/bao_bash.dart';
 import 'bots/bots.dart';
 import 'browser/browser_bridge.dart';
 import 'browser/browser_tools.dart' show BrowserHistory;
+import 'browser/embedded/embedded_browser_controller.dart';
+import 'canvas/canvas_controller.dart';
+import 'canvas/workflow_celebration_overlay.dart';
+import 'computer_use/computer_use_controller.dart';
+import 'tags/tag_store.dart';
+import 'tasks/task_queue_service.dart';
 import 'chat/composer/composer_files.dart' show ComposerFile, pastedAsPicture;
 import 'chat/chat_width.dart';
 import 'chat/reply_scroll.dart';
@@ -57,8 +66,15 @@ import 'kernel/antigravity/antigravity_cli.dart';
 import 'kernel/antigravity/antigravity_transport.dart'
     if (dart.library.js_interop) 'kernel/antigravity/antigravity_transport_stub.dart'
     show AntigravityTransport;
+import 'kernel/claude_code/claude_cli_transport.dart' show ClaudeCliTransport;
 import 'kernel/claude_code/claude_code_kernel.dart';
 import 'kernel/claude_code/claude_core_setting.dart';
+import 'kernel/codebuddy/codebuddy_accounts.dart';
+import 'kernel/codebuddy/codebuddy_cli.dart';
+import 'kernel/codebuddy/codebuddy_transport.dart'
+    if (dart.library.js_interop) 'kernel/codebuddy/codebuddy_transport_stub.dart'
+    show CodeBuddyTransport;
+import 'kernel/codex/codex_process_transport.dart' show ProcessCodexTransport;
 import 'kernel/claude_code/turn_stats_stub.dart'
     if (dart.library.io) 'kernel/claude_code/turn_stats_io.dart'
     show turnStatsIn;
@@ -550,6 +566,12 @@ void followSettingsFiles(SettingsFiles files) {
   );
   ClaudeCore.antigravityInstalled = LocalAntigravity.installed;
   unawaited(LocalAntigravity.lookForInstall());
+  // CodeBuddy CLI & multi-account store (shares ~/.cyte/codebuddy_accounts).
+  CodeBuddyPathSetting.current = () => CodeBuddyPathSetting.parse(
+    files.settings[CodeBuddyPathSetting.settingKey],
+  );
+  unawaited(LocalCodeBuddy.lookForInstall());
+  unawaited(CodeBuddyAccounts.instance.ensureInitialized());
   ClaudeCore.current = () =>
       ClaudeCore.parse(files.settings[ClaudeCore.settingKey]);
   ClaudeCore.changes = files.settings;
@@ -645,6 +667,17 @@ void followSettingsFiles(SettingsFiles files) {
     files.settings,
     () => files.settings[BrowserHistory.detailedKey],
   );
+  // Settings → Browser: Built-in workspace browser settings.
+  EmbeddedBrowserController.instance.follow(files.settings);
+  // Settings → Computer Use: Desktop window sharing & cua-driver settings.
+  ComputerUseController.instance.follow(files.settings);
+  // ACP agents, grouped tags, worktree tasks, cron automations, canvas & IPC.
+  AcpAgentService.instance.follow(files.settings);
+  unawaited(TagStore.instance.load());
+  unawaited(TaskQueueService.instance.load());
+  unawaited(AutomationService.instance.start());
+  unawaited(CanvasController.instance.load());
+  unawaited(AyteIpcServer.instance.start());
   // Settings → Appearance: the code's font, size and ligatures, and the
   // window's text size.
   CodeFont.follow(files.settings, (key) => files.settings[key]);
@@ -880,6 +913,9 @@ class _BaoCodeAppState extends State<BaoCodeApp>
       }
       await Future.wait([
         AntigravityTransport.stopAll(),
+        CodeBuddyTransport.stopAll(),
+        ClaudeCliTransport.stopAll(),
+        ProcessCodexTransport.stopAll(),
         RemoteClaudeTransport.stopAll(),
         stopModelProxy(),
         stopLspProcesses(),
@@ -1097,20 +1133,22 @@ class _BaoCodeAppState extends State<BaoCodeApp>
                 viewId: window.viewId,
               ),
             )
-          : Workbench(
-              key: ValueKey((window.viewId, window.generation)),
-              workspace: _workspace,
-              windows: _windows,
-              window: window,
-              languagesFor: widget.languagesFor,
-              themeExtensions: widget.themeExtensions,
-              gitFor: widget.gitFor,
-              repositoriesIn: widget.repositoriesIn,
-              terminalBackend: widget.terminalBackend,
-              settings: _settings,
-              conversations:
-                  widget.conversations ?? const NoConversationSearch(),
-              customizations: widget.customizations,
+          : WorkflowCelebrationOverlay(
+              child: Workbench(
+                key: ValueKey((window.viewId, window.generation)),
+                workspace: _workspace,
+                windows: _windows,
+                window: window,
+                languagesFor: widget.languagesFor,
+                themeExtensions: widget.themeExtensions,
+                gitFor: widget.gitFor,
+                repositoriesIn: widget.repositoriesIn,
+                terminalBackend: widget.terminalBackend,
+                settings: _settings,
+                conversations:
+                    widget.conversations ?? const NoConversationSearch(),
+                customizations: widget.customizations,
+              ),
             ),
     ),
   );

@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:bao_agent/bao_agent.dart' show AgentPaths, agentVersion;
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:path/path.dart' as p;
 
 import '../../network/network_proxy_io.dart';
@@ -41,7 +42,9 @@ class AntigravityTransport implements ClaudeCodeTransport {
     required this.executable,
     required this.environment,
     required this.launch,
-  }) : _sessionId = (launch.resume != null && launch.resume!.isNotEmpty)
+    DateTime Function()? now,
+  }) : _now = now ?? DateTime.now,
+       _sessionId = (launch.resume != null && launch.resume!.isNotEmpty)
            ? launch.resume
            : null,
        _model = AntigravityModels.cliModelIdOf(launch.model),
@@ -55,6 +58,21 @@ class AntigravityTransport implements ClaudeCodeTransport {
     _live.add(this);
     _initSessionState();
   }
+
+  /// Creates an [AntigravityTransport] directly for unit tests with a custom
+  /// [executable] and injectable clock [now].
+  @visibleForTesting
+  factory AntigravityTransport.forTesting({
+    required String executable,
+    Map<String, String> environment = const {},
+    required ClaudeLaunch launch,
+    DateTime Function()? now,
+  }) => AntigravityTransport._(
+    executable: executable,
+    environment: environment,
+    launch: launch,
+    now: now,
+  );
 
   static int _resolveInitialContextTokens(
     String? rawModel,
@@ -115,6 +133,11 @@ class AntigravityTransport implements ClaudeCodeTransport {
   final Map<String, String> environment;
   final ClaudeLaunch launch;
   final AgentPaths _paths;
+  final DateTime Function() _now;
+
+  /// Elapsed wall-clock milliseconds for a single Q&A turn started at [startedAt].
+  int _elapsedTurnMs(DateTime startedAt) =>
+      math.max(0, _now().difference(startedAt).inMilliseconds);
 
   final StreamController<Map<String, Object?>> _messages =
       StreamController.broadcast();
@@ -503,8 +526,9 @@ class AntigravityTransport implements ClaudeCodeTransport {
   String get _effectiveModeFlag =>
       _permissionMode == 'plan' ? 'plan' : 'agent';
 
-  /// Builds `agy` CLI flags, passing `--settings={"contextWindow": ...}` only
-  /// for models in `agy`'s `ContextWindowSelectable` (`supportsPresetContextWindow`).
+  /// Builds `agy` CLI flags, passing `--settings={"contextWindow": ...}` for
+  /// models in `ContextWindowSelectable` (`supportsPresetContextWindow`) or
+  /// when the user explicitly forces an extended window above the default.
   static List<String> buildCliArguments({
     required String model,
     required String? effort,
@@ -514,7 +538,11 @@ class AntigravityTransport implements ClaudeCodeTransport {
     List<String> directories = const [],
   }) {
     final info = AntigravityModels.of(model);
-    final presetWindow = (info?.supportsPresetContextWindow ?? false)
+    final defaultTokens = info?.defaultContext ?? 256000;
+    final passWindow =
+        (info?.supportsPresetContextWindow ?? false) ||
+        maxContextTokens > defaultTokens;
+    final presetWindow = passWindow
         ? AntigravityModels.presetContextWindowName(maxContextTokens)
         : null;
     return <String>[
@@ -555,8 +583,8 @@ class AntigravityTransport implements ClaudeCodeTransport {
     final env = <String, String>{...baseEnvironment}
       ..remove('AGY_CLI_AUTO_COMPACT_OVERRIDE');
     final info = AntigravityModels.of(model);
-    if ((info?.supportsPresetContextWindow ?? false) &&
-        maxContextTokens > 256000) {
+    final defaultTokens = info?.defaultContext ?? 256000;
+    if (maxContextTokens > defaultTokens) {
       env['AGY_CLI_AUTO_COMPACT_OVERRIDE'] = '$maxContextTokens';
     }
     return env;
@@ -659,6 +687,15 @@ class AntigravityTransport implements ClaudeCodeTransport {
     var prompt = await _extractPrompt(userMessage);
     if (prompt.trim().isEmpty) return;
 
+    if (userMessage['uuid'] case final String commandUuid
+        when commandUuid.isNotEmpty) {
+      _emit({
+        'type': 'command_lifecycle',
+        'command_uuid': commandUuid,
+        'state': 'started',
+      });
+    }
+
     if (prompt.trim() == '/clear') {
       await _stopProcess();
       _agyConversationId = null;
@@ -693,11 +730,13 @@ class AntigravityTransport implements ClaudeCodeTransport {
     }
 
     final turnId = ++_turnCounter;
+    final turnStartedAt = _now();
     _interrupted = false;
 
     Map<String, Object?>? pendingUserRecord = {
       'type': 'user',
       'message': userMessage['message'],
+      'timestamp': turnStartedAt.toUtc().toIso8601String(),
       if (userMessage['uuid'] case final String id when id.isNotEmpty)
         'uuid': id,
     };
@@ -715,6 +754,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
     final turn = _ActiveTurn(
       transport: this,
       turnId: turnId,
+      startedAt: turnStartedAt,
       onConversationBound: (convId) {
         _bindConversationId(convId);
         if (pendingUserRecord != null && _sessionLog != null) {
@@ -757,6 +797,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
         active = _ActiveTurn(
           transport: this,
           turnId: turnId,
+          startedAt: turnStartedAt,
           onConversationBound: turn.onConversationBound,
         );
         await runOnce(active);
@@ -786,6 +827,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
           final failoverTurn = _ActiveTurn(
             transport: this,
             turnId: turnId,
+            startedAt: turnStartedAt,
             allowAutoFailover: false,
             onConversationBound: turn.onConversationBound,
           );
@@ -796,6 +838,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
             'subtype': 'error',
             'is_error': true,
             'result': active.deferredQuotaError ?? 'Antigravity CLI 配额已达上限',
+            'duration_ms': _elapsedTurnMs(turnStartedAt),
           });
         }
       }
@@ -806,6 +849,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
         'subtype': 'error',
         'is_error': true,
         'result': 'Antigravity CLI 启动失败：${error.message}',
+        'duration_ms': _elapsedTurnMs(turnStartedAt),
       });
       _emit({
         'type': 'system',
@@ -820,6 +864,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
         'subtype': 'error',
         'is_error': true,
         'result': 'Antigravity CLI 发送消息失败：$error',
+        'duration_ms': _elapsedTurnMs(turnStartedAt),
       });
       _emit({
         'type': 'system',
@@ -1322,12 +1367,14 @@ class _ActiveTurn {
   _ActiveTurn({
     required this.transport,
     required this.turnId,
+    required this.startedAt,
     required this.onConversationBound,
     this.allowAutoFailover = true,
   });
 
   final AntigravityTransport transport;
   final int turnId;
+  final DateTime startedAt;
   final void Function(String convId) onConversationBound;
   final bool allowAutoFailover;
   final Completer<void> done = Completer<void>();
@@ -1699,7 +1746,6 @@ class _ActiveTurn {
         gotError = isError;
         final responseText = '${result['response'] ?? ''}'.trim();
         final errorText = '${result['error'] ?? ''}'.trim();
-        final durationSec = (result['duration_seconds'] as num?)?.toDouble();
         final usage = transport._recordResultUsage(
           result['usage'],
           hadStepUsage: hadStepUsage,
@@ -1765,8 +1811,10 @@ class _ActiveTurn {
                     ? responseText
                     : 'Antigravity CLI 执行出错')
               : responseText,
-          if (durationSec != null)
-            'duration_ms': (durationSec * 1000).round(),
+          // `agy`'s `result.duration_seconds` is cumulative conversation age
+          // since step 0, not the current turn's duration; always report this
+          // turn's own wall-clock elapsed time instead.
+          'duration_ms': transport._elapsedTurnMs(startedAt),
           'usage': ?usage,
           'modelUsage': {
             AntigravityModels.bareModelId(transport._model): {
@@ -1815,6 +1863,7 @@ class _ActiveTurn {
                   ? errText
                   : 'Antigravity CLI 退出（代码 $exitCode）')
             : '',
+        'duration_ms': transport._elapsedTurnMs(startedAt),
       });
     }
     done.complete();

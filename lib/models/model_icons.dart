@@ -10,6 +10,8 @@ import '../icons/project_icon_view.dart';
 import '../icons/site_icons.dart';
 import '../kernel/antigravity/antigravity_cli.dart'
     show antigravityBuiltinProviderId;
+import '../kernel/codebuddy/codebuddy_cli.dart'
+    show codebuddyBuiltinProviderId;
 import '../theme/codicons.dart';
 import 'featured_upstreams.dart';
 import 'model_brand.dart';
@@ -66,11 +68,18 @@ class ProviderIcon extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (id == builtinProviderId) {
+    if (id == builtinProviderId || id == 'claude-code') {
       return BrandLogo(builtinProviderLogo, size: size, color: color);
     }
     if (id == antigravityBuiltinProviderId) {
       return BrandLogo('google', size: size, color: color);
+    }
+    if (id == codebuddyBuiltinProviderId) {
+      return Icon(
+        Icons.auto_awesome_rounded,
+        size: size,
+        color: color ?? const Color(0xFF0EA5E9),
+      );
     }
     final providers = ModelProviders.current;
     return ListenableBuilder(

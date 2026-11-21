@@ -90,6 +90,11 @@ cp -R "$REPO/build/macos/Build/Products/Release/App.framework" "$STAGE_DIR/Ayte.
 "$CLANG" -isysroot "$SDK_ROOT" -dynamiclib -fobjc-arc -framework Cocoa -framework Carbon \
   -x objective-c "$REPO/macos/Runner/KestrelNotch.m" \
   -o "$STAGE_DIR/Ayte.app/Contents/Frameworks/libKestrelNotch.dylib"
+"$CLANG" -isysroot "$SDK_ROOT" -dynamiclib -fobjc-arc \
+  -framework Cocoa -framework WebKit -framework Carbon -framework ApplicationServices -framework CoreGraphics \
+  -install_name "@rpath/libAyteNative.dylib" \
+  -x objective-c "$REPO/macos/Runner/AyteNative.m" \
+  -o "$STAGE_DIR/Ayte.app/Contents/Frameworks/libAyteNative.dylib"
 
 xattr -cr "$STAGE_DIR/Ayte.app"
 codesign --force --deep --sign - "$STAGE_DIR/Ayte.app"

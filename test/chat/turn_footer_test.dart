@@ -158,4 +158,46 @@ void main() {
     final last = tester.getRect(find.text('92.72k tokens'));
     expect(last.top, greaterThan(first.bottom - 1));
   });
+
+  testWidgets('shows concrete turn time range after duration when sentAt is given', (
+    tester,
+  ) async {
+    final sentAt = DateTime.now().subtract(const Duration(minutes: 2));
+    const worked = Duration(seconds: 15);
+    await _pump(
+      tester,
+      TurnFooter(
+        answer: 'Done.',
+        worked: worked,
+        sentAt: sentAt,
+        usage: const TurnUsage(
+          inputTokens: 500,
+          outputTokens: 100,
+          tokensPerSecond: 40,
+        ),
+      ),
+    );
+    final durationRect = tester.getRect(find.text('15s'));
+    final rangeFinder = find.text(formatTurnTimeRange(sentAt, worked: worked));
+    expect(rangeFinder, findsOneWidget);
+    final speedRect = tester.getRect(find.text('40.00 tok/s'));
+    final rangeRect = tester.getRect(rangeFinder);
+    expect(rangeRect.left, greaterThan(durationRect.right));
+    expect(rangeRect.right, lessThan(speedRect.left));
+  });
+
+  testWidgets('live footer shows start clock timestamp alongside elapsed counter', (
+    tester,
+  ) async {
+    final since = DateTime.now().subtract(const Duration(seconds: 5));
+    await _pump(
+      tester,
+      TurnFooter(
+        live: const TurnOutput(tokens: 200, tokensPerSecond: 30),
+        since: since,
+      ),
+    );
+    expect(find.text(formatChatTimestamp(since)), findsOneWidget);
+    expect(find.byType(RollingText), findsNWidgets(3));
+  });
 }

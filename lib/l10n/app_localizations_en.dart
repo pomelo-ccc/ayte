@@ -2727,6 +2727,14 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
+  String get promptCopy => 'Copy question';
+
+  @override
+  String promptSentAtHint(String time) {
+    return 'Sent at $time';
+  }
+
+  @override
   String get turnCopy => 'Copy reply';
 
   @override
@@ -2759,6 +2767,16 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get turnDurationHint => 'Time this turn took';
+
+  @override
+  String turnStartedAtHint(String time) {
+    return 'Started at $time';
+  }
+
+  @override
+  String turnTimeRangeHint(String start, String end) {
+    return 'Started: $start\nFinished: $end';
+  }
 
   @override
   String get turnCostHint => 'Cost of this turn';
@@ -14324,4 +14342,10 @@ class AppLocalizationsEn extends AppLocalizations {
   String remoteBrowserReplace(String name) {
     return '“$name” already exists. Replace it?';
   }
+
+  @override
+  String get chatArchivedBanner => 'This conversation is archived.';
+
+  @override
+  String get chatRestoreFromArchive => 'Restore from archive';
 }

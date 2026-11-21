@@ -75,6 +75,8 @@ enum SidePanelSection {
   files,
   changes,
   terminal,
+  browser,
+  canvas,
   usage,
   plan,
 
@@ -122,6 +124,8 @@ const alwaysShownSections = [
   SidePanelSection.files,
   SidePanelSection.changes,
   SidePanelSection.terminal,
+  SidePanelSection.browser,
+  SidePanelSection.canvas,
   SidePanelSection.usage,
 ];
 
@@ -160,6 +164,8 @@ class SidePanelTabs {
     SidePanelSection.files => active,
     SidePanelSection.changes => activeDiff,
     SidePanelSection.terminal ||
+    SidePanelSection.browser ||
+    SidePanelSection.canvas ||
     SidePanelSection.usage ||
     SidePanelSection.ports => null,
     SidePanelSection.plan => plan,
@@ -965,6 +971,8 @@ class AgentSidePanel extends ChangeNotifier {
         if (tabs.current case final tab?) return close(conversation, tab);
       // Its tabs are the terminals themselves, killed by their own Close.
       case SidePanelSection.terminal ||
+          SidePanelSection.browser ||
+          SidePanelSection.canvas ||
           SidePanelSection.usage ||
           SidePanelSection.ports:
         break;

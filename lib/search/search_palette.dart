@@ -7,6 +7,7 @@ import 'package:path/path.dart' as p;
 
 import '../chat/widgets/hover_builder.dart';
 import '../ide/ide_fuzzy.dart';
+import '../ide/ide_hover.dart';
 import '../ide/ide_quick_input.dart' show IdeKeycap, IdeQuickInput;
 import '../ide/ide_quick_open.dart';
 import '../l10n/l10n.dart';
@@ -69,15 +70,15 @@ Future<void> showSearchPalette(
   required List<PaletteAction> settings,
   required ValueChanged<AgentThread> onOpenAgent,
   void Function(AgentThread thread, String query)? onFindInAgent,
+  ValueChanged<AgentThread>? onUnarchiveAgent,
   required ValueChanged<String> onOpenFile,
   required ValueChanged<PaletteAction> onRunAction,
   List<String> recentActions = const [],
   IdeFileIndex? files,
   SearchFilter filter = SearchFilter.all,
-}) {
+}) async {
   VoidCallback? picked;
-  return showGeneralDialog<void>(
-    context: context,
+  final route = RawDialogRoute<void>(
     barrierDismissible: true,
     barrierLabel: 'Dismiss',
     // Black, not the theme's: as upstream's modal backdrops.
@@ -112,10 +113,14 @@ Future<void> showSearchPalette(
       },
       onOpenAgent: onOpenAgent,
       onFindInAgent: onFindInAgent,
+      onUnarchiveAgent: onUnarchiveAgent,
       onOpenFile: onOpenFile,
       onRunAction: onRunAction,
     ),
-  ).then((_) => picked?.call());
+  );
+  unawaited(Navigator.of(context, rootNavigator: true).push(route));
+  await route.completed;
+  picked?.call();
 }
 
 /// The palette [showSearchPalette] shows.
@@ -129,6 +134,7 @@ class SearchPalette extends StatefulWidget {
     required this.onPick,
     required this.onOpenAgent,
     this.onFindInAgent,
+    this.onUnarchiveAgent,
     required this.onOpenFile,
     required this.onRunAction,
     this.recentActions = const [],
@@ -156,6 +162,9 @@ class SearchPalette extends StatefulWidget {
   /// Opens an agent where its conversation says what was searched for (a
   /// hit in what was said): [onOpenAgent] when null.
   final void Function(AgentThread thread, String query)? onFindInAgent;
+
+  /// Restores an archived agent directly from the search palette.
+  final ValueChanged<AgentThread>? onUnarchiveAgent;
   final ValueChanged<String> onOpenFile;
   final ValueChanged<PaletteAction> onRunAction;
 
@@ -174,18 +183,22 @@ class _Entry {
     required this.run,
     this.titleMatches = const [],
     this.leading,
+    this.badge,
     this.snippet,
     this.trailing,
+    this.action,
     this.keybinding,
   });
 
   final String title;
   final List<int> titleMatches;
   final Widget? leading;
+  final String? badge;
 
   /// What a conversation says, the match highlighted: a second line.
   final ConversationHit? snippet;
   final String? trailing;
+  final ({IconData icon, String tooltip, VoidCallback onPressed})? action;
   final String? keybinding;
   final VoidCallback run;
 
@@ -428,9 +441,21 @@ class _SearchPaletteState extends State<SearchPalette> {
       ),
     ),
     snippet: snippet,
+    badge: thread.archived ? l10n.sidebarArchived : null,
     trailing:
         '${thread.project.name}   '
         '${relativeTime(thread.updatedAt, DateTime.now(), l10n)}',
+    action: switch (widget.onUnarchiveAgent) {
+      final unarchive? when thread.archived => (
+        icon: Icons.unarchive_outlined,
+        tooltip: l10n.chatRestoreFromArchive,
+        onPressed: () {
+          unarchive(thread);
+          setState(() {});
+        },
+      ),
+      _ => null,
+    },
     run: switch ((find, widget.onFindInAgent)) {
       (final query?, final open?) => () => open(thread, query),
       _ => () => widget.onOpenAgent(thread),
@@ -579,6 +604,16 @@ class _SearchPaletteState extends State<SearchPalette> {
         if (_selected < _rows.length) _pick(_rows[_selected]);
       case LogicalKeyboardKey.escape:
         Navigator.of(context).pop();
+      case LogicalKeyboardKey.keyP when command:
+        Navigator.of(context).pop();
+      case LogicalKeyboardKey.keyK when command && keyboard.isShiftPressed:
+        Navigator.of(context).pop();
+      case LogicalKeyboardKey.keyF when command && keyboard.isShiftPressed:
+        if (_filter == SearchFilter.agents) {
+          Navigator.of(context).pop();
+        } else {
+          _setFilter(SearchFilter.agents);
+        }
       case LogicalKeyboardKey.tab:
         _cycleFilter(keyboard.isShiftPressed ? -1 : 1);
       case LogicalKeyboardKey.bracketLeft when command:
@@ -953,11 +988,40 @@ class _PaletteRow extends StatelessWidget {
                     mainAxisAlignment: MainAxisAlignment.center,
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      _highlighted(
-                        entry.title,
-                        entry.titleMatches,
-                        TextStyle(color: foreground, fontSize: 13),
-                        highlight,
+                      Row(
+                        children: [
+                          Flexible(
+                            child: _highlighted(
+                              entry.title,
+                              entry.titleMatches,
+                              TextStyle(color: foreground, fontSize: 13),
+                              highlight,
+                            ),
+                          ),
+                          if (entry.badge case final badge?) ...[
+                            const SizedBox(width: 6),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 5,
+                                vertical: 1,
+                              ),
+                              decoration: BoxDecoration(
+                                color: selected
+                                    ? foreground.withValues(alpha: 0.14)
+                                    : AppColors.hover,
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text(
+                                badge,
+                                style: TextStyle(
+                                  color: muted,
+                                  fontSize: 10.5,
+                                  height: 1.2,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
                       ),
                       if (snippet != null) ...[
                         const SizedBox(height: 2),
@@ -987,6 +1051,42 @@ class _PaletteRow extends StatelessWidget {
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: faint,
+                    ),
+                  ),
+                ],
+                if (entry.action case final action?) ...[
+                  const SizedBox(width: 6),
+                  IdeHover(
+                    message: action.tooltip,
+                    excludeFromSemantics: true,
+                    child: Semantics(
+                      button: true,
+                      label: action.tooltip,
+                      child: HoverBuilder(
+                        cursor: SystemMouseCursors.click,
+                        builder: (context, hovered) => GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTap: action.onPressed,
+                          child: Container(
+                            width: 22,
+                            height: 22,
+                            alignment: Alignment.center,
+                            decoration: BoxDecoration(
+                              color: hovered
+                                  ? (selected
+                                        ? foreground.withValues(alpha: 0.16)
+                                        : AppColors.hover)
+                                  : Colors.transparent,
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Icon(
+                              action.icon,
+                              size: 14,
+                              color: hovered ? foreground : muted,
+                            ),
+                          ),
+                        ),
+                      ),
                     ),
                   ),
                 ],

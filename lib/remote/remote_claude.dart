@@ -15,22 +15,60 @@ import 'package:bao_remote/files.dart' show IdeFileNotFoundException;
 
 import '../kernel/agent_kernel.dart';
 import '../kernel/antigravity/antigravity_transport.dart';
+import '../kernel/claude_code/claude_cli_transport.dart';
 import '../kernel/claude_code/claude_code_transport.dart';
 import '../kernel/claude_code/claude_core_setting.dart';
 import '../kernel/claude_code/claude_haiku.dart';
 import '../kernel/claude_code/claude_storage_io.dart';
 import '../kernel/claude_code/dart_core_transport.dart';
+import '../kernel/codebuddy/codebuddy_transport.dart';
 import '../models/launch_environment.dart';
 import 'remote_location.dart';
 import 'ssh_host.dart';
 import 'port_forwards.dart';
 
+/// Starts a session specifically for the Antigravity (`agy`) kernel.
+Future<ClaudeCodeTransport> startAntigravitySession(ClaudeLaunch launch) async {
+  final host = RemoteLocation.hostOf(launch.cwd);
+  if (host != null) {
+    return RemoteClaudeTransport.start(SshHosts.instance[host], launch);
+  }
+  if (isCodeBuddyLaunch(launch)) return startCodeBuddy(launch);
+  if (isAntigravityLaunch(launch)) return startAntigravity(launch);
+  return launch.env != null ? startDartCore(launch) : startAntigravity(launch);
+}
+
+/// Starts a session specifically for the CodeBuddy (`codebuddy`) kernel.
+Future<ClaudeCodeTransport> startCodeBuddySession(ClaudeLaunch launch) async {
+  final host = RemoteLocation.hostOf(launch.cwd);
+  if (host != null) {
+    return RemoteClaudeTransport.start(SshHosts.instance[host], launch);
+  }
+  if (isAntigravityLaunch(launch)) return startAntigravity(launch);
+  if (isCodeBuddyLaunch(launch)) return startCodeBuddy(launch);
+  return launch.env != null ? startDartCore(launch) : startCodeBuddy(launch);
+}
+
+/// Starts a session specifically for the native Claude Code (`claude`) kernel.
+Future<ClaudeCodeTransport> startClaudeCliSession(ClaudeLaunch launch) async {
+  final host = RemoteLocation.hostOf(launch.cwd);
+  if (host != null) {
+    return RemoteClaudeTransport.start(SshHosts.instance[host], launch);
+  }
+  if (isAntigravityLaunch(launch)) return startAntigravity(launch);
+  if (isCodeBuddyLaunch(launch)) return startCodeBuddy(launch);
+  return launch.env != null ? startDartCore(launch) : startClaudeCli(launch);
+}
+
 /// Starts an agent session where [launch]'s project is: on this machine via
-/// Antigravity CLI (`agy`) or Ayte's built-in core (for custom API upstreams),
-/// or on a remote SSH host via its built-in core.
+/// Antigravity CLI (`agy`), CodeBuddy CLI, or Ayte's built-in core (for custom
+/// API upstreams), or on a remote SSH host via its built-in core.
 Future<ClaudeCodeTransport> startClaude(ClaudeLaunch launch) async {
   final host = RemoteLocation.hostOf(launch.cwd);
   if (host == null) {
+    if (isCodeBuddyLaunch(launch)) {
+      return startCodeBuddy(launch);
+    }
     if (isAntigravityLaunch(launch)) {
       return startAntigravity(launch);
     }

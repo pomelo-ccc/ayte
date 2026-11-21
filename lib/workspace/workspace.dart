@@ -1851,12 +1851,90 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
       if (project.host == host) project,
   ];
 
-  /// The sidebar lists where an agent picked is: its host's.
+  /// The sidebar lists where an agent picked is: its host's, and archived
+  /// groups when an archived agent is opened so it stays visible there.
   void _followInSidebar(AgentThread thread) {
+    if (thread.archived) {
+      var changed = false;
+      if (!_showArchived) {
+        _showArchived = true;
+        changed = true;
+      }
+      if (_collapsedGroups.remove('archived:${thread.project.path}')) {
+        changed = true;
+      }
+      if (!listsHost(thread.project.host)) {
+        _sidebarHost = thread.project.host;
+        changed = true;
+      }
+      if (changed) _save();
+      return;
+    }
     final host = thread.project.host;
     if (listsHost(host) || isHidden(thread.project)) return;
     _sidebarHost = host;
     _save();
+  }
+
+  /// Ensures [thread] is listed and unfolded in the sidebar (e.g. when picked
+  /// from search) so the left sidebar shows and highlights it immediately.
+  void revealInSidebar(AgentThread thread) {
+    if (isAppFolder(thread.project.path)) return;
+    var changed = false;
+    if (thread.archived) {
+      if (!_showArchived) {
+        _showArchived = true;
+        changed = true;
+      }
+      if (_collapsedGroups.remove('archived:${thread.project.path}')) {
+        changed = true;
+      }
+    } else {
+      if (isHidden(thread.project)) {
+        _unhide(thread.project.path);
+        changed = true;
+      }
+      if (_collapsedGroups.remove(projectGroup(thread.project.path))) {
+        changed = true;
+      }
+      if (thread.pinned && _collapsedGroups.remove('pinned')) {
+        changed = true;
+      }
+      final now = DateTime.now();
+      final today = DateTime(now.year, now.month, now.day);
+      final time = thread.updatedAt;
+      final days = today
+          .difference(DateTime(time.year, time.month, time.day))
+          .inDays;
+      final timeGroup = days <= 0
+          ? 'today'
+          : days == 1
+          ? 'yesterday'
+          : days <= 7
+          ? 'week'
+          : 'older';
+      if (_collapsedGroups.remove(timeGroup)) changed = true;
+      final statusGroup = switch (thread.shownStatus) {
+        ThreadStatus.needsInput => 'needsInput',
+        ThreadStatus.running => 'running',
+        ThreadStatus.unread => 'unread',
+        ThreadStatus.idle => 'idle',
+      };
+      if (_collapsedGroups.remove(statusGroup)) changed = true;
+    }
+    if (parentOf(thread) case final parent?) {
+      final parentId = parent.id;
+      if (parentId != null && _foldedAsides.remove(parentId)) {
+        changed = true;
+      }
+    }
+    if (!listsHost(thread.project.host)) {
+      _sidebarHost = thread.project.host;
+      changed = true;
+    }
+    if (!changed) return;
+    _save();
+    notifyListeners();
   }
 
   /// Moves [project] in [sidebarProjects] to just before [before], or

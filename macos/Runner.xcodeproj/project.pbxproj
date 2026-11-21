@@ -423,6 +423,7 @@
 			);
 			inputPaths = (
 				"$(PROJECT_DIR)/Runner/KestrelNotch.m",
+				"$(PROJECT_DIR)/Runner/AyteNative.m",
 				"$(PROJECT_DIR)/Runner/build_notch.sh",
 			);
 			name = "Notch Library";
@@ -430,6 +431,7 @@
 			);
 			outputPaths = (
 				"$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/libKestrelNotch.dylib",
+				"$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/libAyteNative.dylib",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;

@@ -816,3 +816,140 @@ class FileChange {
     return index < 0 ? '' : path.substring(0, index);
   }
 }
+
+/// Formats [at] as `YYYY-MM-DD HH:mm:ss` in local time.
+String formatChatFullTimestamp(DateTime at) {
+  final local = at.toLocal();
+  String two(int n) => n.toString().padLeft(2, '0');
+  String four(int n) => n.toString().padLeft(4, '0');
+  return '${four(local.year)}-${two(local.month)}-${two(local.day)} '
+      '${two(local.hour)}:${two(local.minute)}:${two(local.second)}';
+}
+
+/// Formats [at] concisely in local time: `HH:mm:ss` for today, `MM-dd HH:mm:ss`
+/// within the current year, and `YYYY-MM-DD HH:mm:ss` for earlier years.
+String formatChatTimestamp(DateTime at, {DateTime? now}) {
+  final local = at.toLocal();
+  final ref = (now ?? DateTime.now()).toLocal();
+  String two(int n) => n.toString().padLeft(2, '0');
+  String four(int n) => n.toString().padLeft(4, '0');
+  final clock = '${two(local.hour)}:${two(local.minute)}:${two(local.second)}';
+  if (local.year == ref.year &&
+      local.month == ref.month &&
+      local.day == ref.day) {
+    return clock;
+  }
+  if (local.year == ref.year) {
+    return '${two(local.month)}-${two(local.day)} $clock';
+  }
+  return '${four(local.year)}-${two(local.month)}-${two(local.day)} $clock';
+}
+
+/// Formats a turn's wall-clock window starting at [start] (with optional
+/// elapsed [worked]), eliding repeated date when start and finish share a day.
+String formatTurnTimeRange(
+  DateTime start, {
+  Duration? worked,
+  DateTime? now,
+}) {
+  final localStart = start.toLocal();
+  if (worked == null || worked.inSeconds <= 0) {
+    return formatChatTimestamp(localStart, now: now);
+  }
+  final localEnd = localStart.add(worked);
+  final ref = (now ?? DateTime.now()).toLocal();
+  String two(int n) => n.toString().padLeft(2, '0');
+  String four(int n) => n.toString().padLeft(4, '0');
+  final sameDay =
+      localStart.year == localEnd.year &&
+      localStart.month == localEnd.month &&
+      localStart.day == localEnd.day;
+  final endClock =
+      '${two(localEnd.hour)}:${two(localEnd.minute)}:${two(localEnd.second)}';
+  final String endStr;
+  if (sameDay) {
+    endStr = endClock;
+  } else if (localEnd.year == ref.year && localEnd.year == localStart.year) {
+    endStr = '${two(localEnd.month)}-${two(localEnd.day)} $endClock';
+  } else {
+    endStr =
+        '${four(localEnd.year)}-${two(localEnd.month)}-${two(localEnd.day)} $endClock';
+  }
+  return '${formatChatTimestamp(localStart, now: ref)} – $endStr';
+}
+
+/// Clean user question text for one-click copying: removes inline
+/// `[Image #N]` placeholders that stand in for attached [images] and tidies
+/// separator spaces around the removed placeholders.
+String userPromptCopyText(
+  String text, {
+  List<ImageAttachment> images = const [],
+}) {
+  if (images.isEmpty || text.isEmpty) return text;
+  final numbered = {for (final image in images) ?image.number};
+  final anyImageRef = images.any((image) => image.number == null);
+  bool matchesAttached(int? number) =>
+      number != null && (anyImageRef || numbered.contains(number));
+
+  final lines = text.split('\n');
+  final cleanedLines = <String>[];
+  for (final line in lines) {
+    final matches = [
+      for (final match in imageReferencePattern.allMatches(line))
+        if (matchesAttached(int.tryParse(match[1]!))) match,
+    ];
+    if (matches.isEmpty) {
+      cleanedLines.add(line);
+      continue;
+    }
+    final cleaned = _stripImageMatches(line, matches);
+    // Drop lines that only held image references so copying doesn't leave
+    // phantom leading/trailing blank lines.
+    if (cleaned.trim().isEmpty) continue;
+    cleanedLines.add(cleaned);
+  }
+  return cleanedLines.join('\n');
+}
+
+String _stripImageMatches(String line, List<RegExpMatch> matches) {
+  final buf = StringBuffer();
+  var index = 0;
+  var at = 0;
+  while (index < matches.length) {
+    final first = matches[index];
+    final beforeRaw = line.substring(at, first.start);
+    final gapBefore = beforeRaw.length - beforeRaw.trimRight().length;
+    final leftText = beforeRaw.substring(0, beforeRaw.length - gapBefore);
+    buf.write(leftText);
+
+    // Collapse consecutive attached-image placeholders separated only by
+    // horizontal whitespace into a single removed run.
+    var runEnd = first.end;
+    var gapAfter = 0;
+    while (index + 1 < matches.length) {
+      final next = matches[index + 1];
+      final between = line.substring(runEnd, next.start);
+      if (between.trim().isNotEmpty) break;
+      gapAfter += between.length;
+      runEnd = next.end;
+      index++;
+    }
+
+    var afterStart = runEnd;
+    while (afterStart < line.length &&
+        (line[afterStart] == ' ' || line[afterStart] == '\t')) {
+      afterStart++;
+      gapAfter++;
+    }
+
+    final hasLeft = buf.isNotEmpty;
+    final hasRight = afterStart < line.length;
+    if (hasLeft && hasRight && (gapBefore > 0 || gapAfter > 0)) {
+      buf.write(' ');
+    }
+    at = afterStart;
+    index++;
+  }
+  buf.write(line.substring(at));
+  return buf.toString();
+}

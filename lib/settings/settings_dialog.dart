@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 
 import '../base/mouse_navigation.dart';
 import '../base/smooth_scroll.dart';
+import '../browser/embedded/embedded_browser_controller.dart';
 import '../channel/channel_setup.dart' show ChannelSetup;
 import '../ide/ide_color_theme_picker.dart' show ideSelectColorThemeCommandId;
 import '../keybindings/default_keybindings.dart' show openKeybindingsCommandId;
@@ -32,11 +33,13 @@ enum SettingsSection {
   appearance,
   models,
   antigravityAccounts,
+  codebuddyAccounts,
   usage,
   network,
   ssh,
   mobile,
   browser,
+  computerUse,
   notifications,
   stash,
   accounts,
@@ -55,11 +58,13 @@ enum SettingsCategory {
     SettingsSection.appearance,
     SettingsSection.models,
     SettingsSection.antigravityAccounts,
+    SettingsSection.codebuddyAccounts,
     SettingsSection.usage,
     SettingsSection.network,
     SettingsSection.ssh,
     SettingsSection.mobile,
     SettingsSection.browser,
+    SettingsSection.computerUse,
     SettingsSection.notifications,
     SettingsSection.stash,
     SettingsSection.accounts,
@@ -260,11 +265,13 @@ class SettingsDialogState extends State<SettingsDialog> {
     SettingsSection.models =>
       ChannelSetup.channelBuild ? Codicons.person : Codicons.sparkle,
     SettingsSection.antigravityAccounts => Codicons.account,
+    SettingsSection.codebuddyAccounts => Codicons.account,
     SettingsSection.usage => SvgIcons.usage,
     SettingsSection.network => Codicons.radioTower,
     SettingsSection.ssh => Codicons.remote,
     SettingsSection.mobile => Codicons.deviceMobile,
     SettingsSection.browser => Codicons.globe,
+    SettingsSection.computerUse => Codicons.vm,
     SettingsSection.notifications => Codicons.bell,
     SettingsSection.stash => Codicons.note,
     SettingsSection.accounts => Codicons.sourceControl,
@@ -296,11 +303,14 @@ class SettingsDialogState extends State<SettingsDialog> {
             : l10n.settingsSectionModels,
       SettingsSection.antigravityAccounts =>
         isZh ? 'Antigravity 账号' : 'Antigravity Accounts',
+      SettingsSection.codebuddyAccounts =>
+        isZh ? 'CodeBuddy 账号' : 'CodeBuddy Accounts',
       SettingsSection.usage => l10n.settingsSectionUsage,
       SettingsSection.network => l10n.settingsSectionNetwork,
       SettingsSection.ssh => l10n.settingsSectionSsh,
       SettingsSection.mobile => l10n.settingsSectionMobile,
       SettingsSection.browser => l10n.settingsSectionBrowser,
+      SettingsSection.computerUse => isZh ? '电脑操作' : 'Computer Use',
       SettingsSection.notifications => l10n.settingsSectionNotifications,
       SettingsSection.stash => l10n.settingsSectionStash,
       SettingsSection.accounts => isZh ? 'Git 账户' : 'Git Accounts',
@@ -322,9 +332,13 @@ class SettingsDialogState extends State<SettingsDialog> {
         SettingsSection.ssh => context.l10n.settingsSshKeywords,
         SettingsSection.mobile => context.l10n.settingsMobileKeywords,
         SettingsSection.browser => context.l10n.settingsBrowserKeywords,
+        SettingsSection.computerUse =>
+          'computer use desktop window screen cua driver accessibility 电脑操作 桌面 窗口 共享 辅助功能 屏幕录制 快捷键',
         SettingsSection.customize => context.l10n.settingsCustomizeKeywords,
         SettingsSection.antigravityAccounts =>
           'google antigravity account oauth quota 配额 切号 账号管理',
+        SettingsSection.codebuddyAccounts =>
+          'tencent codebuddy cbc account oauth quota credits 腾讯 账号 积分 配额 切号 账号管理',
         SettingsSection.accounts => context.l10n.settingsAccountsKeywords,
         _ => '',
       };
@@ -380,11 +394,13 @@ class SettingsDialogState extends State<SettingsDialog> {
   @override
   void initState() {
     super.initState();
+    EmbeddedBrowserController.instance.pushOverlay();
     _search.addListener(() => setState(() {}));
   }
 
   @override
   void dispose() {
+    EmbeddedBrowserController.instance.popOverlay();
     _search.dispose();
     _width.dispose();
     super.dispose();

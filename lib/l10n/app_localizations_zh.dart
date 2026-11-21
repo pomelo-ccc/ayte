@@ -2632,6 +2632,14 @@ class AppLocalizationsZh extends AppLocalizations {
   }
 
   @override
+  String get promptCopy => '复制问题';
+
+  @override
+  String promptSentAtHint(String time) {
+    return '发送于 $time';
+  }
+
+  @override
   String get turnCopy => '复制回复';
 
   @override
@@ -2663,6 +2671,16 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get turnDurationHint => '本轮耗时';
+
+  @override
+  String turnStartedAtHint(String time) {
+    return '开始于 $time';
+  }
+
+  @override
+  String turnTimeRangeHint(String start, String end) {
+    return '开始：$start\n完成：$end';
+  }
 
   @override
   String get turnCostHint => '本轮花费';
@@ -13514,4 +13532,10 @@ class AppLocalizationsZh extends AppLocalizations {
   String remoteBrowserReplace(String name) {
     return '“$name”已存在，要替换它吗？';
   }
+
+  @override
+  String get chatArchivedBanner => '此对话已归档';
+
+  @override
+  String get chatRestoreFromArchive => '从归档恢复';
 }

@@ -4724,6 +4724,18 @@ abstract class AppLocalizations {
   /// **'thought {duration}'**
   String stepsThought(String duration);
 
+  /// Hint of the button under a sent user message that copies its text.
+  ///
+  /// In en, this message translates to:
+  /// **'Copy question'**
+  String get promptCopy;
+
+  /// Tooltip showing the exact date and time a user question was sent.
+  ///
+  /// In en, this message translates to:
+  /// **'Sent at {time}'**
+  String promptSentAtHint(String time);
+
   /// Hint of the button at the end of a finished turn that copies its answer.
   ///
   /// In en, this message translates to:
@@ -4777,6 +4789,18 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Time this turn took'**
   String get turnDurationHint;
+
+  /// No description provided for @turnStartedAtHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Started at {time}'**
+  String turnStartedAtHint(String time);
+
+  /// No description provided for @turnTimeRangeHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Started: {start}\nFinished: {end}'**
+  String turnTimeRangeHint(String start, String end);
 
   /// No description provided for @turnCostHint.
   ///
@@ -23184,6 +23208,18 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'“{name}” already exists. Replace it?'**
   String remoteBrowserReplace(String name);
+
+  /// No description provided for @chatArchivedBanner.
+  ///
+  /// In en, this message translates to:
+  /// **'This conversation is archived.'**
+  String get chatArchivedBanner;
+
+  /// No description provided for @chatRestoreFromArchive.
+  ///
+  /// In en, this message translates to:
+  /// **'Restore from archive'**
+  String get chatRestoreFromArchive;
 }
 
 class _AppLocalizationsDelegate

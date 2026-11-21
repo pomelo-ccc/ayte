@@ -155,4 +155,128 @@ void main() {
       reason: 'the sidebar slides out of the window',
     );
   }, variant: _mac);
+
+  testWidgets('⇧⌘K and ⇧⌘F open, switch, and toggle the search palette', (
+    tester,
+  ) async {
+    await _pumpApp(tester);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyK);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+    await tester.pumpAndSettle();
+    expect(find.byType(SearchPalette), findsOneWidget);
+    expect(_rich('New Chat'), findsOneWidget);
+
+    // ⇧⌘F switches from All to Agents while the palette is open.
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+    await tester.pump();
+    expect(find.byType(SearchPalette), findsOneWidget);
+    expect(_inPalette(find.text('Recent Agents')), findsOneWidget);
+    expect(_rich('New Chat'), findsNothing);
+
+    // ⇧⌘F again closes it.
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+    await tester.pumpAndSettle();
+    expect(find.byType(SearchPalette), findsNothing);
+  }, variant: _mac);
+
+  testWidgets(
+    'opening a searched archived or collapsed conversation reveals it in the '
+    'sidebar and supports restoring from archive',
+    (tester) async {
+      final workspace = await _pumpApp(tester);
+      final archived = workspace.threads.firstWhere(
+        (t) => t.title == 'Flaky integration test on CI',
+      );
+      workspace.setArchived(archived, true);
+      await tester.pumpAndSettle();
+
+      final inSidebarArchived = find.descendant(
+        of: find.byType(Sidebar),
+        matching: find.text('Flaky integration test on CI'),
+      );
+      expect(workspace.showArchived, isFalse);
+      expect(inSidebarArchived, findsNothing);
+      // Sidebar footer shows a visible Archived toggle.
+      final footerArchived = find.descendant(
+        of: find.byType(Sidebar),
+        matching: find.text('Archived · 1'),
+      );
+      expect(footerArchived, findsOneWidget);
+      expect(tester.getSize(footerArchived).width, greaterThan(40));
+
+      // Open Search Agents via ⇧⌘F, confirm Archived badge & open the thread.
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+      await tester.pumpAndSettle();
+      await _type(tester, 'Flaky integration');
+      expect(_inPalette(find.text('Archived')), findsOneWidget);
+
+      await tester.tap(_rich('Flaky integration test on CI'));
+      await tester.pumpAndSettle();
+      expect(find.byType(SearchPalette), findsNothing);
+      expect(workspace.selected, same(archived));
+      expect(workspace.showArchived, isTrue);
+      expect(inSidebarArchived, findsOneWidget);
+
+      // Opened archived conversation shows banner with Restore button.
+      expect(find.text('This conversation is archived.'), findsOneWidget);
+      await tester.tap(find.text('Restore from archive'));
+      await tester.pumpAndSettle();
+      expect(archived.archived, isFalse);
+      expect(find.text('This conversation is archived.'), findsNothing);
+      expect(inSidebarArchived, findsOneWidget);
+
+      // Inline restore directly inside SearchPalette.
+      workspace.setArchived(archived, true);
+      await tester.pumpAndSettle();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+      await tester.pumpAndSettle();
+      await _type(tester, 'Flaky integration');
+      expect(_inPalette(find.text('Archived')), findsOneWidget);
+      await tester.tap(_inPalette(find.byIcon(Icons.unarchive_outlined)));
+      await tester.pumpAndSettle();
+      expect(archived.archived, isFalse);
+      expect(_inPalette(find.text('Archived')), findsNothing);
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.pumpAndSettle();
+
+      // Collapsed project unfolds when its conversation is picked from search.
+      final group = Workspace.projectGroup(archived.project.path);
+      workspace.toggleCollapsed(group);
+      await tester.pumpAndSettle();
+      expect(workspace.isCollapsed(group), isTrue);
+      expect(inSidebarArchived, findsNothing);
+
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+      await tester.pumpAndSettle();
+      await _type(tester, 'Flaky integration');
+      await tester.tap(_rich('Flaky integration test on CI'));
+      await tester.pumpAndSettle();
+      expect(workspace.isCollapsed(group), isFalse);
+      expect(inSidebarArchived, findsOneWidget);
+    },
+    variant: _mac,
+  );
 }
