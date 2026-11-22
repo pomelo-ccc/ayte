@@ -22,10 +22,12 @@ class WorkflowCelebrationOverlay extends StatefulWidget {
     super.key,
     required this.child,
     this.controller,
+    this.onInspectRun,
   });
 
   final Widget child;
   final CanvasController? controller;
+  final ValueChanged<int>? onInspectRun;
 
   @override
   State<WorkflowCelebrationOverlay> createState() =>
@@ -51,6 +53,33 @@ class _WorkflowCelebrationOverlayState extends State<WorkflowCelebrationOverlay>
     vsync: this,
     duration: const Duration(milliseconds: 6200),
   );
+
+  late final CurvedAnimation _opacityCurve = CurvedAnimation(
+    parent: _bannerCtrl,
+    curve: Curves.easeOutCubic,
+  );
+
+  late final CurvedAnimation _slideCurve = CurvedAnimation(
+    parent: _bannerCtrl,
+    curve: Curves.easeOutBack,
+    reverseCurve: Curves.easeInCubic,
+  );
+
+  late final CurvedAnimation _scaleCurve = CurvedAnimation(
+    parent: _bannerCtrl,
+    curve: Curves.easeOutBack,
+    reverseCurve: Curves.easeIn,
+  );
+
+  late final Animation<Offset> _slideAnim = Tween<Offset>(
+    begin: const Offset(0, -0.35),
+    end: Offset.zero,
+  ).animate(_slideCurve);
+
+  late final Animation<double> _scaleAnim = Tween<double>(
+    begin: 0.92,
+    end: 1.0,
+  ).animate(_scaleCurve);
 
   WorkflowCompletionEvent? _activeEvent;
   int _lastHandledRunId = 0;
@@ -85,6 +114,9 @@ class _WorkflowCelebrationOverlayState extends State<WorkflowCelebrationOverlay>
     _ctrl.removeListener(_onControllerChanged);
     _fireworksCtrl.removeStatusListener(_onFireworksStatus);
     _countdownCtrl.removeStatusListener(_onCountdownStatus);
+    _opacityCurve.dispose();
+    _slideCurve.dispose();
+    _scaleCurve.dispose();
     _fireworksCtrl.dispose();
     _bannerCtrl.dispose();
     _countdownCtrl.dispose();
@@ -156,12 +188,25 @@ class _WorkflowCelebrationOverlayState extends State<WorkflowCelebrationOverlay>
   }
 
   Future<void> _dismissBanner() async {
+    final expectedRunId = _activeEvent?.runId;
+    if (expectedRunId == null) return;
     _countdownCtrl.stop();
     await _bannerCtrl.reverse();
     if (!mounted) return;
+    // Guard against clobbering a newer completion event that arrived during reverse.
+    if (_activeEvent?.runId != expectedRunId) return;
     setState(() {
       _activeEvent = null;
     });
+  }
+
+  void _inspectEventRun(WorkflowCompletionEvent ev) {
+    final workflowRunId = ev.workflowRunId;
+    if (workflowRunId != null) {
+      _ctrl.selectRun(workflowRunId);
+      widget.onInspectRun?.call(workflowRunId);
+    }
+    unawaited(_dismissBanner());
   }
 
   void _generateShow() {
@@ -336,29 +381,11 @@ class _WorkflowCelebrationOverlayState extends State<WorkflowCelebrationOverlay>
             child: Align(
               alignment: Alignment.topCenter,
               child: FadeTransition(
-                opacity: CurvedAnimation(
-                  parent: _bannerCtrl,
-                  curve: Curves.easeOutCubic,
-                ),
+                opacity: _opacityCurve,
                 child: SlideTransition(
-                  position: Tween<Offset>(
-                    begin: const Offset(0, -0.35),
-                    end: Offset.zero,
-                  ).animate(
-                    CurvedAnimation(
-                      parent: _bannerCtrl,
-                      curve: Curves.easeOutBack,
-                      reverseCurve: Curves.easeInCubic,
-                    ),
-                  ),
+                  position: _slideAnim,
                   child: ScaleTransition(
-                    scale: Tween<double>(begin: 0.92, end: 1.0).animate(
-                      CurvedAnimation(
-                        parent: _bannerCtrl,
-                        curve: Curves.easeOutBack,
-                        reverseCurve: Curves.easeIn,
-                      ),
-                    ),
+                    scale: _scaleAnim,
                     child: MouseRegion(
                       onEnter: (_) {
                         _hoveringBanner = true;
@@ -377,6 +404,9 @@ class _WorkflowCelebrationOverlayState extends State<WorkflowCelebrationOverlay>
                         isZh: isZh,
                         countdown: _countdownCtrl,
                         onReplay: ev.ok ? _replayFireworks : null,
+                        onInspectRun: ev.workflowRunId != null
+                            ? () => _inspectEventRun(ev)
+                            : null,
                         onDismiss: () => unawaited(_dismissBanner()),
                       ),
                     ),
@@ -398,6 +428,7 @@ class _CompletionBannerCard extends StatelessWidget {
     required this.countdown,
     required this.onDismiss,
     this.onReplay,
+    this.onInspectRun,
   });
 
   final WorkflowCompletionEvent event;
@@ -405,6 +436,7 @@ class _CompletionBannerCard extends StatelessWidget {
   final bool isZh;
   final Animation<double> countdown;
   final VoidCallback? onReplay;
+  final VoidCallback? onInspectRun;
   final VoidCallback onDismiss;
 
   String _formatDuration(Duration d) {
@@ -588,6 +620,62 @@ class _CompletionBannerCard extends StatelessWidget {
                             ],
                           ),
                         ),
+                        if (onInspectRun != null) ...[
+                          const SizedBox(width: 8),
+                          Tooltip(
+                            message: ok
+                                ? (isZh ? '查看本次运行详情' : 'Inspect this run')
+                                : (isZh ? '跳转到失败节点' : 'Jump to failed run'),
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(8),
+                              onTap: onInspectRun,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 9,
+                                  vertical: 6,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: accent.withValues(
+                                    alpha: dark ? 0.18 : 0.1,
+                                  ),
+                                  borderRadius: BorderRadius.circular(8),
+                                  border: Border.all(
+                                    color: accent.withValues(alpha: 0.36),
+                                  ),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      ok ? Codicons.eye : Codicons.target,
+                                      size: 12.5,
+                                      color: dark
+                                          ? (ok
+                                                ? const Color(0xFF34D399)
+                                                : const Color(0xFFF87171))
+                                          : accent,
+                                    ),
+                                    const SizedBox(width: 4),
+                                    Text(
+                                      ok
+                                          ? (isZh ? '查看运行' : 'Inspect')
+                                          : (isZh ? '定位失败' : 'Inspect'),
+                                      style: TextStyle(
+                                        fontSize: 11.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: dark
+                                            ? (ok
+                                                  ? const Color(0xFFA7F3D0)
+                                                  : const Color(0xFFFECACA))
+                                            : accent,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
                         if (onReplay != null) ...[
                           const SizedBox(width: 8),
                           Tooltip(
@@ -769,7 +857,7 @@ class _ConfettiPiece {
 }
 
 class _FireworksPainter extends CustomPainter {
-  const _FireworksPainter({
+  _FireworksPainter({
     required this.progress,
     required this.bursts,
     required this.confetti,
@@ -780,6 +868,12 @@ class _FireworksPainter extends CustomPainter {
   final List<_FireworkBurst> bursts;
   final List<_ConfettiPiece> confetti;
   final bool dark;
+
+  // Reused Paint instances avoid allocating ~1,500+ Paint objects per frame.
+  final Paint _fillPaint = Paint()..style = PaintingStyle.fill;
+  final Paint _strokePaint = Paint()
+    ..style = PaintingStyle.stroke
+    ..strokeCap = StrokeCap.round;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -819,7 +913,7 @@ class _FireworksPainter extends CustomPainter {
       final tailT = math.max(0.0, eased - 0.22);
       final tail = Offset.lerp(launchPos, center, tailT)!;
 
-      final trailPaint = Paint()
+      _strokePaint
         ..shader = LinearGradient(
           colors: [
             burst.primaryColor.withValues(alpha: 0.0),
@@ -827,20 +921,22 @@ class _FireworksPainter extends CustomPainter {
             Colors.white.withValues(alpha: dark ? 0.95 : 0.85),
           ],
         ).createShader(Rect.fromPoints(tail, head))
-        ..strokeWidth = 2.6 * scale
-        ..strokeCap = StrokeCap.round
-        ..style = PaintingStyle.stroke;
-      canvas.drawLine(tail, head, trailPaint);
+        ..strokeWidth = 2.6 * scale;
+      canvas.drawLine(tail, head, _strokePaint);
+      _strokePaint.shader = null;
 
-      final headGlow = Paint()
-        ..color = burst.primaryColor.withValues(alpha: dark ? 0.55 : 0.35)
-        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6);
-      canvas.drawCircle(head, 4.5 * scale, headGlow);
-      canvas.drawCircle(
-        head,
-        2.2 * scale,
-        Paint()..color = dark ? Colors.white : burst.primaryColor,
+      // Fast concentric glow without GPU MaskFilter.blur
+      _fillPaint.shader = null;
+      _fillPaint.color = burst.primaryColor.withValues(
+        alpha: dark ? 0.22 : 0.16,
       );
+      canvas.drawCircle(head, 7.2 * scale, _fillPaint);
+      _fillPaint.color = burst.primaryColor.withValues(
+        alpha: dark ? 0.45 : 0.3,
+      );
+      canvas.drawCircle(head, 4.2 * scale, _fillPaint);
+      _fillPaint.color = dark ? Colors.white : burst.primaryColor;
+      canvas.drawCircle(head, 2.2 * scale, _fillPaint);
       return;
     }
 
@@ -855,29 +951,31 @@ class _FireworksPainter extends CustomPainter {
     if (norm < 0.28) {
       final flashT = (norm / 0.28).clamp(0.0, 1.0);
       final flashAlpha = (1.0 - flashT) * (1.0 - flashT);
-      final flashRadius = (20 + 78 * Curves.easeOutQuad.transform(flashT)) * scale;
-      final glowPaint = Paint()
-        ..shader = RadialGradient(
-          colors: [
-            (dark ? Colors.white : burst.accentColor).withValues(
-              alpha: flashAlpha * (dark ? 0.52 : 0.32),
-            ),
-            burst.primaryColor.withValues(alpha: flashAlpha * 0.18),
-            burst.primaryColor.withValues(alpha: 0.0),
-          ],
-        ).createShader(Rect.fromCircle(center: center, radius: flashRadius));
-      canvas.drawCircle(center, flashRadius, glowPaint);
+      final flashRadius =
+          (20 + 78 * Curves.easeOutQuad.transform(flashT)) * scale;
+      _fillPaint.shader = RadialGradient(
+        colors: [
+          (dark ? Colors.white : burst.accentColor).withValues(
+            alpha: flashAlpha * (dark ? 0.52 : 0.32),
+          ),
+          burst.primaryColor.withValues(alpha: flashAlpha * 0.18),
+          burst.primaryColor.withValues(alpha: 0.0),
+        ],
+      ).createShader(Rect.fromCircle(center: center, radius: flashRadius));
+      canvas.drawCircle(center, flashRadius, _fillPaint);
+      _fillPaint.shader = null;
 
-      final ringPaint = Paint()
-        ..style = PaintingStyle.stroke
+      _strokePaint
+        ..shader = null
         ..strokeWidth = (2.6 * (1.0 - flashT) + 0.5) * scale
         ..color = burst.accentColor.withValues(
           alpha: flashAlpha * (dark ? 0.58 : 0.45),
         );
-      canvas.drawCircle(center, flashRadius * 0.92, ringPaint);
+      canvas.drawCircle(center, flashRadius * 0.92, _strokePaint);
     }
 
-    // Spark particles with analytical air-drag + gravity & multi-segment trails
+    // Spark particles with analytical air-drag + gravity & fast concentric glow
+    _fillPaint.shader = null;
     for (final s in burst.sparks) {
       if (norm > s.lifeSpan) continue;
       final lifeT = (norm / s.lifeSpan).clamp(0.0, 1.0);
@@ -895,51 +993,46 @@ class _FireworksPainter extends CustomPainter {
 
       final sparkColor = _toneForTheme(s.color, dark);
 
-      // Tapered glowing tail
+      // Tapered glowing tail (single-color fast stroke + midpoint accent, zero per-spark shader)
       if ((pos - prevPos).distanceSquared > 1.0) {
-        final tailPaint = Paint()
-          ..shader = LinearGradient(
-            colors: [
-              sparkColor.withValues(alpha: 0.0),
-              sparkColor.withValues(alpha: alpha * (dark ? 0.78 : 0.68)),
-            ],
-          ).createShader(Rect.fromPoints(prevPos, pos))
-          ..strokeWidth = math.max(1.0, s.radius * (1.15 - lifeT * 0.45) * scale)
-          ..strokeCap = StrokeCap.round
-          ..style = PaintingStyle.stroke;
-        canvas.drawLine(prevPos, pos, tailPaint);
+        final mid = Offset(
+          (prevPos.dx + pos.dx) * 0.5,
+          (prevPos.dy + pos.dy) * 0.5,
+        );
+        final strokeW = math.max(
+          1.0,
+          s.radius * (1.15 - lifeT * 0.45) * scale,
+        );
+        _strokePaint
+          ..shader = null
+          ..strokeWidth = strokeW * 0.72
+          ..color = sparkColor.withValues(alpha: alpha * (dark ? 0.32 : 0.28));
+        canvas.drawLine(prevPos, mid, _strokePaint);
+        _strokePaint
+          ..strokeWidth = strokeW
+          ..color = sparkColor.withValues(alpha: alpha * (dark ? 0.76 : 0.65));
+        canvas.drawLine(mid, pos, _strokePaint);
       }
 
-      // Soft halo around bright spark head
+      // Fast concentric soft halo (no GPU MaskFilter.blur overhead)
       final headR = math.max(0.9, s.radius * (1.0 - lifeT * 0.35) * scale);
       if (dark) {
-        canvas.drawCircle(
-          pos,
-          headR * 2.3,
-          Paint()
-            ..color = sparkColor.withValues(alpha: alpha * 0.28)
-            ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 4),
-        );
+        _fillPaint.color = sparkColor.withValues(alpha: alpha * 0.12);
+        canvas.drawCircle(pos, headR * 2.6, _fillPaint);
+        _fillPaint.color = sparkColor.withValues(alpha: alpha * 0.28);
+        canvas.drawCircle(pos, headR * 1.65, _fillPaint);
       } else {
-        // Subtle crisp outline on light backgrounds so bright sparks pop.
-        canvas.drawCircle(
-          pos,
-          headR * 1.45,
-          Paint()..color = sparkColor.withValues(alpha: alpha * 0.22),
-        );
+        _fillPaint.color = sparkColor.withValues(alpha: alpha * 0.22);
+        canvas.drawCircle(pos, headR * 1.48, _fillPaint);
       }
 
       // Bright core
-      canvas.drawCircle(
-        pos,
-        headR,
-        Paint()
-          ..color = Color.lerp(
-            sparkColor,
-            dark ? Colors.white : sparkColor,
-            (1.0 - lifeT) * 0.45,
-          )!.withValues(alpha: alpha),
-      );
+      _fillPaint.color = Color.lerp(
+        sparkColor,
+        dark ? Colors.white : sparkColor,
+        (1.0 - lifeT) * 0.45,
+      )!.withValues(alpha: alpha);
+      canvas.drawCircle(pos, headR, _fillPaint);
     }
   }
 
@@ -956,6 +1049,7 @@ class _FireworksPainter extends CustomPainter {
   }
 
   void _paintConfetti(Canvas canvas, Size size, double scale) {
+    _fillPaint.shader = null;
     for (final c in confetti) {
       final local = progress - c.startFrac;
       if (local <= 0) continue;
@@ -980,7 +1074,8 @@ class _FireworksPainter extends CustomPainter {
 
       final color = _toneForTheme(c.color, dark).withValues(alpha: alpha);
       final angle = c.phase + tSec * c.spinSpeed;
-      final flipScaleY = 0.25 + 0.75 * math.cos(tSec * c.flipSpeed + c.phase).abs();
+      final flipScaleY =
+          0.25 + 0.75 * math.cos(tSec * c.flipSpeed + c.phase).abs();
 
       canvas.save();
       canvas.translate(x, y);
@@ -991,9 +1086,10 @@ class _FireworksPainter extends CustomPainter {
         width: c.width * scale,
         height: c.height * scale,
       );
+      _fillPaint.color = color;
       canvas.drawRRect(
         RRect.fromRectAndRadius(rect, const Radius.circular(1.4)),
-        Paint()..color = color,
+        _fillPaint,
       );
       canvas.restore();
     }
@@ -1017,5 +1113,6 @@ class _FireworksPainter extends CustomPainter {
   bool shouldRepaint(covariant _FireworksPainter oldDelegate) =>
       oldDelegate.progress != progress ||
       oldDelegate.dark != dark ||
-      oldDelegate.bursts != bursts;
+      oldDelegate.bursts != bursts ||
+      oldDelegate.confetti != confetti;
 }

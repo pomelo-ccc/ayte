@@ -2,9 +2,12 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:path/path.dart' as p;
 
 import '../acp/acp_agent_service.dart';
 import '../chat/chat_session.dart';
@@ -14,7 +17,178 @@ import '../ide/ide_input.dart';
 import '../theme/app_theme.dart';
 import '../theme/codicons.dart';
 import '../theme/workbench_theme.dart' show themeColors;
+import 'canvas_ai_dialog.dart';
+import 'canvas_context_menu.dart';
 import 'canvas_controller.dart';
+import 'canvas_minimap.dart';
+import 'canvas_search_palette.dart';
+
+/// Cross-platform OS file/directory opener (replaces macOS-only `open`).
+Future<void> _openPathInOs(String targetPath, {bool reveal = false}) async {
+  try {
+    if (Platform.isWindows) {
+      final winPath = targetPath.replaceAll('/', r'\');
+      if (reveal) {
+        await Process.start('explorer.exe', ['/select,$winPath']);
+      } else {
+        await Process.start('explorer.exe', [winPath]);
+      }
+    } else if (Platform.isMacOS) {
+      await Process.run('open', [if (reveal) '-R', targetPath]);
+    } else {
+      final dirPath = reveal ? p.dirname(targetPath) : targetPath;
+      await Process.run('xdg-open', [dirPath]);
+    }
+  } on Object catch (e) {
+    debugPrint('Canvas _openPathInOs failed for $targetPath: $e');
+  }
+}
+
+/// Non-blocking TTL filesystem cache so `build()` never calls sync disk I/O.
+abstract final class _CanvasFsCache {
+  static final Map<String, ({bool exists, DateTime at})> _exists = {};
+  static final Map<String, ({String preview, DateTime at})> _previews = {};
+  static final Set<String> _pendingExists = {};
+  static final Set<String> _pendingPreviews = {};
+  static const _ttl = Duration(seconds: 6);
+
+  static bool? existsCached(String path, VoidCallback onReady) {
+    final trimmed = path.trim();
+    if (trimmed.isEmpty) return false;
+    final hit = _exists[trimmed];
+    if (hit != null && DateTime.now().difference(hit.at) < _ttl) {
+      return hit.exists;
+    }
+    if (_pendingExists.add(trimmed)) {
+      unawaited(
+        FileSystemEntity.type(trimmed)
+            .then((type) {
+              _exists[trimmed] = (
+                exists: type != FileSystemEntityType.notFound,
+                at: DateTime.now(),
+              );
+            })
+            .catchError((_) {
+              _exists[trimmed] = (exists: false, at: DateTime.now());
+            })
+            .whenComplete(() {
+              _pendingExists.remove(trimmed);
+              onReady();
+            }),
+      );
+    }
+    return hit?.exists;
+  }
+
+  static String? filePreviewCached(String path, VoidCallback onReady) {
+    final trimmed = path.trim();
+    if (trimmed.isEmpty) return null;
+    final hit = _previews[trimmed];
+    if (hit != null && DateTime.now().difference(hit.at) < _ttl) {
+      return hit.preview;
+    }
+    if (_pendingPreviews.add(trimmed)) {
+      unawaited(() async {
+        try {
+          final f = File(trimmed);
+          if (await f.exists()) {
+            final bytes = await f.openRead(0, 4096).fold<List<int>>(
+              <int>[],
+              (acc, chunk) => acc..addAll(chunk),
+            );
+            _previews[trimmed] = (
+              preview: utf8.decode(bytes, allowMalformed: true),
+              at: DateTime.now(),
+            );
+          } else {
+            _previews[trimmed] = (preview: '', at: DateTime.now());
+          }
+        } on Object {
+          _previews[trimmed] = (preview: '', at: DateTime.now());
+        } finally {
+          _pendingPreviews.remove(trimmed);
+          onReady();
+        }
+      }());
+    }
+    return hit?.preview;
+  }
+}
+
+/// Isolated 1-second timer widget that ticks elapsed time locally on active
+/// cards/strips without forcing a root canvas rebuild every second.
+class _LiveElapsedText extends StatefulWidget {
+  const _LiveElapsedText({
+    required this.startedAt,
+    required this.finishedAt,
+    required this.running,
+    this.prefix = '',
+    this.suffix = '',
+    required this.style,
+  });
+
+  final DateTime? startedAt;
+  final DateTime? finishedAt;
+  final bool running;
+  final String prefix;
+  final String suffix;
+  final TextStyle style;
+
+  @override
+  State<_LiveElapsedText> createState() => _LiveElapsedTextState();
+}
+
+class _LiveElapsedTextState extends State<_LiveElapsedText> {
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _sync();
+  }
+
+  @override
+  void didUpdateWidget(covariant _LiveElapsedText oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.running != widget.running ||
+        oldWidget.startedAt != widget.startedAt) {
+      _sync();
+    }
+  }
+
+  void _sync() {
+    if (widget.running && _timer == null) {
+      _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted) setState(() {});
+      });
+    } else if (!widget.running && _timer != null) {
+      _timer?.cancel();
+      _timer = null;
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = widget.startedAt;
+    if (s == null) return const SizedBox.shrink();
+    final end = widget.running
+        ? DateTime.now()
+        : (widget.finishedAt ?? DateTime.now());
+    final d = end.difference(s);
+    return Text(
+      '${widget.prefix}${_formatElapsed(d)}${widget.suffix}',
+      style: widget.style,
+    );
+  }
+}
+
+typedef _SnapGuide = ({bool vertical, double pos, double start, double end});
 
 /// Studio-grade 2D Executable Workflow Canvas (DAG):
 /// - Clean single-row 48px studio toolbar with properly constrained menus
@@ -32,21 +206,55 @@ class InfiniteCanvasView extends StatefulWidget {
   State<InfiniteCanvasView> createState() => _InfiniteCanvasViewState();
 }
 
-class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
+class _InfiniteCanvasViewState extends State<InfiniteCanvasView>
+    with SingleTickerProviderStateMixin {
+  static const double _gridStep = 22.0;
+
   final _transform = TransformationController();
   final _boardKey = GlobalKey();
+  final _canvasFocusNode = FocusNode(debugLabel: 'WorkflowCanvas');
   final _approvalNoteCtrl = TextEditingController();
   final _logScrollCtrl = ScrollController();
-  double _scale = 1.0;
-  String? _selectedNodeId;
+
+  // Dedicated high-frequency notifiers avoid rebuilding node cards on drag/hover.
+  final _wirePointerNotifier = ValueNotifier<Offset?>(null);
+  final _marqueeRectNotifier = ValueNotifier<Rect?>(null);
+  final _snapGuidesNotifier = ValueNotifier<List<_SnapGuide>>(const []);
+
+  late final AnimationController _camAnimCtrl = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 200),
+  );
+  Animation<Matrix4>? _camAnim;
+
+  Set<String> _selectedNodeIds = {};
+  String? _selectedEdgeId;
   ({String fromId, CanvasEdgeBranch branch})? _connecting;
-  Offset? _pointerScenePos;
+  bool _dragWiring = false;
+  Offset? _wireStartScene;
+
+  bool _marqueeMode = false;
+  bool _spacePanning = false;
+  bool _middleMousePanning = false;
+  Offset? _marqueeOriginScene;
+
+  Map<String, ({double x, double y})>? _dragInitialPositions;
+  Offset _dragAccumDelta = Offset.zero;
+  String? _dragAnchorId;
+
+  List<CanvasNode> _copiedNodes = const [];
+  List<CanvasEdge> _copiedEdges = const [];
+
+  bool _snapToGrid = true;
+  bool _showMinimap = true;
+  bool _autoFollowActiveNode = false;
   bool _showLogDrawer = false;
   bool _logExpanded = false;
   bool _logSelectedNodeOnly = false;
+  bool _consolePinnedToBottom = true;
   double _inspectorWidth = 400.0;
   Size _viewportSize = const Size(960, 620);
-  Timer? _tickTimer;
+
   int? _lastSelectedRunId;
   String? _lastTrackedRunningId;
   String? _lastTrackedApprovalId;
@@ -54,20 +262,28 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
 
   CanvasController get _ctrl => CanvasController.instance;
 
+  double get _currentScale =>
+      _transform.value.getMaxScaleOnAxis().clamp(0.25, 2.5);
+
+  String? get _primarySelectedNodeId =>
+      _selectedNodeIds.length == 1 ? _selectedNodeIds.first : null;
+
   @override
   void initState() {
     super.initState();
-    _transform.addListener(_onTransform);
     _ctrl.addListener(_onControllerChanged);
+    _logScrollCtrl.addListener(_onLogScroll);
+    _camAnimCtrl.addListener(_onCamAnimTick);
     _lastSelectedRunId = _ctrl.selectedRunId;
     if (_ctrl.anyWorkflowRunning || _ctrl.workflowLog.isNotEmpty) {
       _showLogDrawer = true;
     }
-    _syncTicker();
     unawaited(
       _ctrl.load().then((_) {
         if (mounted && _ctrl.displayNodes.isNotEmpty) {
-          WidgetsBinding.instance.addPostFrameCallback((_) => _fitToView());
+          WidgetsBinding.instance.addPostFrameCallback(
+            (_) => _fitToView(animate: false),
+          );
         }
       }),
     );
@@ -75,31 +291,52 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
 
   @override
   void dispose() {
-    _tickTimer?.cancel();
     _ctrl.removeListener(_onControllerChanged);
+    _logScrollCtrl.removeListener(_onLogScroll);
+    _camAnimCtrl.removeListener(_onCamAnimTick);
+    _camAnimCtrl.dispose();
+    _canvasFocusNode.dispose();
     _approvalNoteCtrl.dispose();
     _logScrollCtrl.dispose();
-    _transform.removeListener(_onTransform);
+    _wirePointerNotifier.dispose();
+    _marqueeRectNotifier.dispose();
+    _snapGuidesNotifier.dispose();
     _transform.dispose();
     super.dispose();
   }
 
-  void _syncTicker() {
-    final active =
-        _ctrl.anyWorkflowRunning || _ctrl.currentRunningNodeId != null;
-    if (active && _tickTimer == null) {
-      _tickTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-        if (mounted) setState(() {});
-      });
-    } else if (!active && _tickTimer != null) {
-      _tickTimer?.cancel();
-      _tickTimer = null;
+  void _onCamAnimTick() {
+    final anim = _camAnim;
+    if (anim != null) {
+      _transform.value = anim.value;
+    }
+  }
+
+  void _animateToMatrix(Matrix4 target, {bool animate = true}) {
+    if (!animate) {
+      _camAnimCtrl.stop();
+      _camAnim = null;
+      _transform.value = target;
+      return;
+    }
+    _camAnim = Matrix4Tween(begin: _transform.value.clone(), end: target)
+        .animate(
+          CurvedAnimation(parent: _camAnimCtrl, curve: Curves.easeOutCubic),
+        );
+    _camAnimCtrl.forward(from: 0);
+  }
+
+  void _onLogScroll() {
+    if (!_logScrollCtrl.hasClients) return;
+    final pos = _logScrollCtrl.position;
+    final atBottom = (pos.maxScrollExtent - pos.pixels) < 42.0;
+    if (atBottom != _consolePinnedToBottom) {
+      setState(() => _consolePinnedToBottom = atBottom);
     }
   }
 
   void _onControllerChanged() {
     if (!mounted) return;
-    _syncTicker();
     final selectedRunId = _ctrl.selectedRunId;
     final runNodeId = _ctrl.currentRunningNodeId;
     final approvalId = _ctrl.activeApprovalNodeId;
@@ -110,20 +347,37 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
       _lastTrackedRunningId = null;
       _lastTrackedApprovalId = null;
       _connecting = null;
-      _pointerScenePos = null;
+      _wirePointerNotifier.value = null;
+      _selectedEdgeId = null;
       final run = _ctrl.selectedRun;
       if (run != null) {
-        _selectedNodeId =
+        final targetId =
             run.activeApprovalNodeId ??
             run.currentRunningNodeId ??
-            (_selectedNodeId != null && run.nodeById(_selectedNodeId!) != null
-                ? _selectedNodeId
+            (_primarySelectedNodeId != null &&
+                    run.nodeById(_primarySelectedNodeId!) != null
+                ? _primarySelectedNodeId
                 : null);
-      } else if (_selectedNodeId != null &&
-          _ctrl.nodeById(_selectedNodeId!) == null) {
-        _selectedNodeId = null;
+        _selectedNodeIds = targetId == null ? {} : {targetId};
+      } else {
+        _selectedNodeIds = {
+          for (final id in _selectedNodeIds)
+            if (_ctrl.nodeById(id) != null) id,
+        };
       }
       needsState = true;
+    } else {
+      final existing = {for (final n in _ctrl.displayNodes) n.id};
+      final pruned = _selectedNodeIds.intersection(existing);
+      if (pruned.length != _selectedNodeIds.length) {
+        _selectedNodeIds = pruned;
+        needsState = true;
+      }
+      if (_selectedEdgeId != null &&
+          !_ctrl.displayEdges.any((e) => e.id == _selectedEdgeId)) {
+        _selectedEdgeId = null;
+        needsState = true;
+      }
     }
 
     if ((_ctrl.selectedRun?.running == true || runNodeId != null) &&
@@ -134,13 +388,15 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
 
     if (runNodeId != null && runNodeId != _lastTrackedRunningId) {
       _lastTrackedRunningId = runNodeId;
-      _selectedNodeId = runNodeId;
-      needsState = true;
-      final node = _ctrl.displayNodeById(runNodeId);
-      if (node != null) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) _focusNode(node);
-        });
+      if (_autoFollowActiveNode) {
+        _selectedNodeIds = {runNodeId};
+        needsState = true;
+        final node = _ctrl.displayNodeById(runNodeId);
+        if (node != null) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) _focusNode(node);
+          });
+        }
       }
     } else if (runNodeId == null) {
       _lastTrackedRunningId = null;
@@ -148,10 +404,10 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
 
     if (approvalId != null && approvalId != _lastTrackedApprovalId) {
       _lastTrackedApprovalId = approvalId;
-      _selectedNodeId = approvalId;
+      _selectedNodeIds = {approvalId};
       needsState = true;
       final node = _ctrl.displayNodeById(approvalId);
-      if (node != null) {
+      if (node != null && _autoFollowActiveNode) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted) _focusNode(node);
         });
@@ -163,9 +419,9 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
     final logLen = _ctrl.workflowLog.length;
     if (logLen != _lastLogLen) {
       _lastLogLen = logLen;
-      if (_showLogDrawer) {
+      if (_showLogDrawer && _consolePinnedToBottom) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted && _logScrollCtrl.hasClients) {
+          if (mounted && _logScrollCtrl.hasClients && _consolePinnedToBottom) {
             _logScrollCtrl.jumpTo(_logScrollCtrl.position.maxScrollExtent);
           }
         });
@@ -180,18 +436,20 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
     final run = runId == null ? null : _ctrl.runById(runId);
     setState(() {
       _connecting = null;
-      _pointerScenePos = null;
+      _wirePointerNotifier.value = null;
+      _selectedEdgeId = null;
       if (run != null) {
         _showLogDrawer = true;
-        _selectedNodeId =
+        final id =
             run.activeApprovalNodeId ??
             run.currentRunningNodeId ??
             run.nodes.firstOrNull?.id;
+        _selectedNodeIds = id == null ? {} : {id};
       } else {
-        if (_selectedNodeId != null &&
-            _ctrl.nodeById(_selectedNodeId!) == null) {
-          _selectedNodeId = null;
-        }
+        _selectedNodeIds = {
+          for (final id in _selectedNodeIds)
+            if (_ctrl.nodeById(id) != null) id,
+        };
       }
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -284,8 +542,8 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
     );
   }
 
-  void _focusNode(CanvasNode node) {
-    final s = _scale.clamp(0.55, 1.0);
+  void _focusNode(CanvasNode node, {bool animate = true}) {
+    final s = _currentScale.clamp(0.55, 1.0);
     final vw = math.max(320.0, _viewportSize.width);
     final vh = math.max(220.0, _viewportSize.height);
     final cx = node.x + node.width / 2;
@@ -297,30 +555,21 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
       ..setEntry(1, 1, s)
       ..setEntry(0, 3, tx)
       ..setEntry(1, 3, ty);
-    _transform.value = m;
-    setState(() => _scale = s);
+    _animateToMatrix(m, animate: animate);
   }
 
   void _startSingleStep(CanvasNode node) {
     setState(() {
-      _selectedNodeId = node.id;
+      _selectedNodeIds = {node.id};
+      _selectedEdgeId = null;
       _showLogDrawer = true;
     });
     unawaited(_ctrl.runCommandNode(node.id));
   }
 
-  void _onTransform() {
-    final s = _transform.value.getMaxScaleOnAxis();
-    if ((s - _scale).abs() > 0.01 && mounted) {
-      setState(() => _scale = s);
-    }
-  }
-
-  void _fitToView() {
-    final nodes = _ctrl.displayNodes;
+  void _fitNodes(List<CanvasNode> nodes, {bool animate = true}) {
     if (nodes.isEmpty) {
-      _transform.value = Matrix4.identity();
-      setState(() => _scale = 1.0);
+      _animateToMatrix(Matrix4.identity(), animate: animate);
       return;
     }
     var minX = double.infinity;
@@ -338,7 +587,7 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
     final contentH = math.max(200.0, (maxY - minY) + pad * 2);
     final vw = math.max(320.0, _viewportSize.width);
     final vh = math.max(240.0, _viewportSize.height);
-    final s = math.min(vw / contentW, vh / contentH).clamp(0.42, 1.0);
+    final s = math.min(vw / contentW, vh / contentH).clamp(0.35, 1.0);
     final tx = (vw - (maxX - minX) * s) / 2 - minX * s;
     final ty = (vh - (maxY - minY) * s) / 2 - minY * s;
     final m = Matrix4.identity()
@@ -346,13 +595,38 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
       ..setEntry(1, 1, s)
       ..setEntry(0, 3, tx)
       ..setEntry(1, 3, ty);
-    _transform.value = m;
-    setState(() => _scale = s);
+    _animateToMatrix(m, animate: animate);
   }
 
-  void _zoomBy(double factor) {
-    final next = (_scale * factor).clamp(0.35, 2.0);
+  void _fitToView({bool animate = true}) =>
+      _fitNodes(_ctrl.displayNodes, animate: animate);
+
+  void _fitToSelection() {
+    if (_selectedNodeIds.isEmpty) {
+      _fitToView();
+      return;
+    }
+    final selected = [
+      for (final n in _ctrl.displayNodes)
+        if (_selectedNodeIds.contains(n.id)) n,
+    ];
+    _fitNodes(selected);
+  }
+
+  void _resetZoom100() {
     final center = Offset(_viewportSize.width / 2, _viewportSize.height / 2);
+    final sceneCenter = _transform.toScene(center);
+    final m = Matrix4.identity()
+      ..setEntry(0, 3, center.dx - sceneCenter.dx)
+      ..setEntry(1, 3, center.dy - sceneCenter.dy);
+    _animateToMatrix(m);
+  }
+
+  void _zoomBy(double factor, {Offset? focalViewport}) {
+    final next = (_currentScale * factor).clamp(0.25, 2.5);
+    final center =
+        focalViewport ??
+        Offset(_viewportSize.width / 2, _viewportSize.height / 2);
     final sceneCenter = _transform.toScene(center);
     final m = Matrix4.identity()
       ..setEntry(0, 0, next)
@@ -360,7 +634,6 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
       ..setEntry(0, 3, center.dx - sceneCenter.dx * next)
       ..setEntry(1, 3, center.dy - sceneCenter.dy * next);
     _transform.value = m;
-    setState(() => _scale = next);
   }
 
   ({String content, String httpUrl}) _defaultsFor(
@@ -377,7 +650,8 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
           isZh
               ? '针对 {{input.bugId}} 执行验证，结尾必须明确输出 VERDICT: PASS 或 VERDICT: FAIL。'
               : 'Verify {{input.bugId}} and end with VERDICT: PASS or VERDICT: FAIL.',
-        CanvasNodeKind.http => '{"status": "开发已确认", "bugId": "{{input.bugId}}"}',
+        CanvasNodeKind.http =>
+          '{"status": "开发已确认", "bugId": "{{input.bugId}}"}',
         CanvasNodeKind.approval =>
           isZh
               ? '请检查上一步输出并确认是否放行：\n\n{{prev.output}}'
@@ -387,39 +661,50 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
         CanvasNodeKind.chat =>
           'Session: ${widget.session?.sessionId ?? "new"}',
         CanvasNodeKind.file => '',
+        CanvasNodeKind.group =>
+          isZh ? '拖动标题框可连同内部节点一起移动' : 'Drag header to move enclosed nodes',
       },
       httpUrl: kind == CanvasNodeKind.http ? 'http://pomeloc.top/bugs/' : '',
     );
   }
 
-  void _addNode(CanvasNodeKind kind, bool isZh) {
+  double _snapVal(double v) =>
+      _snapToGrid ? (v / _gridStep).round() * _gridStep : v;
+
+  void _addNode(CanvasNodeKind kind, bool isZh, {Offset? atScenePos}) {
     if (_ctrl.selectedRunId != null) {
       _ctrl.selectRun(null);
     }
     final cwd = widget.session?.root ?? '';
     final d = _defaultsFor(kind, isZh);
-    final centerScene = _transform.toScene(
-      Offset(_viewportSize.width * 0.35, _viewportSize.height * 0.35),
-    );
-    final jitter = (_ctrl.nodes.length % 5) * 26.0;
+    final basePos =
+        atScenePos ??
+        _transform.toScene(
+          Offset(_viewportSize.width * 0.35, _viewportSize.height * 0.35),
+        );
+    final jitter = atScenePos == null ? (_ctrl.nodes.length % 5) * 26.0 : 0.0;
     final node = _ctrl.addNode(
       kind: kind,
       title: kind.label(isZh),
       refId: cwd,
-      x: (centerScene.dx + jitter).clamp(40, 3200),
-      y: (centerScene.dy + jitter).clamp(40, 2100),
+      x: _snapVal(basePos.dx + jitter).clamp(40.0, CanvasController.maxBoardX),
+      y: _snapVal(basePos.dy + jitter).clamp(40.0, CanvasController.maxBoardY),
       content: d.content,
       httpUrl: d.httpUrl,
     );
-    setState(() => _selectedNodeId = node.id);
+    setState(() {
+      _selectedNodeIds = {node.id};
+      _selectedEdgeId = null;
+    });
   }
 
   void _quickAppendNode(
     String fromId,
     CanvasEdgeBranch branch,
     CanvasNodeKind kind,
-    bool isZh,
-  ) {
+    bool isZh, {
+    Offset? atScenePos,
+  }) {
     final d = _defaultsFor(kind, isZh);
     final created = _ctrl.addConnectedNode(
       fromId: fromId,
@@ -429,14 +714,721 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
       content: d.content,
       refId: widget.session?.root ?? '',
       httpUrl: d.httpUrl,
+      x: atScenePos != null ? _snapVal(atScenePos.dx) : null,
+      y: atScenePos != null ? _snapVal(atScenePos.dy) : null,
     );
     if (created != null) {
       setState(() {
-        _selectedNodeId = created.id;
+        _selectedNodeIds = {created.id};
+        _selectedEdgeId = null;
         _connecting = null;
-        _pointerScenePos = null;
+        _dragWiring = false;
+      });
+      _wirePointerNotifier.value = null;
+    }
+  }
+
+  void _showToast(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message, style: const TextStyle(fontSize: 12)),
+          duration: const Duration(milliseconds: 2200),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+  }
+
+  bool _isTextInputFocused() {
+    final focus = FocusManager.instance.primaryFocus;
+    if (focus == null || focus == _canvasFocusNode) return false;
+    final ctx = focus.context;
+    if (ctx == null) return false;
+    if (ctx.widget is EditableText) return true;
+    return ctx.findAncestorWidgetOfExactType<EditableText>() != null;
+  }
+
+  void _handleNodeDragStart(CanvasNode anchor) {
+    if (_ctrl.selectedRunId != null) return;
+    _ctrl.pushUndoSnapshot();
+    final idsToMove = _selectedNodeIds.contains(anchor.id)
+        ? Set<String>.from(_selectedNodeIds)
+        : {anchor.id};
+
+    // Moving a Group Frame automatically moves cards whose center is inside it.
+    for (final id in List<String>.from(idsToMove)) {
+      final n = _ctrl.nodeById(id);
+      if (n != null && n.kind == CanvasNodeKind.group) {
+        final rect = Rect.fromLTWH(n.x, n.y, n.width, n.height);
+        for (final other in _ctrl.nodes) {
+          if (other.id == n.id || other.kind == CanvasNodeKind.group) continue;
+          final center = Offset(
+            other.x + other.width / 2,
+            other.y + other.height / 2,
+          );
+          if (rect.contains(center)) {
+            idsToMove.add(other.id);
+          }
+        }
+      }
+    }
+
+    _dragAnchorId = anchor.id;
+    _dragAccumDelta = Offset.zero;
+    _dragInitialPositions = {
+      for (final id in idsToMove)
+        if (_ctrl.nodeById(id) case final n?) id: (x: n.x, y: n.y),
+    };
+  }
+
+  void _handleNodeDragUpdate(CanvasNode anchor, Offset viewportDelta) {
+    final initial = _dragInitialPositions;
+    if (initial == null || _dragAnchorId != anchor.id) {
+      _handleNodeDragStart(anchor);
+    }
+    final baseMap = _dragInitialPositions;
+    if (baseMap == null) return;
+    final anchorStart = baseMap[anchor.id];
+    if (anchorStart == null) return;
+
+    final s = _currentScale;
+    _dragAccumDelta += Offset(viewportDelta.dx / s, viewportDelta.dy / s);
+    var targetX = (anchorStart.x + _dragAccumDelta.dx).clamp(
+      0.0,
+      CanvasController.maxBoardX,
+    );
+    var targetY = (anchorStart.y + _dragAccumDelta.dy).clamp(
+      0.0,
+      CanvasController.maxBoardY,
+    );
+
+    const snapTol = 6.5;
+    double? snapX;
+    double? snapY;
+    final guides = <_SnapGuide>[];
+
+    final anchorW = anchor.width;
+    final anchorH = anchor.height;
+    for (final other in _ctrl.nodes) {
+      if (baseMap.containsKey(other.id)) continue;
+      if (other.kind == CanvasNodeKind.group &&
+          anchor.kind != CanvasNodeKind.group) {
+        continue;
+      }
+
+      if (snapX == null) {
+        final pairsX = <(double aOff, double oCoord)>[
+          (0.0, other.x),
+          (anchorW / 2, other.x + other.width / 2),
+          (anchorW, other.x + other.width),
+        ];
+        for (final (aOff, oCoord) in pairsX) {
+          if (((targetX + aOff) - oCoord).abs() <= snapTol) {
+            snapX = oCoord - aOff;
+            guides.add((
+              vertical: true,
+              pos: oCoord,
+              start: math.min(targetY, other.y) - 24,
+              end: math.max(targetY + anchorH, other.y + other.height) + 24,
+            ));
+            break;
+          }
+        }
+      }
+
+      if (snapY == null) {
+        final pairsY = <(double aOff, double oCoord)>[
+          (0.0, other.y),
+          (anchorH / 2, other.y + other.height / 2),
+          (anchorH, other.y + other.height),
+        ];
+        for (final (aOff, oCoord) in pairsY) {
+          if (((targetY + aOff) - oCoord).abs() <= snapTol) {
+            snapY = oCoord - aOff;
+            guides.add((
+              vertical: false,
+              pos: oCoord,
+              start: math.min(targetX, other.x) - 24,
+              end: math.max(targetX + anchorW, other.x + other.width) + 24,
+            ));
+            break;
+          }
+        }
+      }
+      if (snapX != null && snapY != null) break;
+    }
+
+    targetX = snapX ?? _snapVal(targetX);
+    targetY = snapY ?? _snapVal(targetY);
+    final appliedDx = targetX - anchorStart.x;
+    final appliedDy = targetY - anchorStart.y;
+
+    _snapGuidesNotifier.value = guides;
+    _ctrl.setNodePositions({
+      for (final e in baseMap.entries)
+        e.key: (x: e.value.x + appliedDx, y: e.value.y + appliedDy),
+    });
+  }
+
+  void _handleNodeDragEnd() {
+    _dragInitialPositions = null;
+    _dragAnchorId = null;
+    _dragAccumDelta = Offset.zero;
+    _snapGuidesNotifier.value = const [];
+    _ctrl.commitLayout();
+  }
+
+  void _startPortDrag(CanvasNode from, CanvasEdgeBranch branch) {
+    if (_ctrl.selectedRunId != null) return;
+    final start = _outputPortOffset(from, branch);
+    _dragWiring = true;
+    _wireStartScene = start;
+    _wirePointerNotifier.value = start;
+    setState(() {
+      _connecting = (fromId: from.id, branch: branch);
+      _selectedEdgeId = null;
+    });
+  }
+
+  void _updatePortDrag(Offset globalPosition) {
+    if (!_dragWiring || _connecting == null) return;
+    final box = _boardKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null) return;
+    final local = box.globalToLocal(globalPosition);
+    _wirePointerNotifier.value = _transform.toScene(local);
+  }
+
+  Future<void> _endPortDrag(Offset globalPosition, bool isZh) async {
+    final conn = _connecting;
+    if (!_dragWiring || conn == null) return;
+    _dragWiring = false;
+    final dropScene = _wirePointerNotifier.value;
+    final startScene = _wireStartScene;
+    _wireStartScene = null;
+
+    if (dropScene == null) return;
+
+    CanvasNode? hitNode;
+    for (final n in _ctrl.nodes.reversed) {
+      if (n.id == conn.fromId || !n.kind.isExecutable) continue;
+      final hitRect = Rect.fromLTWH(
+        n.x - 14,
+        n.y - 10,
+        n.width + 28,
+        n.height + 20,
+      );
+      if (hitRect.contains(dropScene)) {
+        hitNode = n;
+        break;
+      }
+    }
+
+    if (hitNode != null) {
+      final edge = _ctrl.connect(conn.fromId, hitNode.id, branch: conn.branch);
+      setState(() {
+        _connecting = null;
+        if (edge != null) {
+          _selectedNodeIds = {hitNode!.id};
+        }
+      });
+      _wirePointerNotifier.value = null;
+      if (edge == null) {
+        _showToast(
+          isZh
+              ? '无法连接：目标连线会形成环形依赖 (DAG 不允许成环)'
+              : 'Cannot connect: edge would introduce a cycle.',
+        );
+      }
+      return;
+    }
+
+    if (startScene != null && (dropScene - startScene).distance > 28) {
+      final pickedKind = await CanvasContextMenu.showDropCreateNodeMenu(
+        context,
+        globalPos: globalPosition,
+        isZh: isZh,
+      );
+      if (!mounted) return;
+      if (pickedKind != null) {
+        _quickAppendNode(
+          conn.fromId,
+          conn.branch,
+          pickedKind,
+          isZh,
+          atScenePos: Offset(dropScene.dx, math.max(20.0, dropScene.dy - 70)),
+        );
+        return;
+      }
+    }
+
+    setState(() => _connecting = null);
+    _wirePointerNotifier.value = null;
+  }
+
+  void _copySelected() {
+    if (_selectedNodeIds.isEmpty) return;
+    _copiedNodes = [
+      for (final n in _ctrl.nodes)
+        if (_selectedNodeIds.contains(n.id)) n.clone(),
+    ];
+    _copiedEdges = [
+      for (final e in _ctrl.edges)
+        if (_selectedNodeIds.contains(e.fromId) &&
+            _selectedNodeIds.contains(e.toId))
+          e,
+    ];
+  }
+
+  void _pasteCopied({Offset? atScenePos}) {
+    if (_ctrl.selectedRunId != null || _copiedNodes.isEmpty) return;
+    double dx = 44;
+    double dy = 44;
+    if (atScenePos != null) {
+      final minX = _copiedNodes.map((n) => n.x).reduce(math.min);
+      final minY = _copiedNodes.map((n) => n.y).reduce(math.min);
+      dx = _snapVal(atScenePos.dx - minX);
+      dy = _snapVal(atScenePos.dy - minY);
+    }
+    final created = _ctrl.pasteNodes(_copiedNodes, _copiedEdges, dx: dx, dy: dy);
+    if (created.isNotEmpty) {
+      setState(() {
+        _selectedNodeIds = {for (final n in created) n.id};
+        _selectedEdgeId = null;
       });
     }
+  }
+
+  void _duplicateSelected() {
+    if (_ctrl.selectedRunId != null || _selectedNodeIds.isEmpty) return;
+    final created = _ctrl.duplicateNodes(_selectedNodeIds);
+    if (created.isNotEmpty) {
+      setState(() {
+        _selectedNodeIds = {for (final n in created) n.id};
+        _selectedEdgeId = null;
+      });
+    }
+  }
+
+  void _deleteSelected() {
+    if (_ctrl.selectedRunId != null) return;
+    if (_selectedEdgeId != null) {
+      final eid = _selectedEdgeId!;
+      setState(() => _selectedEdgeId = null);
+      _ctrl.removeEdge(eid);
+      return;
+    }
+    if (_selectedNodeIds.isEmpty) return;
+    final ids = Set<String>.from(_selectedNodeIds);
+    setState(() => _selectedNodeIds = {});
+    _ctrl.removeNodes(ids);
+  }
+
+  void _nudgeSelected(double dx, double dy) {
+    if (_ctrl.selectedRunId != null || _selectedNodeIds.isEmpty) return;
+    _ctrl.pushUndoSnapshot();
+    _ctrl.moveNodes(_selectedNodeIds, dx, dy);
+    _ctrl.commitLayout();
+  }
+
+  Future<void> _openSearchPalette(bool isZh) async {
+    final picked = await showCanvasSearchPalette(
+      context,
+      nodes: _ctrl.displayNodes,
+      isZh: isZh,
+      kindIcon: _kindIcon,
+    );
+    if (!mounted || picked == null) return;
+    setState(() {
+      _selectedNodeIds = {picked.id};
+      _selectedEdgeId = null;
+    });
+    _focusNode(picked);
+  }
+
+  Future<void> _openAiGeneratorDialog(bool isZh) async {
+    if (_ctrl.selectedRunId != null) {
+      _ctrl.selectRun(null);
+    }
+    final applied = await showCanvasAiWorkflowDialog(
+      context,
+      ctrl: _ctrl,
+      isZh: isZh,
+      cwd: widget.session?.root,
+    );
+    if (!mounted || !applied) return;
+    setState(() {
+      _selectedNodeIds = _ctrl.nodes.isEmpty ? {} : {_ctrl.nodes.first.id};
+      _selectedEdgeId = null;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) => _fitToView());
+  }
+
+  Future<void> _openJsonIoDialog(bool isZh) async {
+    final imported = await showCanvasJsonDialog(
+      context,
+      ctrl: _ctrl,
+      isZh: isZh,
+      defaultDir: widget.session?.root,
+    );
+    if (!mounted || !imported) return;
+    setState(() {
+      _selectedNodeIds = _ctrl.nodes.isEmpty ? {} : {_ctrl.nodes.first.id};
+      _selectedEdgeId = null;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) => _fitToView());
+  }
+
+  Future<void> _promptNewOrRenameWorkflow({
+    required bool isZh,
+    required bool rename,
+  }) async {
+    final nameCtrl = TextEditingController(
+      text: rename
+          ? _ctrl.activeWorkflowName
+          : (isZh
+                ? '工作流 ${_ctrl.workflows.length + 1}'
+                : 'Workflow ${_ctrl.workflows.length + 1}'),
+    );
+    final res = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(
+          rename
+              ? (isZh ? '重命名当前工作流' : 'Rename Workflow')
+              : (isZh ? '新建空白工作流' : 'New Workflow'),
+        ),
+        content: SizedBox(
+          width: 340,
+          child: IdeInputBox(
+            controller: nameCtrl,
+            placeholder: isZh ? '输入工作流名称…' : 'Workflow name...',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: Text(isZh ? '取消' : 'Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(nameCtrl.text.trim()),
+            child: Text(isZh ? '确定' : 'OK'),
+          ),
+        ],
+      ),
+    );
+    nameCtrl.dispose();
+    if (!mounted || res == null || res.isEmpty) return;
+    if (rename) {
+      _ctrl.renameActiveWorkflow(res);
+    } else {
+      _ctrl.createWorkflow(res);
+      setState(() {
+        _selectedNodeIds = {};
+        _selectedEdgeId = null;
+      });
+    }
+  }
+
+  Future<void> _handleBoardContextMenu(
+    Offset globalPos,
+    Offset localViewportPos,
+    bool isZh,
+  ) async {
+    final scenePos = _transform.toScene(localViewportPos);
+    final action = await CanvasContextMenu.showBoardMenu(
+      context,
+      globalPos: globalPos,
+      isZh: isZh,
+      hasClipboard: _copiedNodes.isNotEmpty,
+      snapToGrid: _snapToGrid,
+      showMinimap: _showMinimap,
+      readOnly: _ctrl.selectedRunId != null,
+    );
+    if (!mounted || action == null) return;
+    if (action.startsWith('add:')) {
+      final kind = CanvasNodeKind.parse(action.substring(4));
+      _addNode(kind, isZh, atScenePos: scenePos);
+    } else if (action == 'paste') {
+      _pasteCopied(atScenePos: scenePos);
+    } else if (action == 'ai_generate') {
+      unawaited(_openAiGeneratorDialog(isZh));
+    } else if (action == 'auto_layout') {
+      _ctrl.autoLayout();
+      WidgetsBinding.instance.addPostFrameCallback((_) => _fitToView());
+    } else if (action == 'select_all') {
+      setState(() {
+        _selectedNodeIds = {for (final n in _ctrl.displayNodes) n.id};
+        _selectedEdgeId = null;
+      });
+    } else if (action == 'search') {
+      unawaited(_openSearchPalette(isZh));
+    } else if (action == 'fit_view') {
+      _fitToView();
+    } else if (action == 'toggle_snap') {
+      setState(() => _snapToGrid = !_snapToGrid);
+    } else if (action == 'toggle_minimap') {
+      setState(() => _showMinimap = !_showMinimap);
+    } else if (action == 'json_io') {
+      unawaited(_openJsonIoDialog(isZh));
+    }
+  }
+
+  Future<void> _handleNodeContextMenu(
+    Offset globalPos,
+    CanvasNode node,
+    bool isZh,
+  ) async {
+    if (!_selectedNodeIds.contains(node.id)) {
+      setState(() {
+        _selectedNodeIds = {node.id};
+        _selectedEdgeId = null;
+      });
+    }
+    final isRunView = _ctrl.selectedRunId != null;
+    final action = await CanvasContextMenu.showNodeMenu(
+      context,
+      globalPos: globalPos,
+      node: node,
+      selectionCount: _selectedNodeIds.length,
+      isZh: isZh,
+      readOnly: isRunView,
+    );
+    if (!mounted || action == null) return;
+    if (action == 'test_step') {
+      _startSingleStep(node);
+    } else if (action == 'run_from_here') {
+      final viewingRun = _ctrl.selectedRun;
+      if (viewingRun != null && !viewingRun.running) {
+        _resumeRunFromNode(viewingRun, node.id);
+      } else if (!isRunView) {
+        _runEditorFromNode(node.id);
+      }
+    } else if (action == 'ai_assist') {
+      final updated = await showCanvasNodeAiAssistDialog(
+        context,
+        node: node,
+        availableVars: _availableTemplateVars(),
+        isZh: isZh,
+        cwd: widget.session?.root,
+      );
+      if (mounted && updated != null) {
+        if (node.kind == CanvasNodeKind.condition) {
+          _ctrl.updateNode(node.id, conditionExpr: updated.trim());
+        } else {
+          _ctrl.updateNode(node.id, content: updated);
+        }
+      }
+    } else if (action == 'copy') {
+      _copySelected();
+    } else if (action == 'duplicate') {
+      _duplicateSelected();
+    } else if (action.startsWith('align:')) {
+      final alignName = action.substring(6);
+      final align = CanvasNodeAlignment.values.asNameMap()[alignName];
+      if (align != null) {
+        _ctrl.alignNodes(_selectedNodeIds, align);
+      }
+    } else if (action == 'delete') {
+      _deleteSelected();
+    }
+  }
+
+  Future<void> _handleEdgeContextMenu(
+    Offset globalPos,
+    CanvasEdge edge,
+    bool isZh,
+  ) async {
+    if (_ctrl.selectedRunId != null) return;
+    final action = await CanvasContextMenu.showEdgeMenu(
+      context,
+      globalPos: globalPos,
+      edge: edge,
+      isZh: isZh,
+    );
+    if (!mounted || action == null) return;
+    if (action.startsWith('insert:')) {
+      final kind = CanvasNodeKind.parse(action.substring(7));
+      final created = _ctrl.insertNodeOnEdge(
+        edge.id,
+        kind,
+        title: kind.label(isZh),
+      );
+      if (created != null) {
+        final d = _defaultsFor(kind, isZh);
+        _ctrl.updateNode(
+          created.id,
+          content: d.content,
+          httpUrl: d.httpUrl,
+        );
+        setState(() {
+          _selectedNodeIds = {created.id};
+          _selectedEdgeId = null;
+        });
+      }
+    } else if (action.startsWith('branch:')) {
+      final branch = CanvasEdgeBranch.parse(action.substring(7));
+      _ctrl.reconnectEdge(edge.id, branch: branch);
+    } else if (action == 'delete') {
+      setState(() => _selectedEdgeId = null);
+      _ctrl.removeEdge(edge.id);
+    }
+  }
+
+  List<String> _availableTemplateVars() {
+    final vars = <String>[
+      '{{prev.output}}',
+      '{{prev.exitCode}}',
+      '{{approval.note}}',
+      '{{input.root}}',
+    ];
+    for (final n in _ctrl.displayNodes) {
+      if (n.kind == CanvasNodeKind.trigger) {
+        for (final k in CanvasController.parseKeyValueLines(n.content).keys) {
+          final tok = '{{input.$k}}';
+          if (!vars.contains(tok)) vars.add(tok);
+        }
+      }
+    }
+    return vars;
+  }
+
+  CanvasEdge? _hitTestEdge(Offset scenePos) {
+    final nodes = _ctrl.displayNodes;
+    final byId = {for (final n in nodes) n.id: n};
+    CanvasEdge? best;
+    var bestDist = 14.0;
+    for (final edge in _ctrl.displayEdges) {
+      final from = byId[edge.fromId];
+      final to = byId[edge.toId];
+      if (from == null || to == null) continue;
+      final geom = _computeEdgeGeometry(from, to, edge.branch);
+      for (var i = 1; i <= 16; i++) {
+        final pt = _cubicPoint(geom.p0, geom.c1, geom.c2, geom.p3, i / 17.0);
+        final d = (pt - scenePos).distance;
+        if (d < bestDist) {
+          bestDist = d;
+          best = edge;
+        }
+      }
+    }
+    return best;
+  }
+
+  KeyEventResult _handleCanvasKeyEvent(FocusNode node, KeyEvent event) {
+    if (event.logicalKey == LogicalKeyboardKey.space) {
+      if (event is KeyDownEvent && !_isTextInputFocused()) {
+        if (!_spacePanning) setState(() => _spacePanning = true);
+        return KeyEventResult.handled;
+      }
+      if (event is KeyUpEvent && _spacePanning) {
+        setState(() => _spacePanning = false);
+        return KeyEventResult.handled;
+      }
+    }
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+
+    final isZh = Localizations.localeOf(context).languageCode == 'zh';
+    final key = event.logicalKey;
+    final mod =
+        HardwareKeyboard.instance.isControlPressed ||
+        HardwareKeyboard.instance.isMetaPressed;
+    final shift = HardwareKeyboard.instance.isShiftPressed;
+
+    if (key == LogicalKeyboardKey.escape) {
+      if (_connecting != null) {
+        setState(() {
+          _connecting = null;
+          _dragWiring = false;
+        });
+        _wirePointerNotifier.value = null;
+        return KeyEventResult.handled;
+      }
+      if (_selectedNodeIds.isNotEmpty || _selectedEdgeId != null) {
+        setState(() {
+          _selectedNodeIds = {};
+          _selectedEdgeId = null;
+        });
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    }
+
+    if (mod &&
+        (key == LogicalKeyboardKey.keyK || key == LogicalKeyboardKey.keyF)) {
+      unawaited(_openSearchPalette(isZh));
+      return KeyEventResult.handled;
+    }
+
+    if (_isTextInputFocused()) return KeyEventResult.ignored;
+
+    if (mod && key == LogicalKeyboardKey.keyZ) {
+      if (shift) {
+        _ctrl.redo();
+      } else {
+        _ctrl.undo();
+      }
+      return KeyEventResult.handled;
+    }
+    if (mod && key == LogicalKeyboardKey.keyY) {
+      _ctrl.redo();
+      return KeyEventResult.handled;
+    }
+    if (mod && key == LogicalKeyboardKey.keyA) {
+      setState(() {
+        _selectedNodeIds = {for (final n in _ctrl.displayNodes) n.id};
+        _selectedEdgeId = null;
+      });
+      return KeyEventResult.handled;
+    }
+    if (mod && key == LogicalKeyboardKey.keyC) {
+      _copySelected();
+      return KeyEventResult.handled;
+    }
+    if (mod && key == LogicalKeyboardKey.keyV) {
+      _pasteCopied();
+      return KeyEventResult.handled;
+    }
+    if (mod && key == LogicalKeyboardKey.keyD) {
+      _duplicateSelected();
+      return KeyEventResult.handled;
+    }
+    if (mod && key == LogicalKeyboardKey.digit0) {
+      _resetZoom100();
+      return KeyEventResult.handled;
+    }
+    if (shift && !mod && key == LogicalKeyboardKey.digit1) {
+      _fitToView();
+      return KeyEventResult.handled;
+    }
+    if (shift && !mod && key == LogicalKeyboardKey.digit2) {
+      _fitToSelection();
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.delete ||
+        key == LogicalKeyboardKey.backspace) {
+      _deleteSelected();
+      return KeyEventResult.handled;
+    }
+    final step = shift ? _gridStep : 4.0;
+    if (key == LogicalKeyboardKey.arrowLeft) {
+      _nudgeSelected(-step, 0);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowRight) {
+      _nudgeSelected(step, 0);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowUp) {
+      _nudgeSelected(0, -step);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowDown) {
+      _nudgeSelected(0, step);
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
   }
 
   Future<void> _saveTemplateDialog(bool isZh) async {
@@ -479,7 +1471,10 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
         ctrl: _ctrl,
         isZh: isZh,
         onSelectNode: (id) {
-          setState(() => _selectedNodeId = id);
+          setState(() {
+            _selectedNodeIds = {id};
+            _selectedEdgeId = null;
+          });
         },
       ),
     );
@@ -526,10 +1521,12 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
     );
     if (choice == 0) {
       setState(() {
-        _selectedNodeId = null;
+        _selectedNodeIds = {};
+        _selectedEdgeId = null;
         _connecting = null;
-        _pointerScenePos = null;
+        _dragWiring = false;
       });
+      _wirePointerNotifier.value = null;
       _ctrl.clearBoard();
     }
   }
@@ -547,19 +1544,10 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
         ? Colors.white.withValues(alpha: 0.12)
         : Colors.black.withValues(alpha: 0.09);
 
-    return CallbackShortcuts(
-      bindings: {
-        const SingleActivator(LogicalKeyboardKey.escape): () {
-          if (_connecting != null) {
-            setState(() {
-              _connecting = null;
-              _pointerScenePos = null;
-            });
-          } else if (_selectedNodeId != null) {
-            setState(() => _selectedNodeId = null);
-          }
-        },
-      },
+    return Focus(
+      focusNode: _canvasFocusNode,
+      autofocus: true,
+      onKeyEvent: _handleCanvasKeyEvent,
       child: ListenableBuilder(
         listenable: _ctrl,
         builder: (context, _) {
@@ -567,9 +1555,9 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
           final isRunView = viewingRun != null;
           final nodes = _ctrl.displayNodes;
           final edges = _ctrl.displayEdges;
-          final selectedNode = _selectedNodeId == null
+          final selectedNode = _primarySelectedNodeId == null
               ? null
-              : _ctrl.displayNodeById(_selectedNodeId!);
+              : _ctrl.displayNodeById(_primarySelectedNodeId!);
           final approvalNode = _ctrl.activeApprovalNodeId == null
               ? null
               : _ctrl.displayNodeById(_ctrl.activeApprovalNodeId!);
@@ -617,6 +1605,204 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                           Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
+                              // Multi-Workflow Document Switcher
+                              PopupMenuButton<String>(
+                                tooltip: isZh
+                                    ? '切换或管理多条工作流画布'
+                                    : 'Switch or manage workflow documents',
+                                offset: const Offset(0, 38),
+                                color: menuBg,
+                                surfaceTintColor: Colors.transparent,
+                                elevation: 12,
+                                constraints: const BoxConstraints(
+                                  minWidth: 230,
+                                  maxWidth: 320,
+                                ),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(11),
+                                  side: BorderSide(color: menuBorder),
+                                ),
+                                onSelected: (val) {
+                                  if (val == '__new__') {
+                                    unawaited(
+                                      _promptNewOrRenameWorkflow(
+                                        isZh: isZh,
+                                        rename: false,
+                                      ),
+                                    );
+                                  } else if (val == '__rename__') {
+                                    unawaited(
+                                      _promptNewOrRenameWorkflow(
+                                        isZh: isZh,
+                                        rename: true,
+                                      ),
+                                    );
+                                  } else if (val == '__delete__') {
+                                    _ctrl.deleteWorkflow(
+                                      _ctrl.activeWorkflowId,
+                                    );
+                                    setState(() {
+                                      _selectedNodeIds = {};
+                                      _selectedEdgeId = null;
+                                    });
+                                    WidgetsBinding.instance
+                                        .addPostFrameCallback(
+                                          (_) => _fitToView(),
+                                        );
+                                  } else if (val.startsWith('wf:')) {
+                                    _ctrl.switchWorkflow(val.substring(3));
+                                    setState(() {
+                                      _selectedNodeIds = {};
+                                      _selectedEdgeId = null;
+                                    });
+                                    WidgetsBinding.instance
+                                        .addPostFrameCallback(
+                                          (_) => _fitToView(),
+                                        );
+                                  }
+                                },
+                                itemBuilder: (_) => [
+                                  for (final w in _ctrl.workflows)
+                                    PopupMenuItem(
+                                      value: 'wf:${w.id}',
+                                      height: 36,
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 12,
+                                      ),
+                                      child: Row(
+                                        children: [
+                                          Icon(
+                                            w.id == _ctrl.activeWorkflowId
+                                                ? Codicons.check
+                                                : Codicons.layers,
+                                            size: 13,
+                                            color:
+                                                w.id == _ctrl.activeWorkflowId
+                                                ? const Color(0xFF2563EB)
+                                                : colors[
+                                                      'descriptionForeground'],
+                                          ),
+                                          const SizedBox(width: 8),
+                                          Expanded(
+                                            child: Text(
+                                              w.name,
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: TextStyle(
+                                                fontSize: 12,
+                                                fontWeight:
+                                                    w.id ==
+                                                        _ctrl.activeWorkflowId
+                                                    ? FontWeight.w600
+                                                    : FontWeight.w400,
+                                                color: colors['foreground'],
+                                              ),
+                                            ),
+                                          ),
+                                          Text(
+                                            '${w.nodes.length}',
+                                            style: TextStyle(
+                                              fontSize: 10.5,
+                                              color: colors[
+                                                  'descriptionForeground'],
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  const PopupMenuDivider(height: 8),
+                                  PopupMenuItem(
+                                    value: '__new__',
+                                    height: 34,
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 12,
+                                    ),
+                                    child: Row(
+                                      children: [
+                                        const Icon(
+                                          Codicons.add,
+                                          size: 13,
+                                          color: Color(0xFF2563EB),
+                                        ),
+                                        const SizedBox(width: 8),
+                                        Text(
+                                          isZh ? '新建空白工作流…' : 'New Workflow...',
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            color: colors['foreground'],
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  PopupMenuItem(
+                                    value: '__rename__',
+                                    height: 34,
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 12,
+                                    ),
+                                    child: Row(
+                                      children: [
+                                        Icon(
+                                          Codicons.edit,
+                                          size: 13,
+                                          color: colors['foreground'],
+                                        ),
+                                        const SizedBox(width: 8),
+                                        Text(
+                                          isZh
+                                              ? '重命名当前工作流…'
+                                              : 'Rename Current...',
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            color: colors['foreground'],
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  if (_ctrl.workflows.length > 1)
+                                    PopupMenuItem(
+                                      value: '__delete__',
+                                      height: 34,
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 12,
+                                      ),
+                                      child: Row(
+                                        children: [
+                                          const Icon(
+                                            Codicons.trash,
+                                            size: 13,
+                                            color: Color(0xFFDC2626),
+                                          ),
+                                          const SizedBox(width: 8),
+                                          Text(
+                                            isZh
+                                                ? '删除当前工作流'
+                                                : 'Delete Workflow',
+                                            style: const TextStyle(
+                                              fontSize: 12,
+                                              color: Color(0xFFDC2626),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                ],
+                                child: ConstrainedBox(
+                                  constraints: const BoxConstraints(
+                                    maxWidth: 158,
+                                  ),
+                                  child: _ToolbarPill(
+                                    icon: Codicons.layers,
+                                    label: _ctrl.activeWorkflowName.isEmpty
+                                        ? (isZh ? '默认工作流' : 'Workflow')
+                                        : _ctrl.activeWorkflowName,
+                                    chevron: true,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 6),
                               // Primary Run / Stop / Re-run Pill
                               _RunWorkflowButton(
                                 running: currentRunActive,
@@ -822,6 +2008,7 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                                     CanvasNodeKind.http,
                                     CanvasNodeKind.condition,
                                     CanvasNodeKind.approval,
+                                    CanvasNodeKind.group,
                                     CanvasNodeKind.note,
                                   ])
                                     PopupMenuItem(
@@ -920,10 +2107,14 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                                       defaultCwd: widget.session?.root,
                                     );
                                     setState(() {
-                                      _selectedNodeId =
-                                          _ctrl.nodes.firstOrNull?.id;
+                                      final first = _ctrl.nodes.firstOrNull?.id;
+                                      _selectedNodeIds = first == null
+                                          ? {}
+                                          : {first};
+                                      _selectedEdgeId = null;
                                       _connecting = null;
                                     });
+                                    _wirePointerNotifier.value = null;
                                     WidgetsBinding.instance
                                         .addPostFrameCallback(
                                           (_) => _fitToView(),
@@ -1099,6 +2290,56 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                                 ),
                               ),
                               const SizedBox(width: 6),
+                              // AI Workflow Generator Button
+                              Tooltip(
+                                message: isZh
+                                    ? '用自然语言让 AI 自动生成或改造整条可执行工作流'
+                                    : 'Generate or modify workflow with AI',
+                                child: InkWell(
+                                  borderRadius: BorderRadius.circular(7),
+                                  onTap: () => unawaited(
+                                    _openAiGeneratorDialog(isZh),
+                                  ),
+                                  child: Container(
+                                    height: 30,
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 9,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: const Color(0xFF8B5CF6).withValues(
+                                        alpha: dark ? 0.2 : 0.1,
+                                      ),
+                                      borderRadius: BorderRadius.circular(7),
+                                      border: Border.all(
+                                        color: const Color(0xFF8B5CF6)
+                                            .withValues(alpha: 0.45),
+                                      ),
+                                    ),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        const Icon(
+                                          Codicons.wand,
+                                          size: 13,
+                                          color: Color(0xFF8B5CF6),
+                                        ),
+                                        const SizedBox(width: 5),
+                                        Text(
+                                          isZh ? 'AI 生成' : 'AI Build',
+                                          style: TextStyle(
+                                            fontSize: 11.5,
+                                            fontWeight: FontWeight.w600,
+                                            color: dark
+                                                ? const Color(0xFFC4B5FD)
+                                                : const Color(0xFF6D28D9),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 6),
                               // Workflow & Per-Node Model Config Button
                               Tooltip(
                                 message: isZh
@@ -1113,7 +2354,8 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                                     icon: Codicons.hubot,
                                     label: _workflowModelBadgeLabel(isZh),
                                     chevron: true,
-                                    active: _ctrl.defaultModel.isNotEmpty ||
+                                    active:
+                                        _ctrl.defaultModel.isNotEmpty ||
                                         _ctrl.nodes.any(
                                           (n) =>
                                               n.kind == CanvasNodeKind.agent &&
@@ -1129,6 +2371,95 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                           Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
+                              // Undo / Redo group
+                              if (!isRunView) ...[
+                                _ToolbarIconBtn(
+                                  icon: Codicons.discard,
+                                  tooltip: isZh ? '撤销 (Ctrl+Z)' : 'Undo (Ctrl+Z)',
+                                  enabled: _ctrl.canUndo,
+                                  onTap: _ctrl.undo,
+                                ),
+                                const SizedBox(width: 3),
+                                _ToolbarIconBtn(
+                                  icon: Codicons.redo,
+                                  tooltip: isZh ? '重做 (Ctrl+Y)' : 'Redo (Ctrl+Y)',
+                                  enabled: _ctrl.canRedo,
+                                  onTap: _ctrl.redo,
+                                ),
+                                const SizedBox(width: 6),
+                              ],
+                              // Box-select vs Pan mode toggle
+                              _ToolbarIconBtn(
+                                icon: Codicons.selection,
+                                tooltip: _marqueeMode
+                                    ? (isZh
+                                          ? '当前为框选模式（按住空格可平移，点击切回拖拽平移）'
+                                          : 'Box-Select mode (hold Space to pan)')
+                                    : (isZh
+                                          ? '切换框选多选模式（也可按住 Shift 框选）'
+                                          : 'Toggle Box-Select mode (or Shift+Drag)'),
+                                active: _marqueeMode,
+                                onTap: () => setState(
+                                  () => _marqueeMode = !_marqueeMode,
+                                ),
+                              ),
+                              const SizedBox(width: 3),
+                              // Snap-to-grid toggle
+                              _ToolbarIconBtn(
+                                icon: Codicons.magnet,
+                                tooltip: isZh
+                                    ? '网格吸附 22px（${_snapToGrid ? "已开启" : "已关闭"}）'
+                                    : 'Snap to 22px grid',
+                                active: _snapToGrid,
+                                onTap: () =>
+                                    setState(() => _snapToGrid = !_snapToGrid),
+                              ),
+                              const SizedBox(width: 3),
+                              // Auto-follow active node toggle
+                              _ToolbarIconBtn(
+                                icon: Codicons.target,
+                                tooltip: isZh
+                                    ? '运行时自动跟随焦点镜头（${_autoFollowActiveNode ? "已开启" : "已关闭"}）'
+                                    : 'Auto-follow active node during run',
+                                active: _autoFollowActiveNode,
+                                onTap: () => setState(
+                                  () => _autoFollowActiveNode =
+                                      !_autoFollowActiveNode,
+                                ),
+                              ),
+                              const SizedBox(width: 3),
+                              // Search palette (Ctrl+K)
+                              _ToolbarIconBtn(
+                                icon: Codicons.search,
+                                tooltip: isZh
+                                    ? '搜索并定位节点 (Ctrl+K)'
+                                    : 'Search nodes (Ctrl+K)',
+                                onTap: () => unawaited(_openSearchPalette(isZh)),
+                              ),
+                              const SizedBox(width: 3),
+                              // Portable JSON Import/Export
+                              if (!isRunView) ...[
+                                _ToolbarIconBtn(
+                                  icon: Codicons.json,
+                                  tooltip: isZh
+                                      ? '导入 / 导出工作流 JSON'
+                                      : 'Import / Export Workflow JSON',
+                                  onTap: () => unawaited(_openJsonIoDialog(isZh)),
+                                ),
+                                const SizedBox(width: 3),
+                              ],
+                              // Minimap toggle
+                              _ToolbarIconBtn(
+                                icon: Codicons.map,
+                                tooltip: isZh
+                                    ? '显示 / 隐藏右下角小地图'
+                                    : 'Toggle Minimap',
+                                active: _showMinimap,
+                                onTap: () => setState(
+                                  () => _showMinimap = !_showMinimap,
+                                ),
+                              ),
+                              const SizedBox(width: 6),
                               Tooltip(
                                 message: isZh
                                     ? '按 DAG 层级一键自动排版'
@@ -1145,25 +2476,25 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                                   },
                                   child: _ToolbarPill(
                                     icon: Codicons.layout,
-                                    label: isZh ? '自动排版' : 'Layout',
+                                    label: isZh ? '排版' : 'Layout',
                                   ),
                                 ),
                               ),
-                              const SizedBox(width: 6),
+                              const SizedBox(width: 5),
                               Tooltip(
                                 message: isZh
-                                    ? '居中并缩放显示所有节点'
-                                    : 'Fit all nodes in view',
+                                    ? '居中并缩放显示所有节点 (Shift+1)'
+                                    : 'Fit all nodes (Shift+1)',
                                 child: InkWell(
                                   borderRadius: BorderRadius.circular(7),
                                   onTap: _fitToView,
                                   child: _ToolbarPill(
                                     icon: Codicons.screenFull,
-                                    label: isZh ? '适配全图' : 'Fit',
+                                    label: isZh ? '适配' : 'Fit',
                                   ),
                                 ),
                               ),
-                              const SizedBox(width: 6),
+                              const SizedBox(width: 5),
                               InkWell(
                                 borderRadius: BorderRadius.circular(7),
                                 onTap: () => setState(
@@ -1175,7 +2506,7 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                                   active: _showLogDrawer,
                                 ),
                               ),
-                              const SizedBox(width: 8),
+                              const SizedBox(width: 6),
                               Container(
                                 height: 30,
                                 padding: const EdgeInsets.symmetric(
@@ -1206,18 +2537,36 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                                         ),
                                       ),
                                     ),
-                                    SizedBox(
-                                      width: 38,
-                                      child: Text(
-                                        '${(_scale * 100).round()}%',
-                                        textAlign: TextAlign.center,
-                                        style: TextStyle(
-                                          fontSize: 11,
-                                          fontWeight: FontWeight.w500,
-                                          color: colors['descriptionForeground'],
-                                          fontFeatures: const [
-                                            FontFeature.tabularFigures(),
-                                          ],
+                                    Tooltip(
+                                      message: isZh
+                                          ? '重置缩放 100% (Ctrl+0)'
+                                          : 'Reset zoom 100% (Ctrl+0)',
+                                      child: InkWell(
+                                        borderRadius: BorderRadius.circular(4),
+                                        onTap: _resetZoom100,
+                                        child: SizedBox(
+                                          width: 40,
+                                          child: ValueListenableBuilder<Matrix4>(
+                                            valueListenable: _transform,
+                                            builder: (context, m, _) {
+                                              final pct =
+                                                  (m.getMaxScaleOnAxis() * 100)
+                                                      .round();
+                                              return Text(
+                                                '$pct%',
+                                                textAlign: TextAlign.center,
+                                                style: TextStyle(
+                                                  fontSize: 11,
+                                                  fontWeight: FontWeight.w500,
+                                                  color: colors[
+                                                      'descriptionForeground'],
+                                                  fontFeatures: const [
+                                                    FontFeature.tabularFigures(),
+                                                  ],
+                                                ),
+                                              );
+                                            },
+                                          ),
                                         ),
                                       ),
                                     ),
@@ -1339,10 +2688,13 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                       IdeButton(
                         label: isZh ? '取消' : 'Cancel',
                         secondary: true,
-                        onPressed: () => setState(() {
-                          _connecting = null;
-                          _pointerScenePos = null;
-                        }),
+                        onPressed: () {
+                          setState(() {
+                            _connecting = null;
+                            _dragWiring = false;
+                          });
+                          _wirePointerNotifier.value = null;
+                        },
                       ),
                     ],
                   ),
@@ -1354,10 +2706,13 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                   ctrl: _ctrl,
                   run: viewingRun,
                   isZh: isZh,
-                  selectedNodeId: _selectedNodeId,
+                  selectedNodeId: _primarySelectedNodeId,
                   showLogDrawer: _showLogDrawer,
                   onSelectAndFocus: (node) {
-                    setState(() => _selectedNodeId = node.id);
+                    setState(() {
+                      _selectedNodeIds = {node.id};
+                      _selectedEdgeId = null;
+                    });
                     _focusNode(node);
                   },
                   onResumeFromNode:
@@ -1373,7 +2728,7 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                       setState(() => _showLogDrawer = !_showLogDrawer),
                 ),
 
-              // Human-in-the-Loop Active Approval Banner
+              // Human-in-the-Loop Active Approval Banner (Responsive Wrap for narrow side panels)
               if (approvalNode != null)
                 Container(
                   padding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
@@ -1390,49 +2745,62 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      Row(
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 6,
+                        crossAxisAlignment: WrapCrossAlignment.center,
                         children: [
-                          const Icon(
-                            Codicons.shield,
-                            size: 15,
-                            color: Color(0xFFD97706),
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              isZh
-                                  ? '⏸ ${viewingRun != null ? "#${viewingRun.id} " : ""}流程暂停在「${approvalNode.title}」等待您的决策'
-                                  : '⏸ ${viewingRun != null ? "#${viewingRun.id} " : ""}Paused at "${approvalNode.title}" for decision',
-                              style: TextStyle(
-                                fontSize: 12.5,
-                                fontWeight: FontWeight.w600,
-                                color: colors['foreground'],
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(
+                                Codicons.shield,
+                                size: 15,
+                                color: Color(0xFFD97706),
                               ),
-                            ),
+                              const SizedBox(width: 7),
+                              ConstrainedBox(
+                                constraints: const BoxConstraints(
+                                  maxWidth: 420,
+                                ),
+                                child: Text(
+                                  isZh
+                                      ? '⏸ ${viewingRun != null ? "#${viewingRun.id} " : ""}流程暂停在「${approvalNode.title}」等待您的决策'
+                                      : '⏸ ${viewingRun != null ? "#${viewingRun.id} " : ""}Paused at "${approvalNode.title}" for decision',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 12.5,
+                                    fontWeight: FontWeight.w600,
+                                    color: colors['foreground'],
+                                  ),
+                                ),
+                              ),
+                            ],
                           ),
                           IdeButton(
                             label: isZh ? '查看研判详情' : 'Inspect',
                             secondary: true,
-                            onPressed: () => setState(
-                              () => _selectedNodeId = approvalNode.id,
-                            ),
+                            onPressed: () => setState(() {
+                              _selectedNodeIds = {approvalNode.id};
+                              _selectedEdgeId = null;
+                            }),
                           ),
-                          if (_resolveEvidenceDir() case final evDir?) ...[
-                            const SizedBox(width: 6),
+                          if (_resolveEvidenceDir() case final evDir?)
                             IdeButton(
                               label: isZh ? '打开留证目录' : 'Evidence',
                               icon: Codicons.folderOpened,
                               secondary: true,
                               onPressed: () {
-                                final d = Directory(evDir);
-                                if (!d.existsSync()) {
-                                  d.createSync(recursive: true);
-                                }
-                                unawaited(Process.run('open', [evDir]));
+                                unawaited(() async {
+                                  final d = Directory(evDir);
+                                  if (!await d.exists()) {
+                                    await d.create(recursive: true);
+                                  }
+                                  await _openPathInOs(evDir);
+                                }());
                               },
                             ),
-                          ],
-                          const SizedBox(width: 6),
                           IdeButton(
                             label: isZh ? '通过放行' : 'Approve',
                             icon: Codicons.check,
@@ -1446,7 +2814,6 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                               );
                             },
                           ),
-                          const SizedBox(width: 6),
                           IdeButton(
                             label: isZh ? '驳回 / 不改 / 转后端' : 'Reject',
                             icon: Codicons.close,
@@ -1464,17 +2831,17 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                         ],
                       ),
                       const SizedBox(height: 7),
-                      Row(
+                      IdeInputBox(
+                        controller: _approvalNoteCtrl,
+                        placeholder: isZh
+                            ? '补充判断意见（将自动传入下游 {{approval.note}}，如：前端修改 / 只改 pdm / 补充清晰描述 / 转后端原因）'
+                            : 'Optional human note passed to {{approval.note}}...',
+                      ),
+                      const SizedBox(height: 6),
+                      Wrap(
+                        spacing: 5,
+                        runSpacing: 5,
                         children: [
-                          Expanded(
-                            child: IdeInputBox(
-                              controller: _approvalNoteCtrl,
-                              placeholder: isZh
-                                  ? '补充判断意见（将自动传入下游 {{approval.note}}，如：前端修改 / 只改 pdm / 补充清晰描述 / 转后端原因）'
-                                  : 'Optional human note passed to {{approval.note}}...',
-                            ),
-                          ),
-                          const SizedBox(width: 8),
                           for (final preset in const [
                             '前端修改(置PR)',
                             '只改 pdm',
@@ -1483,35 +2850,32 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                             '开发已确认(PRCFMD)',
                             '转交测试(QC)',
                           ])
-                            Padding(
-                              padding: const EdgeInsets.only(left: 4),
-                              child: InkWell(
-                                borderRadius: BorderRadius.circular(6),
-                                onTap: () {
-                                  final cur = _approvalNoteCtrl.text.trim();
-                                  _approvalNoteCtrl.text = cur.isEmpty
-                                      ? preset
-                                      : '$cur；$preset';
-                                },
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 8,
-                                    vertical: 4,
+                            InkWell(
+                              borderRadius: BorderRadius.circular(6),
+                              onTap: () {
+                                final cur = _approvalNoteCtrl.text.trim();
+                                _approvalNoteCtrl.text = cur.isEmpty
+                                    ? preset
+                                    : '$cur；$preset';
+                              },
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 4,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: colors['editor.background'],
+                                  borderRadius: BorderRadius.circular(6),
+                                  border: Border.all(
+                                    color: const Color(0xFFD97706)
+                                        .withValues(alpha: 0.4),
                                   ),
-                                  decoration: BoxDecoration(
-                                    color: colors['editor.background'],
-                                    borderRadius: BorderRadius.circular(6),
-                                    border: Border.all(
-                                      color: const Color(0xFFD97706)
-                                          .withValues(alpha: 0.4),
-                                    ),
-                                  ),
-                                  child: Text(
-                                    preset,
-                                    style: TextStyle(
-                                      fontSize: 10.5,
-                                      color: colors['foreground'],
-                                    ),
+                                ),
+                                child: Text(
+                                  preset,
+                                  style: TextStyle(
+                                    fontSize: 10.5,
+                                    color: colors['foreground'],
                                   ),
                                 ),
                               ),
@@ -1527,313 +2891,876 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                 child: LayoutBuilder(
                   builder: (context, areaBox) {
                     final narrow = areaBox.maxWidth < 740;
+                    final boardBounds = CanvasController.computeBoardSize(
+                      nodes,
+                    );
+                    final boardSize = Size(
+                      boardBounds.width,
+                      boardBounds.height,
+                    );
+                    final groupNodes = [
+                      for (final n in nodes)
+                        if (n.kind == CanvasNodeKind.group) n,
+                    ];
+                    final regularNodes = [
+                      for (final n in nodes)
+                        if (n.kind != CanvasNodeKind.group) n,
+                    ];
+                    final layoutVersion = Object.hashAll([
+                      for (final n in nodes)
+                        Object.hash(
+                          n.id,
+                          n.x.round(),
+                          n.y.round(),
+                          n.width.round(),
+                          n.height.round(),
+                          n.runStatus,
+                        ),
+                      for (final e in edges)
+                        Object.hash(e.id, e.fromId, e.toId, e.branch),
+                    ]);
+
                     final board = ColoredBox(
                       color: canvasBg,
                       child: LayoutBuilder(
                         builder: (context, constraints) {
                           _viewportSize = constraints.biggest;
+                          final allowPan =
+                              !_marqueeMode ||
+                              _spacePanning ||
+                              _middleMousePanning;
+
                           return Stack(
                             children: [
                               ClipRect(
-                                child: MouseRegion(
-                                  onHover: (e) {
-                                    if (_connecting != null) {
+                                child: Listener(
+                                  onPointerDown: (e) {
+                                    _canvasFocusNode.requestFocus();
+                                    if (e.buttons == kMiddleMouseButton) {
                                       setState(
-                                        () => _pointerScenePos = _transform
-                                            .toScene(e.localPosition),
+                                        () => _middleMousePanning = true,
                                       );
+                                      return;
+                                    }
+                                    final shiftHeld =
+                                        HardwareKeyboard.instance.isShiftPressed;
+                                    if ((_marqueeMode || shiftHeld) &&
+                                        !_spacePanning &&
+                                        e.buttons == kPrimaryMouseButton) {
+                                      final scenePos = _transform.toScene(
+                                        e.localPosition,
+                                      );
+                                      // Only start marquee if pointer is on empty canvas.
+                                      final hitCard = regularNodes.any(
+                                        (n) => Rect.fromLTWH(
+                                          n.x,
+                                          n.y,
+                                          n.width,
+                                          n.height,
+                                        ).contains(scenePos),
+                                      );
+                                      if (!hitCard) {
+                                        _marqueeOriginScene = scenePos;
+                                        _marqueeRectNotifier.value =
+                                            Rect.fromPoints(scenePos, scenePos);
+                                      }
                                     }
                                   },
-                                  child: GestureDetector(
-                                    onTap: () {
-                                      if (_connecting != null) {
+                                  onPointerMove: (e) {
+                                    if (_marqueeOriginScene != null) {
+                                      final cur = _transform.toScene(
+                                        e.localPosition,
+                                      );
+                                      _marqueeRectNotifier.value =
+                                          Rect.fromPoints(
+                                            _marqueeOriginScene!,
+                                            cur,
+                                          );
+                                    }
+                                  },
+                                  onPointerUp: (_) {
+                                    if (_middleMousePanning) {
+                                      setState(
+                                        () => _middleMousePanning = false,
+                                      );
+                                    }
+                                    final rect = _marqueeRectNotifier.value;
+                                    if (_marqueeOriginScene != null &&
+                                        rect != null) {
+                                      _marqueeOriginScene = null;
+                                      _marqueeRectNotifier.value = null;
+                                      if (rect.width > 6 || rect.height > 6) {
+                                        final picked = <String>{
+                                          for (final n in nodes)
+                                            if (rect.overlaps(
+                                              Rect.fromLTWH(
+                                                n.x,
+                                                n.y,
+                                                n.width,
+                                                n.height,
+                                              ),
+                                            ))
+                                              n.id,
+                                        };
                                         setState(() {
-                                          _connecting = null;
-                                          _pointerScenePos = null;
+                                          _selectedNodeIds = picked;
+                                          _selectedEdgeId = null;
                                         });
                                       }
+                                    }
+                                  },
+                                  child: MouseRegion(
+                                    cursor: _spacePanning || _middleMousePanning
+                                        ? SystemMouseCursors.grab
+                                        : (_marqueeMode
+                                              ? SystemMouseCursors.precise
+                                              : MouseCursor.defer),
+                                    onHover: (e) {
+                                      if (_connecting != null && !_dragWiring) {
+                                        _wirePointerNotifier.value = _transform
+                                            .toScene(e.localPosition);
+                                      }
                                     },
-                                    child: InteractiveViewer(
-                                      key: _boardKey,
-                                      transformationController: _transform,
-                                      constrained: false,
-                                      boundaryMargin: const EdgeInsets.all(800),
-                                      minScale: 0.35,
-                                      maxScale: 2.0,
-                                      child: SizedBox(
-                                        width: 4800,
-                                        height: 2400,
-                                        child: Stack(
-                                          clipBehavior: Clip.none,
-                                          children: [
-                                            Positioned.fill(
-                                              child: CustomPaint(
-                                                painter: _DotGridPainter(
-                                                  dotColor:
-                                                      (dark
-                                                              ? Colors.white
-                                                              : Colors.black)
-                                                          .withValues(
-                                                            alpha: dark
-                                                                ? 0.1
-                                                                : 0.09,
+                                    child: GestureDetector(
+                                      behavior: HitTestBehavior.translucent,
+                                      onTapUp: (d) {
+                                        _canvasFocusNode.requestFocus();
+                                        if (_connecting != null) {
+                                          setState(() {
+                                            _connecting = null;
+                                            _dragWiring = false;
+                                          });
+                                          _wirePointerNotifier.value = null;
+                                          return;
+                                        }
+                                        final scenePos = _transform.toScene(
+                                          d.localPosition,
+                                        );
+                                        final hitEdge = _hitTestEdge(scenePos);
+                                        if (hitEdge != null) {
+                                          setState(() {
+                                            _selectedEdgeId = hitEdge.id;
+                                            _selectedNodeIds = {};
+                                          });
+                                        } else if (_selectedNodeIds
+                                                .isNotEmpty ||
+                                            _selectedEdgeId != null) {
+                                          setState(() {
+                                            _selectedNodeIds = {};
+                                            _selectedEdgeId = null;
+                                          });
+                                        }
+                                      },
+                                      onSecondaryTapUp: (d) {
+                                        _canvasFocusNode.requestFocus();
+                                        final scenePos = _transform.toScene(
+                                          d.localPosition,
+                                        );
+                                        final hitEdge = _hitTestEdge(scenePos);
+                                        if (hitEdge != null && !isRunView) {
+                                          setState(() {
+                                            _selectedEdgeId = hitEdge.id;
+                                            _selectedNodeIds = {};
+                                          });
+                                          unawaited(
+                                            _handleEdgeContextMenu(
+                                              d.globalPosition,
+                                              hitEdge,
+                                              isZh,
+                                            ),
+                                          );
+                                          return;
+                                        }
+                                        unawaited(
+                                          _handleBoardContextMenu(
+                                            d.globalPosition,
+                                            d.localPosition,
+                                            isZh,
+                                          ),
+                                        );
+                                      },
+                                      child: InteractiveViewer(
+                                        key: _boardKey,
+                                        transformationController: _transform,
+                                        constrained: false,
+                                        panEnabled: allowPan,
+                                        boundaryMargin: const EdgeInsets.all(
+                                          1200,
+                                        ),
+                                        minScale: 0.25,
+                                        maxScale: 2.5,
+                                        child: SizedBox(
+                                          width: boardSize.width,
+                                          height: boardSize.height,
+                                          child: Stack(
+                                            clipBehavior: Clip.none,
+                                            children: [
+                                              // 1. Viewport-culled Dot Grid (RepaintBoundary)
+                                              Positioned.fill(
+                                                child: RepaintBoundary(
+                                                  child: CustomPaint(
+                                                    painter: _DotGridPainter(
+                                                      dotColor:
+                                                          (dark
+                                                                  ? Colors.white
+                                                                  : Colors
+                                                                        .black)
+                                                              .withValues(
+                                                                alpha: dark
+                                                                    ? 0.12
+                                                                    : 0.1,
+                                                              ),
+                                                      transform: _transform,
+                                                      viewportSize:
+                                                          _viewportSize,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                              // 2. Group Frames rendered behind edges & workflow cards
+                                              for (final g in groupNodes)
+                                                Positioned(
+                                                  key: ValueKey(
+                                                    '${viewingRun?.id ?? 'edit'}-grp-${g.id}',
+                                                  ),
+                                                  left: g.x,
+                                                  top: g.y,
+                                                  width: g.width,
+                                                  height: g.height,
+                                                  child: RepaintBoundary(
+                                                    child:
+                                                        _CanvasGroupFrameWidget(
+                                                          node: g,
+                                                          readOnly: isRunView,
+                                                          selected:
+                                                              _selectedNodeIds
+                                                                  .contains(
+                                                                    g.id,
+                                                                  ),
+                                                          scaleProvider: () =>
+                                                              _currentScale,
+                                                          onSelect:
+                                                              (toggleMulti) {
+                                                                _canvasFocusNode
+                                                                    .requestFocus();
+                                                                setState(() {
+                                                                  _selectedEdgeId =
+                                                                      null;
+                                                                  if (toggleMulti) {
+                                                                    final next =
+                                                                        Set<
+                                                                          String
+                                                                        >.from(
+                                                                          _selectedNodeIds,
+                                                                        );
+                                                                    if (!next
+                                                                        .remove(
+                                                                          g.id,
+                                                                        )) {
+                                                                      next.add(
+                                                                        g.id,
+                                                                      );
+                                                                    }
+                                                                    _selectedNodeIds =
+                                                                        next;
+                                                                  } else {
+                                                                    _selectedNodeIds =
+                                                                        {g.id};
+                                                                  }
+                                                                });
+                                                              },
+                                                          onDragStart: () =>
+                                                              _handleNodeDragStart(
+                                                                g,
+                                                              ),
+                                                          onDragUpdate:
+                                                              (delta) =>
+                                                                  _handleNodeDragUpdate(
+                                                                    g,
+                                                                    delta,
+                                                                  ),
+                                                          onDragEnd:
+                                                              _handleNodeDragEnd,
+                                                          onSecondaryTapUp:
+                                                              (d) => unawaited(
+                                                                _handleNodeContextMenu(
+                                                                  d.globalPosition,
+                                                                  g,
+                                                                  isZh,
+                                                                ),
+                                                              ),
+                                                        ),
+                                                  ),
+                                                ),
+                                              // 3. Smart Hairpin-Free Bezier Edges (RepaintBoundary)
+                                              Positioned.fill(
+                                                child: IgnorePointer(
+                                                  child: RepaintBoundary(
+                                                    child: CustomPaint(
+                                                      painter:
+                                                          _WorkflowEdgesPainter(
+                                                            nodes: nodes,
+                                                            edges: edges,
+                                                            selectedNodeIds:
+                                                                _selectedNodeIds,
+                                                            selectedEdgeId:
+                                                                _selectedEdgeId,
+                                                            layoutVersion:
+                                                                layoutVersion,
                                                           ),
+                                                    ),
+                                                  ),
                                                 ),
                                               ),
-                                            ),
-                                            // Smart Hairpin-Free Bezier Edges
-                                            Positioned.fill(
-                                              child: IgnorePointer(
-                                                child: CustomPaint(
-                                                  painter:
-                                                      _WorkflowEdgesPainter(
-                                                        nodes: nodes,
-                                                        edges: edges,
-                                                        selectedNodeId:
-                                                            _selectedNodeId,
-                                                        connectingFrom:
-                                                            _connecting,
-                                                        pointerPos:
-                                                            _pointerScenePos,
-                                                      ),
+                                              // 4. Live Connecting Wire Overlay (rebuilds only itself)
+                                              if (_connecting case final conn?)
+                                                Positioned.fill(
+                                                  child: IgnorePointer(
+                                                    child: ValueListenableBuilder<
+                                                      Offset?
+                                                    >(
+                                                      valueListenable:
+                                                          _wirePointerNotifier,
+                                                      builder: (context, pt, _) =>
+                                                          CustomPaint(
+                                                            painter:
+                                                                _LiveWirePainter(
+                                                                  fromNode: _ctrl
+                                                                      .displayNodeById(
+                                                                        conn.fromId,
+                                                                      ),
+                                                                  branch:
+                                                                      conn.branch,
+                                                                  targetPos: pt,
+                                                                ),
+                                                          ),
+                                                    ),
+                                                  ),
                                                 ),
-                                              ),
-                                            ),
-                                            // Exact Curve-Midpoint Edge Pills (only shown in editor mode on fail edges or selected node's edges for an airy, uncluttered board!)
-                                            if (!isRunView)
-                                              for (final edge in edges)
-                                                if (edge.branch ==
-                                                        CanvasEdgeBranch
-                                                            .onFail ||
-                                                    edge.fromId ==
-                                                        _selectedNodeId ||
-                                                    edge.toId ==
-                                                        _selectedNodeId)
-                                                  if (_edgeCurveMidpoint(edge)
-                                                      case final mid?)
-                                                    Positioned(
-                                                      left: mid.dx - 24,
-                                                      top: mid.dy - 10,
-                                                      child: Tooltip(
-                                                        message: isZh
-                                                            ? '点击删除连线'
-                                                            : 'Delete edge',
-                                                        child: InkWell(
-                                                          borderRadius:
-                                                              BorderRadius.circular(
-                                                                10,
-                                                              ),
-                                                          onTap: () => _ctrl
-                                                              .removeEdge(
-                                                                edge.id,
-                                                              ),
-                                                          child: Container(
-                                                            padding:
-                                                                const EdgeInsets.symmetric(
-                                                                  horizontal: 6,
-                                                                  vertical: 2,
-                                                                ),
-                                                            decoration:
-                                                                BoxDecoration(
-                                                                  color: dark
-                                                                      ? const Color(
-                                                                          0xFF1F2228,
-                                                                        )
-                                                                      : Colors
-                                                                            .white,
-                                                                  borderRadius:
-                                                                      BorderRadius.circular(
-                                                                        10,
-                                                                      ),
-                                                                  border: Border.all(
-                                                                    color: _branchColor(
-                                                                      edge.branch,
-                                                                    ).withValues(
-                                                                      alpha:
-                                                                          0.65,
-                                                                    ),
-                                                                    width: 0.9,
+                                              // 5. Figma Magnetic Alignment Guides Overlay
+                                              Positioned.fill(
+                                                child: IgnorePointer(
+                                                  child: ValueListenableBuilder<
+                                                    List<_SnapGuide>
+                                                  >(
+                                                    valueListenable:
+                                                        _snapGuidesNotifier,
+                                                    builder:
+                                                        (context, guides, _) =>
+                                                            CustomPaint(
+                                                              painter:
+                                                                  _SnapGuidesPainter(
+                                                                    guides:
+                                                                        guides,
                                                                   ),
-                                                                  boxShadow: [
-                                                                    BoxShadow(
-                                                                      color: Colors
-                                                                          .black
-                                                                          .withValues(
-                                                                            alpha:
-                                                                                0.08,
-                                                                          ),
-                                                                      blurRadius:
-                                                                          4,
-                                                                      offset:
-                                                                          const Offset(
-                                                                            0,
-                                                                            1,
-                                                                          ),
-                                                                    ),
-                                                                  ],
-                                                                ),
-                                                            child: Row(
-                                                              mainAxisSize:
-                                                                  MainAxisSize
-                                                                      .min,
-                                                              children: [
-                                                                Text(
-                                                                  edge.branch
-                                                                      .label(
-                                                                        isZh,
-                                                                      ),
-                                                                  style: TextStyle(
-                                                                    fontSize:
-                                                                        9.5,
-                                                                    fontWeight:
-                                                                        FontWeight
-                                                                            .w600,
-                                                                    color: _branchColor(
-                                                                      edge.branch,
-                                                                    ),
-                                                                  ),
-                                                                ),
-                                                                const SizedBox(
-                                                                  width: 3,
-                                                                ),
-                                                                Icon(
-                                                                  Codicons
-                                                                      .close,
-                                                                  size: 8.5,
-                                                                  color: colors[
-                                                                      'descriptionForeground'],
-                                                                ),
-                                                              ],
                                                             ),
+                                                  ),
+                                                ),
+                                              ),
+                                              // 6. Marquee Multi-Select Rectangle Overlay
+                                              Positioned.fill(
+                                                child: IgnorePointer(
+                                                  child: ValueListenableBuilder<
+                                                    Rect?
+                                                  >(
+                                                    valueListenable:
+                                                        _marqueeRectNotifier,
+                                                    builder:
+                                                        (context, rect, _) =>
+                                                            CustomPaint(
+                                                              painter:
+                                                                  _MarqueePainter(
+                                                                    rect: rect,
+                                                                  ),
+                                                            ),
+                                                  ),
+                                                ),
+                                              ),
+                                              // 7. Interactive Curve-Midpoint Edge Pills (+ Insert / Branch / Delete)
+                                              if (!isRunView)
+                                                for (final edge in edges)
+                                                  if (edge.id ==
+                                                          _selectedEdgeId ||
+                                                      edge.branch ==
+                                                          CanvasEdgeBranch
+                                                              .onFail ||
+                                                      _selectedNodeIds.contains(
+                                                        edge.fromId,
+                                                      ) ||
+                                                      _selectedNodeIds.contains(
+                                                        edge.toId,
+                                                      ))
+                                                    if (_edgeCurveMidpoint(edge)
+                                                        case final mid?)
+                                                      Positioned(
+                                                        left: mid.dx - 34,
+                                                        top: mid.dy - 11,
+                                                        child: Container(
+                                                          decoration: BoxDecoration(
+                                                            color: dark
+                                                                ? const Color(
+                                                                    0xFF1F2228,
+                                                                  )
+                                                                : Colors.white,
+                                                            borderRadius:
+                                                                BorderRadius.circular(
+                                                                  11,
+                                                                ),
+                                                            border: Border.all(
+                                                              color:
+                                                                  _branchColor(
+                                                                    edge.branch,
+                                                                  ).withValues(
+                                                                    alpha:
+                                                                        edge.id ==
+                                                                            _selectedEdgeId
+                                                                        ? 1.0
+                                                                        : 0.65,
+                                                                  ),
+                                                              width:
+                                                                  edge.id ==
+                                                                      _selectedEdgeId
+                                                                  ? 1.4
+                                                                  : 0.9,
+                                                            ),
+                                                            boxShadow: [
+                                                              BoxShadow(
+                                                                color: Colors
+                                                                    .black
+                                                                    .withValues(
+                                                                      alpha:
+                                                                          0.1,
+                                                                    ),
+                                                                blurRadius: 5,
+                                                                offset:
+                                                                    const Offset(
+                                                                      0,
+                                                                      1,
+                                                                    ),
+                                                              ),
+                                                            ],
+                                                          ),
+                                                          child: Row(
+                                                            mainAxisSize:
+                                                                MainAxisSize
+                                                                    .min,
+                                                            children: [
+                                                              Tooltip(
+                                                                message: isZh
+                                                                    ? '在线上插入节点或切换分支'
+                                                                    : 'Insert node or change branch',
+                                                                child: GestureDetector(
+                                                                  onTapUp: (d) =>
+                                                                      unawaited(
+                                                                        _handleEdgeContextMenu(
+                                                                          d.globalPosition,
+                                                                          edge,
+                                                                          isZh,
+                                                                        ),
+                                                                      ),
+                                                                  child: Padding(
+                                                                    padding:
+                                                                        const EdgeInsets.fromLTRB(
+                                                                          6,
+                                                                          2.5,
+                                                                          4,
+                                                                          2.5,
+                                                                        ),
+                                                                    child: Row(
+                                                                      mainAxisSize:
+                                                                          MainAxisSize
+                                                                              .min,
+                                                                      children: [
+                                                                        Icon(
+                                                                          Codicons
+                                                                              .add,
+                                                                          size:
+                                                                              9.5,
+                                                                          color: _branchColor(
+                                                                            edge.branch,
+                                                                          ),
+                                                                        ),
+                                                                        const SizedBox(
+                                                                          width:
+                                                                              2,
+                                                                        ),
+                                                                        Text(
+                                                                          edge.branch
+                                                                              .label(
+                                                                                isZh,
+                                                                              ),
+                                                                          style: TextStyle(
+                                                                            fontSize:
+                                                                                9.5,
+                                                                            fontWeight:
+                                                                                FontWeight.w600,
+                                                                            color: _branchColor(
+                                                                              edge.branch,
+                                                                            ),
+                                                                          ),
+                                                                        ),
+                                                                      ],
+                                                                    ),
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                              Container(
+                                                                width: 0.8,
+                                                                height: 11,
+                                                                color:
+                                                                    (dark
+                                                                            ? Colors.white
+                                                                            : Colors.black)
+                                                                        .withValues(
+                                                                          alpha:
+                                                                              0.12,
+                                                                        ),
+                                                              ),
+                                                              Tooltip(
+                                                                message: isZh
+                                                                    ? '删除连线'
+                                                                    : 'Delete edge',
+                                                                child: InkWell(
+                                                                  borderRadius:
+                                                                      const BorderRadius.horizontal(
+                                                                        right: Radius.circular(
+                                                                          10,
+                                                                        ),
+                                                                      ),
+                                                                  onTap: () {
+                                                                    setState(
+                                                                      () => _selectedEdgeId =
+                                                                          null,
+                                                                    );
+                                                                    _ctrl
+                                                                        .removeEdge(
+                                                                          edge.id,
+                                                                        );
+                                                                  },
+                                                                  child: Padding(
+                                                                    padding:
+                                                                        const EdgeInsets.fromLTRB(
+                                                                          4,
+                                                                          3,
+                                                                          5.5,
+                                                                          3,
+                                                                        ),
+                                                                    child: Icon(
+                                                                      Codicons
+                                                                          .close,
+                                                                      size: 8.5,
+                                                                      color: colors[
+                                                                          'descriptionForeground'],
+                                                                    ),
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                            ],
                                                           ),
                                                         ),
                                                       ),
-                                                    ),
-                                            if (nodes.isEmpty && !isRunView)
-                                              Positioned(
-                                                left: 72,
-                                                top: 64,
-                                                child: _EmptyWorkflowHint(
-                                                  isZh: isZh,
-                                                  onLoadTemplateId: (id) {
-                                                    _ctrl.loadBuiltInTemplate(
-                                                      id,
-                                                      defaultCwd: widget
-                                                          .session
-                                                          ?.root,
-                                                    );
-                                                    setState(
-                                                      () => _selectedNodeId =
-                                                          _ctrl
-                                                              .nodes
-                                                              .firstOrNull
-                                                              ?.id,
-                                                    );
-                                                    WidgetsBinding.instance
-                                                        .addPostFrameCallback(
-                                                          (_) => _fitToView(),
-                                                        );
-                                                  },
-                                                  onAddNode: (k) =>
-                                                      _addNode(k, isZh),
-                                                ),
-                                              ),
-                                            for (final node in nodes)
-                                              Positioned(
-                                                key: ValueKey(
-                                                  '${viewingRun?.id ?? 'edit'}-${node.id}',
-                                                ),
-                                                left: node.x,
-                                                top: node.y,
-                                                width: node.width,
-                                                height: node.height,
-                                                child: _CanvasCardWidget(
-                                                  node: node,
-                                                  run: viewingRun,
-                                                  readOnly: isRunView,
-                                                  scale: _scale,
-                                                  isZh: isZh,
-                                                  selected:
-                                                      _selectedNodeId ==
-                                                      node.id,
-                                                  connectingFrom: isRunView
-                                                      ? null
-                                                      : _connecting,
-                                                  onSelect: () {
-                                                    if (!isRunView &&
-                                                        _connecting != null &&
-                                                        _connecting!.fromId !=
-                                                            node.id &&
-                                                        node
-                                                            .kind
-                                                            .isExecutable) {
-                                                      final conn = _connecting!;
-                                                      _ctrl.connect(
-                                                        conn.fromId,
-                                                        node.id,
-                                                        branch: conn.branch,
+                                              if (nodes.isEmpty && !isRunView)
+                                                Positioned(
+                                                  left: 72,
+                                                  top: 64,
+                                                  child: _EmptyWorkflowHint(
+                                                    isZh: isZh,
+                                                    onLoadTemplateId: (id) {
+                                                      _ctrl.loadBuiltInTemplate(
+                                                        id,
+                                                        defaultCwd: widget
+                                                            .session
+                                                            ?.root,
                                                       );
                                                       setState(() {
-                                                        _connecting = null;
-                                                        _pointerScenePos = null;
-                                                        _selectedNodeId =
-                                                            node.id;
+                                                        final first = _ctrl
+                                                            .nodes
+                                                            .firstOrNull
+                                                            ?.id;
+                                                        _selectedNodeIds =
+                                                            first == null
+                                                            ? {}
+                                                            : {first};
+                                                        _selectedEdgeId = null;
                                                       });
-                                                      return;
-                                                    }
-                                                    setState(
-                                                      () => _selectedNodeId =
-                                                          node.id,
-                                                    );
-                                                  },
-                                                  onStartConnect: (branch) {
-                                                    if (isRunView) return;
-                                                    setState(() {
-                                                      _connecting = (
-                                                        fromId: node.id,
-                                                        branch: branch,
-                                                      );
-                                                      _pointerScenePos =
-                                                          _outputPortOffset(
-                                                            node,
-                                                            branch,
+                                                      WidgetsBinding.instance
+                                                          .addPostFrameCallback(
+                                                            (_) => _fitToView(),
                                                           );
-                                                    });
-                                                  },
-                                                  onQuickAppend:
-                                                      (branch, kind) {
-                                                        if (isRunView) return;
-                                                        _quickAppendNode(
-                                                          node.id,
-                                                          branch,
-                                                          kind,
-                                                          isZh,
-                                                        );
-                                                      },
-                                                  onDuplicate: () {
-                                                    if (isRunView) return;
-                                                    final copy = _ctrl
-                                                        .duplicateNode(node.id);
-                                                    if (copy != null) {
-                                                      setState(
-                                                        () => _selectedNodeId =
-                                                            copy.id,
-                                                      );
-                                                    }
-                                                  },
-                                                  onTestRun: () {
-                                                    if (isRunView) return;
-                                                    _startSingleStep(node);
-                                                  },
+                                                    },
+                                                    onAddNode: (k) =>
+                                                        _addNode(k, isZh),
+                                                  ),
                                                 ),
-                                              ),
-                                          ],
+                                              // 8. Workflow Node Cards (each isolated in RepaintBoundary)
+                                              for (final node in regularNodes)
+                                                Positioned(
+                                                  key: ValueKey(
+                                                    '${viewingRun?.id ?? 'edit'}-${node.id}',
+                                                  ),
+                                                  left: node.x,
+                                                  top: node.y,
+                                                  width: node.width,
+                                                  height: node.height,
+                                                  child: RepaintBoundary(
+                                                    child: _CanvasCardWidget(
+                                                      node: node,
+                                                      run: viewingRun,
+                                                      readOnly: isRunView,
+                                                      scaleProvider: () =>
+                                                          _currentScale,
+                                                      isZh: isZh,
+                                                      selected: _selectedNodeIds
+                                                          .contains(node.id),
+                                                      connectingFrom: isRunView
+                                                          ? null
+                                                          : _connecting,
+                                                      onSelect: (toggleMulti) {
+                                                        _canvasFocusNode
+                                                            .requestFocus();
+                                                        if (!isRunView &&
+                                                            _connecting !=
+                                                                null &&
+                                                            _connecting!
+                                                                    .fromId !=
+                                                                node.id &&
+                                                            node
+                                                                .kind
+                                                                .isExecutable) {
+                                                          final conn =
+                                                              _connecting!;
+                                                          final edge = _ctrl
+                                                              .connect(
+                                                                conn.fromId,
+                                                                node.id,
+                                                                branch:
+                                                                    conn.branch,
+                                                              );
+                                                          setState(() {
+                                                            _connecting = null;
+                                                            _dragWiring = false;
+                                                            _selectedEdgeId =
+                                                                null;
+                                                            _selectedNodeIds = {
+                                                              node.id,
+                                                            };
+                                                          });
+                                                          _wirePointerNotifier
+                                                                  .value =
+                                                              null;
+                                                          if (edge == null) {
+                                                            _showToast(
+                                                              isZh
+                                                                  ? '无法连接：目标连线会形成环形依赖 (DAG 不允许成环)'
+                                                                  : 'Cannot connect: edge would introduce a cycle.',
+                                                            );
+                                                          }
+                                                          return;
+                                                        }
+                                                        setState(() {
+                                                          _selectedEdgeId =
+                                                              null;
+                                                          if (toggleMulti) {
+                                                            final next =
+                                                                Set<
+                                                                  String
+                                                                >.from(
+                                                                  _selectedNodeIds,
+                                                                );
+                                                            if (!next.remove(
+                                                              node.id,
+                                                            )) {
+                                                              next.add(node.id);
+                                                            }
+                                                            _selectedNodeIds =
+                                                                next;
+                                                          } else {
+                                                            _selectedNodeIds = {
+                                                              node.id,
+                                                            };
+                                                          }
+                                                        });
+                                                      },
+                                                      onDragStart: () =>
+                                                          _handleNodeDragStart(
+                                                            node,
+                                                          ),
+                                                      onDragUpdate: (delta) =>
+                                                          _handleNodeDragUpdate(
+                                                            node,
+                                                            delta,
+                                                          ),
+                                                      onDragEnd:
+                                                          _handleNodeDragEnd,
+                                                      onSecondaryTapUp: (d) =>
+                                                          unawaited(
+                                                            _handleNodeContextMenu(
+                                                              d.globalPosition,
+                                                              node,
+                                                              isZh,
+                                                            ),
+                                                          ),
+                                                      onStartConnect: (branch) {
+                                                        if (isRunView) return;
+                                                        _dragWiring = false;
+                                                        _wirePointerNotifier
+                                                            .value = _outputPortOffset(
+                                                          node,
+                                                          branch,
+                                                        );
+                                                        setState(() {
+                                                          _connecting = (
+                                                            fromId: node.id,
+                                                            branch: branch,
+                                                          );
+                                                          _selectedEdgeId =
+                                                              null;
+                                                        });
+                                                      },
+                                                      onPortDragStart:
+                                                          (branch) =>
+                                                              _startPortDrag(
+                                                                node,
+                                                                branch,
+                                                              ),
+                                                      onPortDragUpdate:
+                                                          _updatePortDrag,
+                                                      onPortDragEnd: (gPos) =>
+                                                          unawaited(
+                                                            _endPortDrag(
+                                                              gPos,
+                                                              isZh,
+                                                            ),
+                                                          ),
+                                                      onQuickAppend:
+                                                          (branch, kind) {
+                                                            if (isRunView) {
+                                                              return;
+                                                            }
+                                                            _quickAppendNode(
+                                                              node.id,
+                                                              branch,
+                                                              kind,
+                                                              isZh,
+                                                            );
+                                                          },
+                                                      onDuplicate: () {
+                                                        if (isRunView) return;
+                                                        final copy = _ctrl
+                                                            .duplicateNode(
+                                                              node.id,
+                                                            );
+                                                        if (copy != null) {
+                                                          setState(() {
+                                                            _selectedNodeIds = {
+                                                              copy.id,
+                                                            };
+                                                            _selectedEdgeId =
+                                                                null;
+                                                          });
+                                                        }
+                                                      },
+                                                      onTestRun: () {
+                                                        if (isRunView) return;
+                                                        _startSingleStep(node);
+                                                      },
+                                                    ),
+                                                  ),
+                                                ),
+                                            ],
+                                          ),
                                         ),
                                       ),
                                     ),
                                   ),
                                 ),
                               ),
+                              // Multi-Select Floating Action Pill (when 2+ nodes selected)
+                              if (_selectedNodeIds.length > 1 && !isRunView)
+                                Positioned(
+                                  top: 12,
+                                  left: 0,
+                                  right: 0,
+                                  child: Center(
+                                    child: Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 10,
+                                        vertical: 5,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color:
+                                            (dark
+                                                    ? const Color(0xFF1F2228)
+                                                    : Colors.white)
+                                                .withValues(alpha: 0.96),
+                                        borderRadius: BorderRadius.circular(10),
+                                        border: Border.all(
+                                          color: const Color(
+                                            0xFF2563EB,
+                                          ).withValues(alpha: 0.45),
+                                        ),
+                                        boxShadow: [
+                                          BoxShadow(
+                                            color: Colors.black.withValues(
+                                              alpha: 0.14,
+                                            ),
+                                            blurRadius: 12,
+                                            offset: const Offset(0, 4),
+                                          ),
+                                        ],
+                                      ),
+                                      child: Wrap(
+                                        spacing: 6,
+                                        runSpacing: 4,
+                                        crossAxisAlignment:
+                                            WrapCrossAlignment.center,
+                                        children: [
+                                          Text(
+                                            isZh
+                                                ? '已选 ${_selectedNodeIds.length} 个节点'
+                                                : '${_selectedNodeIds.length} selected',
+                                            style: const TextStyle(
+                                              fontSize: 11.5,
+                                              fontWeight: FontWeight.w600,
+                                              color: Color(0xFF2563EB),
+                                            ),
+                                          ),
+                                          _MiniActionChip(
+                                            label: isZh ? '左对齐' : 'Left',
+                                            onTap: () => _ctrl.alignNodes(
+                                              _selectedNodeIds,
+                                              CanvasNodeAlignment.left,
+                                            ),
+                                          ),
+                                          _MiniActionChip(
+                                            label: isZh ? '顶对齐' : 'Top',
+                                            onTap: () => _ctrl.alignNodes(
+                                              _selectedNodeIds,
+                                              CanvasNodeAlignment.top,
+                                            ),
+                                          ),
+                                          if (_selectedNodeIds.length >= 3)
+                                            _MiniActionChip(
+                                              label: isZh ? '等距分布' : 'Distribute',
+                                              onTap: () => _ctrl.alignNodes(
+                                                _selectedNodeIds,
+                                                CanvasNodeAlignment.distributeH,
+                                              ),
+                                            ),
+                                          _MiniActionChip(
+                                            label: isZh ? '副本' : 'Duplicate',
+                                            onTap: _duplicateSelected,
+                                          ),
+                                          _MiniActionChip(
+                                            label: isZh ? '删除' : 'Delete',
+                                            danger: true,
+                                            onTap: _deleteSelected,
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
                               // Subtle Frosted Bottom-Left Canvas HUD
                               Positioned(
                                 left: 12,
@@ -1845,10 +3772,11 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                                       vertical: 5,
                                     ),
                                     decoration: BoxDecoration(
-                                      color: (dark
-                                              ? const Color(0xFF1F2228)
-                                              : Colors.white)
-                                          .withValues(alpha: 0.9),
+                                      color:
+                                          (dark
+                                                  ? const Color(0xFF1F2228)
+                                                  : Colors.white)
+                                              .withValues(alpha: 0.9),
                                       borderRadius: BorderRadius.circular(8),
                                       border: Border.all(
                                         color: dark
@@ -1872,11 +3800,11 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                                     child: Text(
                                       isRunView
                                           ? (isZh
-                                                ? '运行实例 #${viewingRun.id}（只读监控）· ${nodes.length} 节点 · 点击节点查看输出 · 顶部切回「编辑画布」可修改'
-                                                : 'Run #${viewingRun.id} (Live Monitor) · ${nodes.length} nodes · Switch to Editor tab to edit')
+                                                ? '运行实例 #${viewingRun.id}（只读监控）· ${nodes.length} 节点 · Ctrl+K 搜索'
+                                                : 'Run #${viewingRun.id} (Read-only) · ${nodes.length} nodes · Ctrl+K search')
                                           : (isZh
-                                                ? '${nodes.length} 节点 · ${edges.length} 连线   |   拖拽平移 · 滚轮缩放 · 点击卡片编辑'
-                                                : '${nodes.length} nodes · ${edges.length} edges  |  Pan · Scroll zoom · Click to edit'),
+                                                ? '${nodes.length} 节点 · ${edges.length} 连线  |  拖拽端口连线 · Shift+框选 · 右键菜单 · Ctrl+K 搜索'
+                                                : '${nodes.length} nodes · ${edges.length} edges  |  Drag ports · Shift+Box select · Right-click · Ctrl+K'),
                                       style: TextStyle(
                                         fontSize: 10.5,
                                         color: colors['descriptionForeground'],
@@ -1885,6 +3813,26 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                                   ),
                                 ),
                               ),
+                              // Interactive Bottom-Right Minimap
+                              if (_showMinimap &&
+                                  _viewportSize.width >= 520 &&
+                                  _viewportSize.height >= 300)
+                                Positioned(
+                                  right: 12,
+                                  bottom: 12,
+                                  child: CanvasMinimap(
+                                    nodes: nodes,
+                                    edges: edges,
+                                    selectedNodeIds: _selectedNodeIds,
+                                    boardSize: boardSize,
+                                    viewportSize: _viewportSize,
+                                    transform: _transform,
+                                    isZh: isZh,
+                                    onFitView: _fitToView,
+                                    onClose: () =>
+                                        setState(() => _showMinimap = false),
+                                  ),
+                                ),
                             ],
                           );
                         },
@@ -1898,6 +3846,7 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                       node: selectedNode,
                       run: viewingRun,
                       isZh: isZh,
+                      cwd: widget.session?.root,
                       width: narrow
                           ? math.min(392.0, areaBox.maxWidth * 0.92)
                           : _inspectorWidth.clamp(
@@ -1916,15 +3865,18 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                                 math.min(600.0, maxW),
                               );
                             }),
-                      onClose: () => setState(() => _selectedNodeId = null),
-                      onSelectNode: (id) =>
-                          setState(() => _selectedNodeId = id),
+                      onClose: () => setState(() => _selectedNodeIds = {}),
+                      onSelectNode: (id) => setState(() {
+                        _selectedNodeIds = {id};
+                        _selectedEdgeId = null;
+                      }),
                       onSwitchToEdit: isRunView
                           ? () {
                               final keepId = selectedNode.id;
                               _ctrl.selectRun(null);
                               setState(() {
-                                _selectedNodeId = _ctrl.nodeById(keepId)?.id;
+                                final kept = _ctrl.nodeById(keepId)?.id;
+                                _selectedNodeIds = kept == null ? {} : {kept};
                               });
                             }
                           : null,
@@ -1945,12 +3897,12 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                       onDuplicate: () {
                         final copy = _ctrl.duplicateNode(selectedNode.id);
                         if (copy != null) {
-                          setState(() => _selectedNodeId = copy.id);
+                          setState(() => _selectedNodeIds = {copy.id});
                         }
                       },
                       onDelete: () {
                         final id = selectedNode.id;
-                        setState(() => _selectedNodeId = null);
+                        setState(() => _selectedNodeIds = {});
                         _ctrl.removeNode(id);
                       },
                     );
@@ -1982,7 +3934,7 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                 ),
               ),
 
-              // Collapsible & Auto-Scrolling Live Execution Console Drawer
+              // Collapsible & Virtualized Smart-Scrolling Live Execution Console Drawer
               if (_showLogDrawer)
                 Container(
                   height: _logExpanded ? 340 : 210,
@@ -2049,7 +4001,9 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                             if (viewingRun != null) ...[
                               const SizedBox(width: 6),
                               ConstrainedBox(
-                                constraints: const BoxConstraints(maxWidth: 180),
+                                constraints: const BoxConstraints(
+                                  maxWidth: 180,
+                                ),
                                 child: Text(
                                   viewingRun.name,
                                   maxLines: 1,
@@ -2062,7 +4016,6 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                               ),
                             ],
                             const SizedBox(width: 10),
-                            // Filter Tabs: Full Workflow Log vs Selected Node Output
                             _ConsoleTabChip(
                               label: isZh ? '全部日志' : 'All Logs',
                               selected: !_logSelectedNodeOnly,
@@ -2079,11 +4032,47 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                               ),
                             ],
                             const Spacer(),
-                            if (_ctrl.workflowDuration case final dur?)
+                            if (!_consolePinnedToBottom) ...[
+                              InkWell(
+                                borderRadius: BorderRadius.circular(4),
+                                onTap: () {
+                                  setState(() => _consolePinnedToBottom = true);
+                                  if (_logScrollCtrl.hasClients) {
+                                    _logScrollCtrl.jumpTo(
+                                      _logScrollCtrl.position.maxScrollExtent,
+                                    );
+                                  }
+                                },
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 6,
+                                    vertical: 2,
+                                  ),
+                                  margin: const EdgeInsets.only(right: 8),
+                                  decoration: BoxDecoration(
+                                    color: const Color(
+                                      0xFF2563EB,
+                                    ).withValues(alpha: 0.25),
+                                    borderRadius: BorderRadius.circular(4),
+                                  ),
+                                  child: Text(
+                                    isZh ? '↓ 回到底部' : '↓ Bottom',
+                                    style: const TextStyle(
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w600,
+                                      color: Color(0xFF93C5FD),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                            if (viewingRun != null)
                               Padding(
                                 padding: const EdgeInsets.only(right: 10),
-                                child: Text(
-                                  _formatElapsed(dur),
+                                child: _LiveElapsedText(
+                                  startedAt: viewingRun.startedAt,
+                                  finishedAt: viewingRun.finishedAt,
+                                  running: viewingRun.running,
                                   style: const TextStyle(
                                     fontSize: 11,
                                     color: Color(0xFF9CA3AF),
@@ -2125,8 +4114,9 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                               message: isZh ? '清空日志' : 'Clear log',
                               child: InkWell(
                                 borderRadius: BorderRadius.circular(4),
-                                onTap: () =>
-                                    _ctrl.clearWorkflowLog(runId: viewingRun?.id),
+                                onTap: () => _ctrl.clearWorkflowLog(
+                                  runId: viewingRun?.id,
+                                ),
                                 child: const Padding(
                                   padding: EdgeInsets.all(4),
                                   child: Icon(
@@ -2175,14 +4165,10 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                         ),
                       ),
                       Expanded(
-                        child: SingleChildScrollView(
-                          controller: _logScrollCtrl,
-                          padding: const EdgeInsets.all(11),
-                          child: SelectableText(
-                            () {
-                              if (_logSelectedNodeOnly &&
-                                  selectedNode != null) {
-                                return selectedNode.output.isEmpty
+                        child: () {
+                          final rawText =
+                              _logSelectedNodeOnly && selectedNode != null
+                              ? (selectedNode.output.isEmpty
                                     ? (selectedNode.running
                                           ? (isZh
                                                 ? '正在执行「${selectedNode.title}」，等待输出流…'
@@ -2190,22 +4176,51 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView> {
                                           : (isZh
                                                 ? '节点「${selectedNode.title}」暂无输出'
                                                 : 'No output for this node yet.'))
-                                    : selectedNode.output;
-                              }
-                              return _ctrl.workflowLog.isEmpty
-                                  ? (isZh
-                                        ? '点击左上角「运行工作流」或卡片上的 ▶ 单步试跑，实时日志与命令/Agent 流式输出将显示在此处。'
-                                        : 'Click "Run Workflow" above to start.')
-                                  : _ctrl.workflowLog;
-                            }(),
-                            style: TextStyle(
-                              fontSize: 11.5,
-                              height: 1.48,
-                              fontFamily: AppFonts.mono,
-                              color: const Color(0xFFE5E7EB),
+                                    : selectedNode.output)
+                              : (_ctrl.workflowLog.isEmpty
+                                    ? (isZh
+                                          ? '点击左上角「运行工作流」或卡片上的 ▶ 单步试跑，实时日志与命令/Agent 流式输出将显示在此处。'
+                                          : 'Click "Run Workflow" above to start.')
+                                    : _ctrl.workflowLog);
+                          final lines = rawText.split('\n');
+                          return SelectionArea(
+                            child: ListView.builder(
+                              controller: _logScrollCtrl,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 12,
+                                vertical: 9,
+                              ),
+                              itemCount: lines.length,
+                              itemBuilder: (context, idx) {
+                                final line = lines[idx];
+                                final Color lineColor;
+                                if (line.startsWith('✗') ||
+                                    line.contains('[FAILED]') ||
+                                    line.contains('ERROR')) {
+                                  lineColor = const Color(0xFFFCA5A5);
+                                } else if (line.startsWith('✓') ||
+                                    line.contains('VERDICT: PASS')) {
+                                  lineColor = const Color(0xFF86EFAC);
+                                } else if (line.startsWith('▶') ||
+                                    line.startsWith('===') ||
+                                    line.startsWith('⏸')) {
+                                  lineColor = const Color(0xFF93C5FD);
+                                } else {
+                                  lineColor = const Color(0xFFE5E7EB);
+                                }
+                                return Text(
+                                  line,
+                                  style: TextStyle(
+                                    fontSize: 11.4,
+                                    height: 1.46,
+                                    fontFamily: AppFonts.mono,
+                                    color: lineColor,
+                                  ),
+                                );
+                              },
                             ),
-                          ),
-                        ),
+                          );
+                        }(),
                       ),
                     ],
                   ),
@@ -2852,7 +4867,30 @@ class _ExecutionProgressStrip extends StatelessWidget {
                   ),
                 ),
               ),
-              if (durText.isNotEmpty)
+              if (activeRun != null)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 6,
+                    vertical: 1.5,
+                  ),
+                  decoration: BoxDecoration(
+                    color: tone.withValues(alpha: 0.14),
+                    borderRadius: BorderRadius.circular(5),
+                  ),
+                  child: _LiveElapsedText(
+                    startedAt: activeRun.startedAt,
+                    finishedAt: activeRun.finishedAt,
+                    running: activeRun.running,
+                    suffix: ' · $doneCount/${execNodes.length}',
+                    style: TextStyle(
+                      fontSize: 10.5,
+                      fontWeight: FontWeight.w600,
+                      color: tone,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                )
+              else if (durText.isNotEmpty)
                 Container(
                   padding: const EdgeInsets.symmetric(
                     horizontal: 6,
@@ -2923,13 +4961,18 @@ class _ExecutionProgressStrip extends StatelessWidget {
                 ),
               ],
               if (CanvasController.resolveEvidenceDirFromNodes(sourceNodes)
-                  case final evDir? when Directory(evDir).existsSync()) ...[
+                  case final evDir?
+                  when _CanvasFsCache.existsCached(
+                        evDir,
+                        () => (context as Element).markNeedsBuild(),
+                      ) ==
+                      true) ...[
                 const SizedBox(width: 6),
                 Tooltip(
                   message: evDir,
                   child: InkWell(
                     borderRadius: BorderRadius.circular(5),
-                    onTap: () => unawaited(Process.run('open', [evDir])),
+                    onTap: () => unawaited(_openPathInOs(evDir)),
                     child: Container(
                       padding: const EdgeInsets.symmetric(
                         horizontal: 7,
@@ -3242,6 +5285,102 @@ class _ToolbarPill extends StatelessWidget {
   }
 }
 
+class _ToolbarIconBtn extends StatelessWidget {
+  const _ToolbarIconBtn({
+    required this.icon,
+    required this.tooltip,
+    required this.onTap,
+    this.active = false,
+    this.enabled = true,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onTap;
+  final bool active;
+  final bool enabled;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = themeColors;
+    final dark = colors.dark;
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(7),
+        onTap: enabled ? onTap : null,
+        child: Container(
+          width: 30,
+          height: 30,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: active
+                ? colors['button.background'].withValues(alpha: 0.16)
+                : (dark ? Colors.white : Colors.black).withValues(
+                    alpha: dark ? 0.05 : 0.035,
+                  ),
+            borderRadius: BorderRadius.circular(7),
+            border: Border.all(
+              color: active
+                  ? colors['button.background'].withValues(alpha: 0.55)
+                  : (dark
+                        ? Colors.white.withValues(alpha: 0.1)
+                        : Colors.black.withValues(alpha: 0.08)),
+            ),
+          ),
+          child: Icon(
+            icon,
+            size: 13.5,
+            color: !enabled
+                ? colors['descriptionForeground'].withValues(alpha: 0.35)
+                : (active ? colors['button.background'] : colors['foreground']),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MiniActionChip extends StatelessWidget {
+  const _MiniActionChip({
+    required this.label,
+    required this.onTap,
+    this.danger = false,
+  });
+
+  final String label;
+  final VoidCallback onTap;
+  final bool danger;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = themeColors;
+    final dark = colors.dark;
+    final fg = danger ? const Color(0xFFEF4444) : colors['foreground'];
+    return InkWell(
+      borderRadius: BorderRadius.circular(6),
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+        decoration: BoxDecoration(
+          color: danger
+              ? const Color(0xFFEF4444).withValues(alpha: 0.12)
+              : (dark ? Colors.white : Colors.black).withValues(alpha: 0.06),
+          borderRadius: BorderRadius.circular(6),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 10.8,
+            fontWeight: FontWeight.w500,
+            color: fg,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 // --- Smart Edge Geometry (Zero Backward Hairpin Loops!) ---------------------
 
 typedef _EdgeGeometry = ({
@@ -3328,6 +5467,7 @@ IconData _kindIcon(CanvasNodeKind kind) => switch (kind) {
   CanvasNodeKind.note => Codicons.note,
   CanvasNodeKind.chat => Codicons.commentDiscussion,
   CanvasNodeKind.file => Codicons.file,
+  CanvasNodeKind.group => Codicons.layout,
 };
 
 String _kindSubtitle(CanvasNodeKind kind, bool isZh) => switch (kind) {
@@ -3340,6 +5480,7 @@ String _kindSubtitle(CanvasNodeKind kind, bool isZh) => switch (kind) {
   CanvasNodeKind.note => isZh ? '画布注释便签（不参与执行）' : 'Documentation note',
   CanvasNodeKind.chat => isZh ? '会话引用卡片' : 'Pinned chat',
   CanvasNodeKind.file => isZh ? '文件预览卡片' : 'File preview',
+  CanvasNodeKind.group => isZh ? '分组框（视觉归类节点）' : 'Visual group frame',
 };
 
 class _EmptyWorkflowHint extends StatelessWidget {
@@ -3519,17 +5660,162 @@ class _EmptyWorkflowHint extends StatelessWidget {
   }
 }
 
+/// Visual Group Frame container rendered behind workflow cards; dragging its
+/// header moves all enclosed cards together.
+class _CanvasGroupFrameWidget extends StatelessWidget {
+  const _CanvasGroupFrameWidget({
+    required this.node,
+    required this.readOnly,
+    required this.selected,
+    required this.scaleProvider,
+    required this.onSelect,
+    required this.onDragStart,
+    required this.onDragUpdate,
+    required this.onDragEnd,
+    required this.onSecondaryTapUp,
+  });
+
+  final CanvasNode node;
+  final bool readOnly;
+  final bool selected;
+  final double Function() scaleProvider;
+  final ValueChanged<bool> onSelect;
+  final VoidCallback onDragStart;
+  final ValueChanged<Offset> onDragUpdate;
+  final VoidCallback onDragEnd;
+  final GestureTapUpCallback onSecondaryTapUp;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = themeColors;
+    final dark = colors.dark;
+    final ctrl = CanvasController.instance;
+    final accent = Color(node.colorValue);
+
+    return GestureDetector(
+      onTap: () => onSelect(
+        HardwareKeyboard.instance.isShiftPressed ||
+            HardwareKeyboard.instance.isControlPressed ||
+            HardwareKeyboard.instance.isMetaPressed,
+      ),
+      onSecondaryTapUp: onSecondaryTapUp,
+      child: Container(
+        decoration: BoxDecoration(
+          color: accent.withValues(alpha: dark ? 0.08 : 0.055),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: selected ? accent : accent.withValues(alpha: 0.36),
+            width: selected ? 1.7 : 1.1,
+          ),
+        ),
+        child: Stack(
+          children: [
+            Positioned(
+              left: 0,
+              top: 0,
+              right: 0,
+              child: GestureDetector(
+                onPanStart: readOnly ? null : (_) => onDragStart(),
+                onPanUpdate: readOnly ? null : (d) => onDragUpdate(d.delta),
+                onPanEnd: readOnly ? null : (_) => onDragEnd(),
+                child: MouseRegion(
+                  cursor: readOnly
+                      ? MouseCursor.defer
+                      : SystemMouseCursors.grab,
+                  child: Container(
+                    padding: const EdgeInsets.fromLTRB(12, 8, 10, 7),
+                    decoration: BoxDecoration(
+                      color: accent.withValues(alpha: dark ? 0.14 : 0.09),
+                      borderRadius: const BorderRadius.vertical(
+                        top: Radius.circular(13),
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(Codicons.layers, size: 13, color: accent),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            node.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                              color: colors['foreground'],
+                            ),
+                          ),
+                        ),
+                        if (!readOnly)
+                          InkWell(
+                            borderRadius: BorderRadius.circular(4),
+                            onTap: () => ctrl.removeNode(node.id),
+                            child: Padding(
+                              padding: const EdgeInsets.all(2),
+                              child: Icon(
+                                Codicons.close,
+                                size: 11,
+                                color: colors['descriptionForeground'],
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            if (!readOnly)
+              Positioned(
+                right: 4,
+                bottom: 4,
+                child: GestureDetector(
+                  onPanStart: (_) => ctrl.pushUndoSnapshot(),
+                  onPanUpdate: (d) {
+                    final s = scaleProvider();
+                    ctrl.resizeNode(node.id, d.delta.dx / s, d.delta.dy / s);
+                  },
+                  onPanEnd: (_) => ctrl.commitLayout(),
+                  child: MouseRegion(
+                    cursor: SystemMouseCursors.resizeUpLeftDownRight,
+                    child: Padding(
+                      padding: const EdgeInsets.all(4),
+                      child: Icon(
+                        Codicons.gripper,
+                        size: 11,
+                        color: colors['descriptionForeground'].withValues(
+                          alpha: 0.55,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _CanvasCardWidget extends StatefulWidget {
   const _CanvasCardWidget({
     required this.node,
     this.run,
     this.readOnly = false,
-    required this.scale,
+    required this.scaleProvider,
     required this.isZh,
     required this.selected,
     required this.connectingFrom,
     required this.onSelect,
+    required this.onDragStart,
+    required this.onDragUpdate,
+    required this.onDragEnd,
+    required this.onSecondaryTapUp,
     required this.onStartConnect,
+    required this.onPortDragStart,
+    required this.onPortDragUpdate,
+    required this.onPortDragEnd,
     required this.onQuickAppend,
     required this.onDuplicate,
     required this.onTestRun,
@@ -3538,12 +5824,19 @@ class _CanvasCardWidget extends StatefulWidget {
   final CanvasNode node;
   final WorkflowRun? run;
   final bool readOnly;
-  final double scale;
+  final double Function() scaleProvider;
   final bool isZh;
   final bool selected;
   final ({String fromId, CanvasEdgeBranch branch})? connectingFrom;
-  final VoidCallback onSelect;
+  final ValueChanged<bool> onSelect;
+  final VoidCallback onDragStart;
+  final ValueChanged<Offset> onDragUpdate;
+  final VoidCallback onDragEnd;
+  final GestureTapUpCallback onSecondaryTapUp;
   final ValueChanged<CanvasEdgeBranch> onStartConnect;
+  final ValueChanged<CanvasEdgeBranch> onPortDragStart;
+  final ValueChanged<Offset> onPortDragUpdate;
+  final ValueChanged<Offset> onPortDragEnd;
   final void Function(CanvasEdgeBranch branch, CanvasNodeKind kind) onQuickAppend;
   final VoidCallback onDuplicate;
   final VoidCallback onTestRun;
@@ -3554,6 +5847,14 @@ class _CanvasCardWidget extends StatefulWidget {
 
 class _CanvasCardWidgetState extends State<_CanvasCardWidget> {
   bool _hovered = false;
+
+  void _triggerSelect() {
+    final toggleMulti =
+        HardwareKeyboard.instance.isShiftPressed ||
+        HardwareKeyboard.instance.isControlPressed ||
+        HardwareKeyboard.instance.isMetaPressed;
+    widget.onSelect(toggleMulti);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -3594,7 +5895,8 @@ class _CanvasCardWidgetState extends State<_CanvasCardWidget> {
         clipBehavior: Clip.none,
         children: [
           GestureDetector(
-            onTap: widget.onSelect,
+            onTap: _triggerSelect,
+            onSecondaryTapUp: widget.onSecondaryTapUp,
             child: MouseRegion(
               cursor: isConnectTarget
                   ? SystemMouseCursors.click
@@ -3606,7 +5908,8 @@ class _CanvasCardWidgetState extends State<_CanvasCardWidget> {
                   borderRadius: BorderRadius.circular(13),
                   border: Border.all(
                     color: borderColor,
-                    width: widget.selected ||
+                    width:
+                        widget.selected ||
                             isConnectTarget ||
                             node.runStatus == CanvasNodeRunStatus.running ||
                             node.runStatus ==
@@ -3634,19 +5937,18 @@ class _CanvasCardWidgetState extends State<_CanvasCardWidget> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    // Elevated Card Header (Drag Handle)
+                    // Elevated Card Header (Multi-Select & Magnetic-Snap Drag Handle)
                     GestureDetector(
-                      onTap: widget.onSelect,
+                      onTap: _triggerSelect,
+                      onPanStart: widget.readOnly
+                          ? null
+                          : (_) => widget.onDragStart(),
                       onPanUpdate: widget.readOnly
                           ? null
-                          : (d) => ctrl.moveNode(
-                              node.id,
-                              d.delta.dx / widget.scale,
-                              d.delta.dy / widget.scale,
-                            ),
+                          : (d) => widget.onDragUpdate(d.delta),
                       onPanEnd: widget.readOnly
                           ? null
-                          : (_) => ctrl.commitLayout(),
+                          : (_) => widget.onDragEnd(),
                       child: Container(
                         height: 38,
                         padding: const EdgeInsets.fromLTRB(10, 0, 8, 0),
@@ -3720,34 +6022,38 @@ class _CanvasCardWidgetState extends State<_CanvasCardWidget> {
                                       ),
                                       const SizedBox(width: 4),
                                     ],
-                                    Text(
-                                      () {
-                                        final lbl = node.runStatus.label(
-                                          widget.isZh,
-                                        );
-                                        final d = node.runDuration;
-                                        if (d != null &&
-                                            node.runStatus !=
-                                                CanvasNodeRunStatus.queued) {
-                                          return '$lbl ${_formatElapsed(d)}';
-                                        }
-                                        return lbl;
-                                      }(),
-                                      style: TextStyle(
-                                        fontSize: 9.5,
-                                        fontWeight: FontWeight.w600,
-                                        color: statusTone,
-                                        fontFeatures: const [
-                                          FontFeature.tabularFigures(),
-                                        ],
+                                    if (node.startedAt != null &&
+                                        node.runStatus !=
+                                            CanvasNodeRunStatus.queued)
+                                      _LiveElapsedText(
+                                        startedAt: node.startedAt,
+                                        finishedAt: node.finishedAt,
+                                        running: node.running,
+                                        prefix:
+                                            '${node.runStatus.label(widget.isZh)} ',
+                                        style: TextStyle(
+                                          fontSize: 9.5,
+                                          fontWeight: FontWeight.w600,
+                                          color: statusTone,
+                                          fontFeatures: const [
+                                            FontFeature.tabularFigures(),
+                                          ],
+                                        ),
+                                      )
+                                    else
+                                      Text(
+                                        node.runStatus.label(widget.isZh),
+                                        style: TextStyle(
+                                          fontSize: 9.5,
+                                          fontWeight: FontWeight.w600,
+                                          color: statusTone,
+                                        ),
                                       ),
-                                    ),
                                   ],
                                 ),
                               ),
                               const SizedBox(width: 4),
                             ],
-                            // Subtle action icons (editor mode only)
                             if (!widget.readOnly)
                               AnimatedOpacity(
                                 opacity: _hovered || widget.selected ? 1.0 : 0.42,
@@ -3821,7 +6127,7 @@ class _CanvasCardWidgetState extends State<_CanvasCardWidget> {
                         child: _buildTailoredBody(colors, dark, ctrl, accent),
                       ),
                     ),
-                    // Clean Footer: Kind Pill + Hover Quick-Next + Resize Handle
+                    // Clean Footer: Kind Pill + Policy Badges + Hover Quick-Next + Resize Handle
                     Padding(
                       padding: const EdgeInsets.fromLTRB(10, 0, 6, 5),
                       child: Row(
@@ -3868,6 +6174,29 @@ class _CanvasCardWidgetState extends State<_CanvasCardWidget> {
                               ),
                             ),
                           ),
+                          if (node.maxRetries > 0) ...[
+                            const SizedBox(width: 4),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 4.5,
+                                vertical: 1,
+                              ),
+                              decoration: BoxDecoration(
+                                color: const Color(
+                                  0xFFD97706,
+                                ).withValues(alpha: 0.14),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text(
+                                '↻${node.maxRetries}',
+                                style: const TextStyle(
+                                  fontSize: 9,
+                                  fontWeight: FontWeight.w600,
+                                  color: Color(0xFFD97706),
+                                ),
+                              ),
+                            ),
+                          ],
                           if (!widget.readOnly) ...[
                             const SizedBox(width: 6),
                             if (node.kind.isExecutable &&
@@ -3881,11 +6210,15 @@ class _CanvasCardWidgetState extends State<_CanvasCardWidget> {
                               ),
                             const SizedBox(width: 4),
                             GestureDetector(
-                              onPanUpdate: (d) => ctrl.resizeNode(
-                                node.id,
-                                d.delta.dx / widget.scale,
-                                d.delta.dy / widget.scale,
-                              ),
+                              onPanStart: (_) => ctrl.pushUndoSnapshot(),
+                              onPanUpdate: (d) {
+                                final s = widget.scaleProvider();
+                                ctrl.resizeNode(
+                                  node.id,
+                                  d.delta.dx / s,
+                                  d.delta.dy / s,
+                                );
+                              },
                               onPanEnd: (_) => ctrl.commitLayout(),
                               child: MouseRegion(
                                 cursor: SystemMouseCursors.resizeUpLeftDownRight,
@@ -3910,51 +6243,31 @@ class _CanvasCardWidgetState extends State<_CanvasCardWidget> {
             ),
           ),
 
-          // Left Input Port (minimal clean 10px socket)
+          // Left Input Port (20x20 hit target around crisp 10px socket)
           if (node.kind.isExecutable && !widget.readOnly)
             Positioned(
-              left: -5,
-              top: node.height * 0.42 - 5,
+              left: -10,
+              top: node.height * 0.42 - 10,
               child: GestureDetector(
-                onTap: isConnectTarget ? widget.onSelect : null,
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 120),
-                  width: isConnectTarget ? 12 : 10,
-                  height: isConnectTarget ? 12 : 10,
-                  decoration: BoxDecoration(
-                    color: isConnectTarget
-                        ? const Color(0xFF2563EB)
-                        : cardSurface,
-                    shape: BoxShape.circle,
-                    border: Border.all(
-                      color: const Color(0xFF2563EB),
-                      width: isConnectTarget ? 2.4 : 1.7,
-                    ),
-                  ),
-                ),
-              ),
-            ),
-
-          // Right Output Port: On Pass (single clean emerald dot)
-          if (node.kind.isExecutable && !widget.readOnly)
-            Positioned(
-              right: -5,
-              top: node.height * 0.42 - 5,
-              child: Tooltip(
-                message: widget.isZh
-                    ? '点击拉出「通过」分支连线'
-                    : 'Wire On-Pass branch',
-                child: GestureDetector(
-                  onTap: () => widget.onStartConnect(CanvasEdgeBranch.onPass),
-                  child: MouseRegion(
-                    cursor: SystemMouseCursors.click,
-                    child: Container(
-                      width: 10,
-                      height: 10,
+                behavior: HitTestBehavior.opaque,
+                onTap: isConnectTarget ? _triggerSelect : null,
+                child: SizedBox(
+                  width: 20,
+                  height: 20,
+                  child: Center(
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 120),
+                      width: isConnectTarget ? 13 : 10,
+                      height: isConnectTarget ? 13 : 10,
                       decoration: BoxDecoration(
-                        color: const Color(0xFF16A34A),
+                        color: isConnectTarget
+                            ? const Color(0xFF2563EB)
+                            : cardSurface,
                         shape: BoxShape.circle,
-                        border: Border.all(color: cardSurface, width: 1.8),
+                        border: Border.all(
+                          color: const Color(0xFF2563EB),
+                          width: isConnectTarget ? 2.4 : 1.7,
+                        ),
                       ),
                     ),
                   ),
@@ -3962,28 +6275,77 @@ class _CanvasCardWidgetState extends State<_CanvasCardWidget> {
               ),
             ),
 
-          // Right Output Port: On Fail (single clean coral dot)
+          // Right Output Port: On Pass (20x20 hit target — Click OR Drag to Wire / Drop-to-Create!)
+          if (node.kind.isExecutable && !widget.readOnly)
+            Positioned(
+              right: -10,
+              top: node.height * 0.42 - 10,
+              child: Tooltip(
+                message: widget.isZh
+                    ? '拖拽或点击拉出「通过」连线（拖到空白处可快速新建节点）'
+                    : 'Drag or click to wire On-Pass (drop on canvas to create)',
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => widget.onStartConnect(CanvasEdgeBranch.onPass),
+                  onPanStart: (_) =>
+                      widget.onPortDragStart(CanvasEdgeBranch.onPass),
+                  onPanUpdate: (d) => widget.onPortDragUpdate(d.globalPosition),
+                  onPanEnd: (d) => widget.onPortDragEnd(d.globalPosition),
+                  child: MouseRegion(
+                    cursor: SystemMouseCursors.click,
+                    child: SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: Center(
+                        child: Container(
+                          width: _hovered || widget.selected ? 11.5 : 10,
+                          height: _hovered || widget.selected ? 11.5 : 10,
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF16A34A),
+                            shape: BoxShape.circle,
+                            border: Border.all(color: cardSurface, width: 1.8),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+          // Right Output Port: On Fail (20x20 hit target — Click OR Drag to Wire / Drop-to-Create!)
           if (node.kind.isExecutable &&
               node.kind != CanvasNodeKind.trigger &&
               !widget.readOnly)
             Positioned(
-              right: -5,
-              top: node.height * 0.74 - 5,
+              right: -10,
+              top: node.height * 0.74 - 10,
               child: Tooltip(
                 message: widget.isZh
-                    ? '点击拉出「失败」分支连线'
-                    : 'Wire On-Fail branch',
+                    ? '拖拽或点击拉出「失败」连线（拖到空白处可快速新建节点）'
+                    : 'Drag or click to wire On-Fail (drop on canvas to create)',
                 child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
                   onTap: () => widget.onStartConnect(CanvasEdgeBranch.onFail),
+                  onPanStart: (_) =>
+                      widget.onPortDragStart(CanvasEdgeBranch.onFail),
+                  onPanUpdate: (d) => widget.onPortDragUpdate(d.globalPosition),
+                  onPanEnd: (d) => widget.onPortDragEnd(d.globalPosition),
                   child: MouseRegion(
                     cursor: SystemMouseCursors.click,
-                    child: Container(
-                      width: 10,
-                      height: 10,
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFEF4444),
-                        shape: BoxShape.circle,
-                        border: Border.all(color: cardSurface, width: 1.8),
+                    child: SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: Center(
+                        child: Container(
+                          width: _hovered || widget.selected ? 11.5 : 10,
+                          height: _hovered || widget.selected ? 11.5 : 10,
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFEF4444),
+                            shape: BoxShape.circle,
+                            border: Border.all(color: cardSurface, width: 1.8),
+                          ),
+                        ),
                       ),
                     ),
                   ),
@@ -4252,9 +6614,10 @@ class _CanvasCardWidgetState extends State<_CanvasCardWidget> {
         widget.isZh,
       ),
       CanvasNodeKind.file =>
-        File(node.refId).existsSync()
-            ? File(node.refId).readAsStringSync()
-            : node.content,
+        _CanvasFsCache.filePreviewCached(node.refId, () {
+              if (mounted) setState(() {});
+            }) ??
+            node.content,
       _ => node.content,
     };
 
@@ -4404,6 +6767,7 @@ class _NodeInspectorPanel extends StatefulWidget {
     required this.node,
     this.run,
     required this.isZh,
+    this.cwd,
     this.width = 400,
     this.onResizeWidth,
     required this.onClose,
@@ -4418,6 +6782,7 @@ class _NodeInspectorPanel extends StatefulWidget {
   final CanvasNode node;
   final WorkflowRun? run;
   final bool isZh;
+  final String? cwd;
   final double width;
   final ValueChanged<double>? onResizeWidth;
   final VoidCallback onClose;
@@ -4448,32 +6813,69 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
   bool _resizingHover = false;
   bool _resizingActive = false;
 
+  void _parseConditionExpr(String raw, {bool initController = false}) {
+    final expr = raw.trim();
+    String op;
+    String val;
+    if (expr == 'exitZero' || expr.isEmpty) {
+      op = 'exitZero';
+      val = '';
+    } else if (expr.contains(':')) {
+      final idx = expr.indexOf(':');
+      final candidate = expr.substring(0, idx).trim();
+      op = const {'contains', 'notContains', 'regex', 'equals'}.contains(
+        candidate,
+      )
+          ? candidate
+          : 'contains';
+      val = expr.substring(idx + 1);
+    } else {
+      op = 'contains';
+      val = expr;
+    }
+    _condOp = op;
+    if (initController) {
+      _condValCtrl = TextEditingController(text: val);
+    } else {
+      _syncTextController(_condValCtrl, val);
+    }
+  }
+
+  void _syncTextController(TextEditingController c, String next) {
+    if (c.text == next) return;
+    c.value = TextEditingValue(
+      text: next,
+      selection: TextSelection.collapsed(offset: next.length),
+    );
+  }
+
   @override
   void initState() {
     super.initState();
-    // When inspecting a node inside a live/finished run snapshot, default to
-    // the Output tab (except active approval gates, which show the decision UI
-    // on tab 0).
     if (widget.run != null &&
         widget.node.runStatus != CanvasNodeRunStatus.waitingApproval &&
         (widget.node.output.isNotEmpty ||
             widget.node.runStatus != CanvasNodeRunStatus.idle)) {
       _tabIndex = 1;
     }
-    final expr = widget.node.conditionExpr.trim();
-    if (expr == 'exitZero' || expr.isEmpty) {
-      _condOp = 'exitZero';
-      _condValCtrl = TextEditingController();
-    } else if (expr.contains(':')) {
-      final idx = expr.indexOf(':');
-      final op = expr.substring(0, idx).trim();
-      _condOp = const {'contains', 'notContains', 'regex', 'equals'}.contains(op)
-          ? op
-          : 'contains';
-      _condValCtrl = TextEditingController(text: expr.substring(idx + 1));
-    } else {
-      _condOp = 'contains';
-      _condValCtrl = TextEditingController(text: expr);
+    _parseConditionExpr(widget.node.conditionExpr, initController: true);
+  }
+
+  @override
+  void didUpdateWidget(covariant _NodeInspectorPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Keep text controllers synchronized when Undo/Redo or AI Assist mutates
+    // the node externally without disturbing active typing.
+    _syncTextController(_titleCtrl, widget.node.title);
+    _syncTextController(_contentCtrl, widget.node.content);
+    _syncTextController(_refCtrl, widget.node.refId);
+    _syncTextController(_urlCtrl, widget.node.httpUrl);
+    _syncTextController(_headersCtrl, widget.node.httpHeaders);
+    final currentExpr = _condOp == 'exitZero'
+        ? 'exitZero'
+        : '$_condOp:${_condValCtrl.text}';
+    if (widget.node.conditionExpr.trim() != currentExpr.trim()) {
+      _parseConditionExpr(widget.node.conditionExpr);
     }
   }
 
@@ -4487,6 +6889,75 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
     _approvalInputCtrl.dispose();
     _condValCtrl.dispose();
     super.dispose();
+  }
+
+  List<({String label, String token, Color tone})> _dynamicVarChips(
+    List<CanvasNode> allNodes,
+    bool isZh,
+  ) {
+    final chips = <({String label, String token, Color tone})>[
+      (
+        label: isZh ? '上游输出' : 'Prev Output',
+        token: '{{prev.output}}',
+        tone: const Color(0xFF2563EB),
+      ),
+      (
+        label: isZh ? '退出码' : 'Exit Code',
+        token: '{{prev.exitCode}}',
+        tone: const Color(0xFF7C3AED),
+      ),
+      (
+        label: isZh ? '人工意见' : 'Approval Note',
+        token: '{{approval.note}}',
+        tone: const Color(0xFFD97706),
+      ),
+      (
+        label: isZh ? '工作区路径' : 'Root Path',
+        token: '{{input.root}}',
+        tone: const Color(0xFF0891B2),
+      ),
+    ];
+    final seen = {for (final c in chips) c.token};
+    for (final n in allNodes) {
+      if (n.kind != CanvasNodeKind.trigger) continue;
+      final pairs = CanvasController.parseKeyValueLines(n.content);
+      for (final key in pairs.keys) {
+        final tok = '{{input.$key}}';
+        if (seen.add(tok)) {
+          chips.add((label: key, token: tok, tone: const Color(0xFF16A34A)));
+        }
+      }
+    }
+    return chips;
+  }
+
+  Future<void> _openAiAssist(List<CanvasNode> allNodes) async {
+    final vars = [
+      for (final c in _dynamicVarChips(allNodes, widget.isZh)) c.token,
+    ];
+    final generated = await showCanvasNodeAiAssistDialog(
+      context,
+      node: widget.node,
+      availableVars: vars,
+      isZh: widget.isZh,
+      cwd: widget.cwd,
+    );
+    if (!mounted || generated == null) return;
+    if (widget.node.kind == CanvasNodeKind.condition) {
+      final expr = generated.trim();
+      _parseConditionExpr(expr);
+      setState(() {});
+      CanvasController.instance.updateNode(
+        widget.node.id,
+        conditionExpr: expr,
+      );
+    } else {
+      _syncTextController(_contentCtrl, generated);
+      CanvasController.instance.updateNode(
+        widget.node.id,
+        content: generated,
+      );
+    }
   }
 
   void _syncCondition() {
@@ -4596,7 +7067,10 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
               fillColor: fieldFill,
               borderColor: subtleBorder,
               colors: colors,
-              onChanged: (v) => ctrl.updateNode(node.id, title: v),
+              readOnly: isReadOnly,
+              onChanged: isReadOnly
+                  ? null
+                  : (v) => ctrl.updateNode(node.id, title: v),
             ),
             if (node.kind == CanvasNodeKind.command ||
                 node.kind == CanvasNodeKind.agent ||
@@ -4613,8 +7087,11 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                 colors: colors,
                 mono: true,
                 fontSize: 11.5,
+                readOnly: isReadOnly,
                 placeholder: '{{input.root}}',
-                onChanged: (v) => ctrl.updateNode(node.id, refId: v),
+                onChanged: isReadOnly
+                    ? null
+                    : (v) => ctrl.updateNode(node.id, refId: v),
               ),
             ],
           ],
@@ -4629,12 +7106,15 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
           accent: const Color(0xFF2563EB),
           colors: colors,
           hairline: hairline,
-          child: _AgentModelSelectorSection(
-            ctrl: ctrl,
-            run: run,
-            node: node,
-            agents: agents,
-            isZh: isZh,
+          child: IgnorePointer(
+            ignoring: isReadOnly,
+            child: _AgentModelSelectorSection(
+              ctrl: ctrl,
+              run: run,
+              node: node,
+              agents: agents,
+              isZh: isZh,
+            ),
           ),
         ),
 
@@ -4662,7 +7142,9 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                       borderColor: subtleBorder,
                       colors: colors,
                       mono: true,
-                      onTap: () => ctrl.updateNode(node.id, httpMethod: m),
+                      onTap: isReadOnly
+                          ? () {}
+                          : () => ctrl.updateNode(node.id, httpMethod: m),
                     ),
                 ],
               ),
@@ -4675,8 +7157,11 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                 colors: colors,
                 mono: true,
                 fontSize: 11.5,
+                readOnly: isReadOnly,
                 placeholder: 'http://pomeloc.top/bugs/...',
-                onChanged: (v) => ctrl.updateNode(node.id, httpUrl: v),
+                onChanged: isReadOnly
+                    ? null
+                    : (v) => ctrl.updateNode(node.id, httpUrl: v),
               ),
               const SizedBox(height: 12),
               _subLabel(isZh ? '请求头（每行 Key: Value）' : 'Headers'),
@@ -4690,8 +7175,11 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                 fontSize: 11.5,
                 minLines: 2,
                 maxLines: 5,
+                readOnly: isReadOnly,
                 placeholder: 'Authorization: Bearer ...',
-                onChanged: (v) => ctrl.updateNode(node.id, httpHeaders: v),
+                onChanged: isReadOnly
+                    ? null
+                    : (v) => ctrl.updateNode(node.id, httpHeaders: v),
               ),
             ],
           ),
@@ -4705,6 +7193,13 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
           accent: const Color(0xFFD97706),
           colors: colors,
           hairline: hairline,
+          trailing: isReadOnly
+              ? null
+              : _ghostAction(
+                  label: isZh ? '✨ AI 帮写' : '✨ AI Assist',
+                  accent: const Color(0xFF8B5CF6),
+                  onTap: () => unawaited(_openAiAssist(allNodes)),
+                ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
@@ -4726,10 +7221,12 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                       fillColor: fieldFill,
                       borderColor: subtleBorder,
                       colors: colors,
-                      onTap: () {
-                        setState(() => _condOp = op);
-                        _syncCondition();
-                      },
+                      onTap: isReadOnly
+                          ? () {}
+                          : () {
+                              setState(() => _condOp = op);
+                              _syncCondition();
+                            },
                     ),
                 ],
               ),
@@ -4742,8 +7239,11 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                   borderColor: subtleBorder,
                   colors: colors,
                   mono: true,
-                  placeholder: isZh ? '匹配值（如 PASS 或 FAIL）' : 'Match value...',
-                  onChanged: (_) => _syncCondition(),
+                  readOnly: isReadOnly,
+                  placeholder: isZh
+                      ? '匹配值（支持 {{input.xxx}} 变量）'
+                      : 'Match value (supports {{input.xxx}})...',
+                  onChanged: isReadOnly ? null : (_) => _syncCondition(),
                 ),
               ],
             ],
@@ -4762,21 +7262,34 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
             CanvasNodeKind.http => isZh ? 'JSON 请求体' : 'JSON BODY',
             CanvasNodeKind.approval =>
               isZh ? '审批引导与展示内容' : 'APPROVAL BRIEF',
+            CanvasNodeKind.group => isZh ? '分组说明' : 'GROUP DESCRIPTION',
             _ => isZh ? '内容' : 'CONTENT',
           },
           accent: accent,
           colors: colors,
           hairline: hairline,
-          trailing: node.kind == CanvasNodeKind.trigger
-              ? _ghostAction(
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (!isReadOnly &&
+                  node.kind != CanvasNodeKind.group &&
+                  node.kind != CanvasNodeKind.trigger)
+                _ghostAction(
+                  label: isZh ? '✨ AI 帮写' : '✨ AI Assist',
+                  accent: const Color(0xFF8B5CF6),
+                  onTap: () => unawaited(_openAiAssist(allNodes)),
+                ),
+              if (node.kind == CanvasNodeKind.trigger)
+                _ghostAction(
                   label: _triggerRawMode
                       ? (isZh ? '键值视图' : 'KV View')
                       : (isZh ? '源码模式' : 'Raw'),
                   accent: accent,
                   onTap: () =>
                       setState(() => _triggerRawMode = !_triggerRawMode),
-                )
-              : null,
+                ),
+            ],
+          ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
@@ -4786,6 +7299,7 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                   fillColor: fieldFill,
                   borderColor: subtleBorder,
                   colors: colors,
+                  readOnly: isReadOnly,
                 )
               else
                 _studioField(
@@ -4800,10 +7314,14 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                   lineHeight: 1.55,
                   minLines: isCodeContent ? 6 : 5,
                   maxLines: isCodeContent ? 15 : 12,
-                  onChanged: (v) => ctrl.updateNode(node.id, content: v),
+                  readOnly: isReadOnly,
+                  onChanged: isReadOnly
+                      ? null
+                      : (v) => ctrl.updateNode(node.id, content: v),
                 ),
               if (node.kind.isExecutable &&
-                  node.kind != CanvasNodeKind.trigger) ...[
+                  node.kind != CanvasNodeKind.trigger &&
+                  !isReadOnly) ...[
                 const SizedBox(height: 11),
                 Row(
                   children: [
@@ -4816,7 +7334,9 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                     ),
                     const SizedBox(width: 5),
                     Text(
-                      isZh ? '插入上下文变量' : 'Insert variable',
+                      isZh
+                          ? '插入上下文变量（支持 ?? 默认值 与 | shell / json）'
+                          : 'Insert variable (supports ?? fallback & | shell/json)',
                       style: TextStyle(
                         fontSize: 10.5,
                         letterSpacing: 0.15,
@@ -4832,38 +7352,12 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                   spacing: 6,
                   runSpacing: 6,
                   children: [
-                    for (final (label, token, tone) in [
-                      (
-                        isZh ? '上游输出' : 'Prev Output',
-                        '{{prev.output}}',
-                        const Color(0xFF2563EB),
-                      ),
-                      (
-                        isZh ? '人工意见' : 'Approval Note',
-                        '{{approval.note}}',
-                        const Color(0xFFD97706),
-                      ),
-                      (
-                        isZh ? '留证目录' : 'Evidence Dir',
-                        '{{input.evidenceDir}}',
-                        const Color(0xFF16A34A),
-                      ),
-                      (
-                        isZh ? '工作区根路径' : 'Root Path',
-                        '{{input.root}}',
-                        const Color(0xFF7C3AED),
-                      ),
-                      (
-                        isZh ? 'Bug 平台' : 'Bugs URL',
-                        '{{input.bugsUrl}}',
-                        const Color(0xFF0891B2),
-                      ),
-                    ])
+                    for (final chip in _dynamicVarChips(allNodes, isZh))
                       Tooltip(
-                        message: token,
+                        message: chip.token,
                         child: InkWell(
                           borderRadius: BorderRadius.circular(5),
-                          onTap: () => _insertVar(token),
+                          onTap: () => _insertVar(chip.token),
                           child: Container(
                             padding: const EdgeInsets.symmetric(
                               horizontal: 8,
@@ -4881,13 +7375,13 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                                   width: 5,
                                   height: 5,
                                   decoration: BoxDecoration(
-                                    color: tone,
+                                    color: chip.tone,
                                     shape: BoxShape.circle,
                                   ),
                                 ),
                                 const SizedBox(width: 5.5),
                                 Text(
-                                  label,
+                                  chip.label,
                                   style: TextStyle(
                                     fontSize: 10.8,
                                     fontWeight: FontWeight.w500,
@@ -4906,6 +7400,162 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
           ),
         ),
 
+      // Execution Policy: Timeout, Automatic Retries & Failure Recovery Flag
+      if (node.kind.isExecutable && node.kind != CanvasNodeKind.trigger)
+        _editorialSection(
+          index: nextIndex(),
+          title: isZh ? '执行策略与容错' : 'EXECUTION POLICY',
+          accent: const Color(0xFF0891B2),
+          colors: colors,
+          hairline: hairline,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _subLabel(
+                isZh
+                    ? '单步超时时间（当前 ${node.timeoutSeconds}s）'
+                    : 'Timeout (${node.timeoutSeconds}s)',
+              ),
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: [
+                  for (final sec in const [60, 180, 300, 600, 1800])
+                    _pillChoice(
+                      label: sec >= 60 ? '${sec ~/ 60}m' : '${sec}s',
+                      selected: node.timeoutSeconds == sec,
+                      accent: const Color(0xFF0891B2),
+                      fillColor: fieldFill,
+                      borderColor: subtleBorder,
+                      colors: colors,
+                      mono: true,
+                      onTap: isReadOnly
+                          ? () {}
+                          : () => ctrl.updateNode(
+                              node.id,
+                              timeoutSeconds: sec,
+                            ),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 11),
+              _subLabel(
+                isZh ? '失败自动重试次数' : 'Auto Retries on Failure',
+              ),
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: [
+                  for (final r in const [0, 1, 2, 3])
+                    _pillChoice(
+                      label: r == 0
+                          ? (isZh ? '不重试' : 'Off')
+                          : (isZh ? '重试 $r 次' : '${r}x'),
+                      selected: node.maxRetries == r,
+                      accent: const Color(0xFFD97706),
+                      fillColor: fieldFill,
+                      borderColor: subtleBorder,
+                      colors: colors,
+                      onTap: isReadOnly
+                          ? () {}
+                          : () => ctrl.updateNode(node.id, maxRetries: r),
+                    ),
+                ],
+              ),
+              if (node.maxRetries > 0) ...[
+                const SizedBox(height: 9),
+                _subLabel(
+                  isZh
+                      ? '重试退避间隔（当前 ${node.retryDelaySeconds}s）'
+                      : 'Retry Backoff (${node.retryDelaySeconds}s)',
+                ),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: [
+                    for (final d in const [1, 2, 5, 10, 30])
+                      _pillChoice(
+                        label: '${d}s',
+                        selected: node.retryDelaySeconds == d,
+                        accent: const Color(0xFFD97706),
+                        fillColor: fieldFill,
+                        borderColor: subtleBorder,
+                        colors: colors,
+                        mono: true,
+                        onTap: isReadOnly
+                            ? () {}
+                            : () => ctrl.updateNode(
+                                node.id,
+                                retryDelaySeconds: d,
+                              ),
+                      ),
+                  ],
+                ),
+              ],
+              const SizedBox(height: 11),
+              InkWell(
+                borderRadius: BorderRadius.circular(6),
+                onTap: isReadOnly
+                    ? null
+                    : () => ctrl.updateNode(
+                        node.id,
+                        recoversFailure: !node.recoversFailure,
+                      ),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 3),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: Checkbox(
+                          value: node.recoversFailure,
+                          onChanged: isReadOnly
+                              ? null
+                              : (v) => ctrl.updateNode(
+                                  node.id,
+                                  recoversFailure: v ?? false,
+                                ),
+                          materialTapTargetSize:
+                              MaterialTapTargetSize.shrinkWrap,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              isZh
+                                  ? '作为失败恢复节点（成功后将工作流标记为通过）'
+                                  : 'Marks workflow recovered when run via onFail',
+                              style: TextStyle(
+                                fontSize: 11.2,
+                                fontWeight: FontWeight.w500,
+                                color: colors['foreground'],
+                              ),
+                            ),
+                            Text(
+                              isZh
+                                  ? '关闭时：诊断/告警等 onFail 节点执行完毕仍保留整条流程的失败状态'
+                                  : 'When off, diagnostic/alert fail handlers preserve failure status.',
+                              style: TextStyle(
+                                fontSize: 10.2,
+                                color: colors['descriptionForeground'],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+
       // Downstream Branch Routing
       if (node.kind.isExecutable)
         _editorialSection(
@@ -4916,7 +7566,7 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
           accent: const Color(0xFF16A34A),
           colors: colors,
           hairline: hairline,
-          trailing: otherTargets.isEmpty
+          trailing: isReadOnly || otherTargets.isEmpty
               ? null
               : PopupMenuButton<(String, CanvasEdgeBranch)>(
                   color: dark ? const Color(0xFF1F2228) : Colors.white,
@@ -5372,15 +8022,14 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                                     ],
                                   ),
                                 ),
+                              // Read-only snapshots remain selectable & copyable via readOnly fields!
                               if (isReadOnly)
-                                IgnorePointer(
-                                  child: Opacity(
-                                    opacity: 0.88,
-                                    child: Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.stretch,
-                                      children: sections,
-                                    ),
+                                Opacity(
+                                  opacity: 0.92,
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.stretch,
+                                    children: sections,
                                   ),
                                 )
                               else
@@ -5390,83 +8039,95 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                         ),
                 ),
 
-                // 3. Streamlined Sticky Footer Bar
+                // 3. Streamlined Responsive Sticky Footer Bar
                 Container(
                   padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 10,
+                    horizontal: 14,
+                    vertical: 9,
                   ),
                   decoration: BoxDecoration(
                     color: panelBg,
                     border: Border(top: BorderSide(color: hairline)),
                   ),
-                  child: Row(
+                  child: Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    alignment: WrapAlignment.spaceBetween,
+                    crossAxisAlignment: WrapCrossAlignment.center,
                     children: [
                       if (!isReadOnly) ...[
-                        Tooltip(
-                          message: isZh ? '复制节点' : 'Duplicate node',
-                          child: InkWell(
-                            borderRadius: BorderRadius.circular(6),
-                            onTap: widget.onDuplicate,
-                            child: Padding(
-                              padding: const EdgeInsets.all(6),
-                              child: Icon(
-                                Codicons.copy,
-                                size: 13.5,
-                                color: colors['descriptionForeground'],
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Tooltip(
+                              message: isZh ? '复制节点' : 'Duplicate node',
+                              child: InkWell(
+                                borderRadius: BorderRadius.circular(6),
+                                onTap: widget.onDuplicate,
+                                child: Padding(
+                                  padding: const EdgeInsets.all(6),
+                                  child: Icon(
+                                    Codicons.copy,
+                                    size: 13.5,
+                                    color: colors['descriptionForeground'],
+                                  ),
+                                ),
                               ),
                             ),
-                          ),
-                        ),
-                        const SizedBox(width: 4),
-                        Tooltip(
-                          message: isZh ? '删除节点' : 'Delete node',
-                          child: InkWell(
-                            borderRadius: BorderRadius.circular(6),
-                            onTap: widget.onDelete,
-                            child: const Padding(
-                              padding: EdgeInsets.all(6),
-                              child: Icon(
-                                Codicons.trash,
-                                size: 13.5,
-                                color: Color(0xFFEF4444),
+                            const SizedBox(width: 2),
+                            Tooltip(
+                              message: isZh ? '删除节点' : 'Delete node',
+                              child: InkWell(
+                                borderRadius: BorderRadius.circular(6),
+                                onTap: widget.onDelete,
+                                child: const Padding(
+                                  padding: EdgeInsets.all(6),
+                                  child: Icon(
+                                    Codicons.trash,
+                                    size: 13.5,
+                                    color: Color(0xFFEF4444),
+                                  ),
+                                ),
                               ),
                             ),
-                          ),
+                          ],
                         ),
-                        const Spacer(),
-                        if (widget.onResumeFromNode != null) ...[
-                          IdeButton(
-                            label: isZh ? '从此节点运行' : 'Run Here',
-                            icon: Codicons.debugContinue,
-                            secondary: true,
-                            onPressed: node.running
-                                ? null
-                                : widget.onResumeFromNode,
-                          ),
-                          const SizedBox(width: 6),
-                        ],
-                        if (node.kind == CanvasNodeKind.command ||
-                            node.kind == CanvasNodeKind.agent ||
-                            node.kind == CanvasNodeKind.http)
-                          IdeButton(
-                            label: node.running
-                                ? (isZh ? '执行中…' : 'Running...')
-                                : (isZh ? '单步试跑' : 'Test Step'),
-                            icon: Codicons.play,
-                            onPressed: node.running
-                                ? null
-                                : () {
-                                    setState(() => _tabIndex = 1);
-                                    widget.onTestRun();
-                                  },
-                          )
-                        else
-                          IdeButton(
-                            label: isZh ? '完成' : 'Done',
-                            secondary: true,
-                            onPressed: widget.onClose,
-                          ),
+                        Wrap(
+                          spacing: 6,
+                          runSpacing: 6,
+                          children: [
+                            if (widget.onResumeFromNode != null)
+                              IdeButton(
+                                label: isZh ? '从此节点运行' : 'Run Here',
+                                icon: Codicons.debugContinue,
+                                secondary: true,
+                                onPressed: node.running
+                                    ? null
+                                    : widget.onResumeFromNode,
+                              ),
+                            if (node.kind == CanvasNodeKind.command ||
+                                node.kind == CanvasNodeKind.agent ||
+                                node.kind == CanvasNodeKind.http)
+                              IdeButton(
+                                label: node.running
+                                    ? (isZh ? '执行中…' : 'Running...')
+                                    : (isZh ? '单步试跑' : 'Test Step'),
+                                icon: Codicons.play,
+                                onPressed: node.running
+                                    ? null
+                                    : () {
+                                        setState(() => _tabIndex = 1);
+                                        widget.onTestRun();
+                                      },
+                              )
+                            else
+                              IdeButton(
+                                label: isZh ? '完成' : 'Done',
+                                secondary: true,
+                                onPressed: widget.onClose,
+                              ),
+                          ],
+                        ),
                       ] else ...[
                         if (widget.onSwitchToEdit != null)
                           IdeButton(
@@ -5475,19 +8136,22 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                             secondary: true,
                             onPressed: widget.onSwitchToEdit,
                           ),
-                        const Spacer(),
-                        if (widget.onResumeFromNode != null) ...[
-                          IdeButton(
-                            label: isZh ? '从本节点续跑' : 'Resume Here',
-                            icon: Codicons.debugContinue,
-                            onPressed: widget.onResumeFromNode,
-                          ),
-                          const SizedBox(width: 6),
-                        ],
-                        IdeButton(
-                          label: isZh ? '关闭' : 'Close',
-                          secondary: true,
-                          onPressed: widget.onClose,
+                        Wrap(
+                          spacing: 6,
+                          runSpacing: 6,
+                          children: [
+                            if (widget.onResumeFromNode != null)
+                              IdeButton(
+                                label: isZh ? '从本节点续跑' : 'Resume Here',
+                                icon: Codicons.debugContinue,
+                                onPressed: widget.onResumeFromNode,
+                              ),
+                            IdeButton(
+                              label: isZh ? '关闭' : 'Close',
+                              secondary: true,
+                              onPressed: widget.onClose,
+                            ),
+                          ],
                         ),
                       ],
                     ],
@@ -5531,6 +8195,7 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
     required Color fillColor,
     required Color borderColor,
     required dynamic colors,
+    bool readOnly = false,
   }) {
     final pairs = CanvasController.parseKeyValueLines(_contentCtrl.text);
     if (pairs.isEmpty) {
@@ -5543,8 +8208,13 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
         mono: true,
         minLines: 4,
         maxLines: 10,
-        onChanged: (v) =>
-            CanvasController.instance.updateNode(widget.node.id, content: v),
+        readOnly: readOnly,
+        onChanged: readOnly
+            ? null
+            : (v) => CanvasController.instance.updateNode(
+                widget.node.id,
+                content: v,
+              ),
       );
     }
     return Column(
@@ -5567,9 +8237,14 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                 ),
                 const SizedBox(height: 4),
                 TextFormField(
-                  key: ValueKey('kv-${widget.node.id}-${entry.key}'),
+                  key: ValueKey(
+                    'kv-${widget.node.id}-${entry.key}-${entry.value}',
+                  ),
                   initialValue: entry.value,
-                  onChanged: (v) => _updateTriggerKey(entry.key, v),
+                  readOnly: readOnly,
+                  onChanged: readOnly
+                      ? null
+                      : (v) => _updateTriggerKey(entry.key, v),
                   style: TextStyle(
                     fontSize: 11.8,
                     fontFamily: AppFonts.mono,
@@ -5659,21 +8334,22 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                 alpha: 0.7,
               ),
             ),
-            const SizedBox(width: 2),
-            InkWell(
-              borderRadius: BorderRadius.circular(4),
-              onTap: () => ctrl.removeEdge(edge.id),
-              child: Padding(
-                padding: const EdgeInsets.all(4),
-                child: Icon(
-                  Codicons.close,
-                  size: 11.5,
-                  color: (colors['descriptionForeground'] as Color).withValues(
-                    alpha: 0.75,
+            if (widget.run == null) ...[
+              const SizedBox(width: 2),
+              InkWell(
+                borderRadius: BorderRadius.circular(4),
+                onTap: () => ctrl.removeEdge(edge.id),
+                child: Padding(
+                  padding: const EdgeInsets.all(4),
+                  child: Icon(
+                    Codicons.close,
+                    size: 11.5,
+                    color: (colors['descriptionForeground'] as Color)
+                        .withValues(alpha: 0.75),
                   ),
                 ),
               ),
-            ),
+            ],
           ],
         ),
       ),
@@ -5693,7 +8369,12 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
     final evDir = CanvasController.resolveEvidenceDirFromNodes(
       widget.run?.nodes ?? CanvasController.instance.nodes,
     );
-    final hasExistingEvDir = evDir != null && Directory(evDir).existsSync();
+    final hasExistingEvDir =
+        evDir != null &&
+        _CanvasFsCache.existsCached(evDir, () {
+              if (mounted) setState(() {});
+            }) ==
+            true;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -5812,7 +8493,7 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                     if (hasExistingEvDir)
                       InkWell(
                         borderRadius: BorderRadius.circular(4),
-                        onTap: () => unawaited(Process.run('open', [evDir])),
+                        onTap: () => unawaited(_openPathInOs(evDir)),
                         child: Padding(
                           padding: const EdgeInsets.symmetric(
                             horizontal: 5,
@@ -5934,8 +8615,12 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
     required Color hairline,
   }) {
     final lower = path.toLowerCase();
-    final exists = File(path).existsSync();
-    final baseName = path.split('/').last;
+    final exists =
+        _CanvasFsCache.existsCached(path, () {
+          if (mounted) setState(() {});
+        }) ==
+        true;
+    final baseName = p.basename(path);
     final IconData icon;
     final Color tone;
     if (lower.endsWith('.webm') ||
@@ -5975,8 +8660,9 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                 left: Radius.circular(5),
               ),
               onTap: exists
-                  ? () => unawaited(Process.run('open', [path]))
-                  : () => unawaited(Clipboard.setData(ClipboardData(text: path))),
+                  ? () => unawaited(_openPathInOs(path))
+                  : () =>
+                        unawaited(Clipboard.setData(ClipboardData(text: path))),
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(7, 4, 5, 4),
                 child: Row(
@@ -6015,7 +8701,7 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
                 borderRadius: const BorderRadius.horizontal(
                   right: Radius.circular(5),
                 ),
-                onTap: () => unawaited(Process.run('open', ['-R', path])),
+                onTap: () => unawaited(_openPathInOs(path, reveal: true)),
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(3, 4, 6, 4),
                   child: Icon(
@@ -6166,6 +8852,7 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
     String? placeholder,
     bool mono = false,
     bool accentRail = false,
+    bool readOnly = false,
     double fontSize = 12.2,
     double lineHeight = 1.45,
     int minLines = 1,
@@ -6174,6 +8861,7 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
   }) {
     final field = TextField(
       controller: controller,
+      readOnly: readOnly,
       minLines: minLines,
       maxLines: maxLines,
       onChanged: onChanged,
@@ -7209,20 +9897,25 @@ class _WorkflowEdgesPainter extends CustomPainter {
   const _WorkflowEdgesPainter({
     required this.nodes,
     required this.edges,
-    this.selectedNodeId,
-    this.connectingFrom,
-    this.pointerPos,
+    required this.selectedNodeIds,
+    this.selectedEdgeId,
+    required this.layoutVersion,
   });
 
   final List<CanvasNode> nodes;
   final List<CanvasEdge> edges;
-  final String? selectedNodeId;
-  final ({String fromId, CanvasEdgeBranch branch})? connectingFrom;
-  final Offset? pointerPos;
+  final Set<String> selectedNodeIds;
+  final String? selectedEdgeId;
+  final int layoutVersion;
 
   @override
   void paint(Canvas canvas, Size size) {
     final byId = {for (final n in nodes) n.id: n};
+    final linePaint = Paint()
+      ..strokeCap = StrokeCap.round
+      ..style = PaintingStyle.stroke;
+    final arrowPaint = Paint()..style = PaintingStyle.fill;
+
     for (final edge in edges) {
       final from = byId[edge.fromId];
       final to = byId[edge.toId];
@@ -7230,15 +9923,19 @@ class _WorkflowEdgesPainter extends CustomPainter {
 
       final geom = _computeEdgeGeometry(from, to, edge.branch);
       final color = _branchColor(edge.branch);
+      final isSelectedEdge = edge.id == selectedEdgeId;
       final isHot =
+          isSelectedEdge ||
           (from.runStatus == CanvasNodeRunStatus.succeeded &&
               edge.branch == CanvasEdgeBranch.onPass) ||
           (from.runStatus == CanvasNodeRunStatus.failed &&
               edge.branch == CanvasEdgeBranch.onFail) ||
-          edge.fromId == selectedNodeId ||
-          edge.toId == selectedNodeId;
+          selectedNodeIds.contains(edge.fromId) ||
+          selectedNodeIds.contains(edge.toId);
 
-      final alpha = isHot
+      final alpha = isSelectedEdge
+          ? 1.0
+          : isHot
           ? 0.9
           : (edge.branch == CanvasEdgeBranch.onFail ? 0.48 : 0.55);
 
@@ -7246,42 +9943,24 @@ class _WorkflowEdgesPainter extends CustomPainter {
         canvas,
         geom: geom,
         color: color.withValues(alpha: alpha),
-        strokeWidth: isHot ? 2.2 : 1.5,
+        strokeWidth: isSelectedEdge ? 2.8 : (isHot ? 2.2 : 1.5),
+        linePaint: linePaint,
+        arrowPaint: arrowPaint,
       );
-    }
-
-    // Live preview wire while connecting
-    if ((connectingFrom, pointerPos) case (final conn?, final target?)) {
-      if (byId[conn.fromId] case final from?) {
-        final p0 = _outputPortOffset(from, conn.branch);
-        final dx = math.max(48.0, (target.dx - p0.dx).abs() * 0.45);
-        _drawStyledEdge(
-          canvas,
-          geom: (
-            p0: p0,
-            c1: Offset(p0.dx + dx, p0.dy),
-            c2: Offset(target.dx - dx, target.dy),
-            p3: target,
-            endAngle: 0.0,
-          ),
-          color: _branchColor(conn.branch).withValues(alpha: 0.85),
-          strokeWidth: 2.0,
-        );
-      }
     }
   }
 
-  void _drawStyledEdge(
+  static void _drawStyledEdge(
     Canvas canvas, {
     required _EdgeGeometry geom,
     required Color color,
     required double strokeWidth,
+    required Paint linePaint,
+    required Paint arrowPaint,
   }) {
-    final paint = Paint()
+    linePaint
       ..color = color
-      ..strokeWidth = strokeWidth
-      ..strokeCap = StrokeCap.round
-      ..style = PaintingStyle.stroke;
+      ..strokeWidth = strokeWidth;
 
     final path = Path()
       ..moveTo(geom.p0.dx, geom.p0.dy)
@@ -7293,15 +9972,12 @@ class _WorkflowEdgesPainter extends CustomPainter {
         geom.p3.dx,
         geom.p3.dy,
       );
-    canvas.drawPath(path, paint);
+    canvas.drawPath(path, linePaint);
 
-    // Rotated clean arrowhead pointing along endAngle
     canvas.save();
     canvas.translate(geom.p3.dx, geom.p3.dy);
     canvas.rotate(geom.endAngle);
-    final arrowPaint = Paint()
-      ..color = color
-      ..style = PaintingStyle.fill;
+    arrowPaint.color = color;
     const s = 5.5;
     final arrow = Path()
       ..moveTo(0, 0)
@@ -7313,28 +9989,172 @@ class _WorkflowEdgesPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _WorkflowEdgesPainter oldDelegate) => true;
+  bool shouldRepaint(covariant _WorkflowEdgesPainter oldDelegate) =>
+      oldDelegate.layoutVersion != layoutVersion ||
+      oldDelegate.selectedEdgeId != selectedEdgeId ||
+      oldDelegate.selectedNodeIds.length != selectedNodeIds.length ||
+      !oldDelegate.selectedNodeIds.containsAll(selectedNodeIds) ||
+      oldDelegate.edges.length != edges.length ||
+      oldDelegate.nodes.length != nodes.length;
 }
 
-class _DotGridPainter extends CustomPainter {
-  _DotGridPainter({required this.dotColor});
+class _LiveWirePainter extends CustomPainter {
+  const _LiveWirePainter({
+    required this.fromNode,
+    required this.branch,
+    required this.targetPos,
+  });
 
-  final Color dotColor;
+  final CanvasNode? fromNode;
+  final CanvasEdgeBranch branch;
+  final Offset? targetPos;
 
   @override
   void paint(Canvas canvas, Size size) {
-    final paint = Paint()..color = dotColor;
-    const step = 22.0;
-    for (double x = 0; x < size.width; x += step) {
-      for (double y = 0; y < size.height; y += step) {
-        canvas.drawCircle(Offset(x, y), 0.95, paint);
+    final from = fromNode;
+    final target = targetPos;
+    if (from == null || target == null) return;
+    final p0 = _outputPortOffset(from, branch);
+    final dx = math.max(48.0, (target.dx - p0.dx).abs() * 0.45);
+    final linePaint = Paint()
+      ..strokeCap = StrokeCap.round
+      ..style = PaintingStyle.stroke;
+    final arrowPaint = Paint()..style = PaintingStyle.fill;
+    _WorkflowEdgesPainter._drawStyledEdge(
+      canvas,
+      geom: (
+        p0: p0,
+        c1: Offset(p0.dx + dx, p0.dy),
+        c2: Offset(target.dx - dx, target.dy),
+        p3: target,
+        endAngle: 0.0,
+      ),
+      color: _branchColor(branch).withValues(alpha: 0.9),
+      strokeWidth: 2.2,
+      linePaint: linePaint,
+      arrowPaint: arrowPaint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _LiveWirePainter oldDelegate) =>
+      oldDelegate.targetPos != targetPos ||
+      oldDelegate.fromNode?.id != fromNode?.id ||
+      oldDelegate.branch != branch;
+}
+
+class _SnapGuidesPainter extends CustomPainter {
+  const _SnapGuidesPainter({required this.guides});
+
+  final List<_SnapGuide> guides;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (guides.isEmpty) return;
+    final paint = Paint()
+      ..color = const Color(0xFF3B82F6).withValues(alpha: 0.85)
+      ..strokeWidth = 1.15
+      ..style = PaintingStyle.stroke;
+    for (final g in guides) {
+      if (g.vertical) {
+        canvas.drawLine(Offset(g.pos, g.start), Offset(g.pos, g.end), paint);
+      } else {
+        canvas.drawLine(Offset(g.start, g.pos), Offset(g.end, g.pos), paint);
       }
     }
   }
 
   @override
+  bool shouldRepaint(covariant _SnapGuidesPainter oldDelegate) =>
+      oldDelegate.guides != guides;
+}
+
+class _MarqueePainter extends CustomPainter {
+  const _MarqueePainter({required this.rect});
+
+  final Rect? rect;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final r = rect;
+    if (r == null || r.isEmpty) return;
+    canvas.drawRect(
+      r,
+      Paint()
+        ..color = const Color(0xFF2563EB).withValues(alpha: 0.12)
+        ..style = PaintingStyle.fill,
+    );
+    canvas.drawRect(
+      r,
+      Paint()
+        ..color = const Color(0xFF3B82F6).withValues(alpha: 0.85)
+        ..strokeWidth = 1.2
+        ..style = PaintingStyle.stroke,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _MarqueePainter oldDelegate) =>
+      oldDelegate.rect != rect;
+}
+
+/// High-performance viewport-culled dot grid using batched `drawPoints`
+/// instead of 24,000+ individual `drawCircle` calls.
+class _DotGridPainter extends CustomPainter {
+  _DotGridPainter({
+    required this.dotColor,
+    required this.transform,
+    required this.viewportSize,
+  }) : super(repaint: transform);
+
+  final Color dotColor;
+  final TransformationController transform;
+  final Size viewportSize;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const step = 22.0;
+    final m = transform.value;
+    final scale = m.getMaxScaleOnAxis().clamp(0.15, 5.0);
+    // Double grid spacing when zoomed far out to avoid moire & save GPU points.
+    final effectiveStep = scale < 0.48 ? step * 2 : step;
+    final tx = m.storage[12];
+    final ty = m.storage[13];
+
+    final minX = math.max(0.0, (-tx / scale) - effectiveStep * 2);
+    final minY = math.max(0.0, (-ty / scale) - effectiveStep * 2);
+    final maxX = math.min(
+      size.width,
+      ((viewportSize.width - tx) / scale) + effectiveStep * 2,
+    );
+    final maxY = math.min(
+      size.height,
+      ((viewportSize.height - ty) / scale) + effectiveStep * 2,
+    );
+    if (maxX <= minX || maxY <= minY) return;
+
+    final startX = (minX / effectiveStep).floor() * effectiveStep;
+    final startY = (minY / effectiveStep).floor() * effectiveStep;
+
+    final points = <Offset>[];
+    for (double x = startX; x <= maxX; x += effectiveStep) {
+      for (double y = startY; y <= maxY; y += effectiveStep) {
+        points.add(Offset(x, y));
+      }
+    }
+    if (points.isEmpty) return;
+
+    final paint = Paint()
+      ..color = dotColor
+      ..strokeWidth = scale < 0.55 ? 2.4 : 1.9
+      ..strokeCap = StrokeCap.round;
+    canvas.drawPoints(ui.PointMode.points, points, paint);
+  }
+
+  @override
   bool shouldRepaint(covariant _DotGridPainter oldDelegate) =>
-      oldDelegate.dotColor != dotColor;
+      oldDelegate.dotColor != dotColor ||
+      oldDelegate.viewportSize != viewportSize;
 }
 
 /// Lightweight Pre-Run Parameter Dialog opened before starting an editor

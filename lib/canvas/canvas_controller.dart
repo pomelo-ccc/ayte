@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
@@ -21,14 +22,15 @@ enum CanvasNodeKind {
   approval,
   note,
   chat,
-  file;
+  file,
+  group;
 
   static CanvasNodeKind parse(Object? raw) =>
       values.asNameMap()[raw] ?? note;
 
   bool get isExecutable => switch (this) {
     trigger || command || agent || http || condition || approval => true,
-    note || chat || file => false,
+    note || chat || file || group => false,
   };
 
   String label(bool isZh) => switch (this) {
@@ -41,6 +43,7 @@ enum CanvasNodeKind {
     note => isZh ? '便签' : 'Note',
     chat => isZh ? '会话卡' : 'Chat',
     file => isZh ? '文件卡' : 'File',
+    group => isZh ? '分组框' : 'Group',
   };
 
   int get defaultColorValue => switch (this) {
@@ -53,6 +56,7 @@ enum CanvasNodeKind {
     note => 0xFFD29922,
     chat => 0xFF58A6FF,
     file => 0xFF3FB950,
+    group => 0xFF6E7681,
   };
 }
 
@@ -160,6 +164,9 @@ class CanvasNode {
     this.httpHeaders = '',
     this.conditionExpr = 'notContains:FAIL',
     this.timeoutSeconds = 600,
+    this.maxRetries = 0,
+    this.retryDelaySeconds = 2,
+    this.recoversFailure = false,
     this.output = '',
     this.running = false,
     this.runStatus = CanvasNodeRunStatus.idle,
@@ -212,6 +219,17 @@ class CanvasNode {
   /// Per-node execution timeout in seconds.
   int timeoutSeconds;
 
+  /// Automatic retry attempts on transient failure (0 = no retries).
+  int maxRetries;
+
+  /// Base backoff delay in seconds before retrying a failed node.
+  int retryDelaySeconds;
+
+  /// Whether an `onFail` handler node recovers the workflow to `ok: true` when
+  /// it succeeds (default `false`: diagnostic/alert fail handlers still keep
+  /// the overall run status as failed so false celebrations never fire).
+  bool recoversFailure;
+
   /// Runtime state (not persisted).
   String output;
   bool running;
@@ -247,6 +265,9 @@ class CanvasNode {
       httpHeaders: httpHeaders,
       conditionExpr: conditionExpr,
       timeoutSeconds: timeoutSeconds,
+      maxRetries: maxRetries,
+      retryDelaySeconds: retryDelaySeconds,
+      recoversFailure: recoversFailure,
     );
     if (includeRuntime) {
       copy.output = output;
@@ -281,6 +302,9 @@ class CanvasNode {
     'httpHeaders': httpHeaders,
     'conditionExpr': conditionExpr,
     'timeoutSeconds': timeoutSeconds,
+    if (maxRetries > 0) 'maxRetries': maxRetries,
+    if (retryDelaySeconds != 2) 'retryDelaySeconds': retryDelaySeconds,
+    if (recoversFailure) 'recoversFailure': true,
     if (includeRuntime) ...{
       'runStatus': runStatus.name,
       'output': output.length <= 12000
@@ -297,14 +321,16 @@ class CanvasNode {
     final id = raw['id'] as String?;
     if (id == null || id.isEmpty) return null;
     final kind = CanvasNodeKind.parse(raw['kind']);
+    final maxW = kind == CanvasNodeKind.group ? 1800.0 : 960.0;
+    final maxH = kind == CanvasNodeKind.group ? 1200.0 : 760.0;
     final node = CanvasNode(
       id: id,
       kind: kind,
       title: raw['title'] as String? ?? kind.label(true),
       x: (raw['x'] as num?)?.toDouble() ?? 80,
       y: (raw['y'] as num?)?.toDouble() ?? 80,
-      width: ((raw['width'] as num?)?.toDouble() ?? 280).clamp(180, 720),
-      height: ((raw['height'] as num?)?.toDouble() ?? 190).clamp(110, 600),
+      width: ((raw['width'] as num?)?.toDouble() ?? 280).clamp(180.0, maxW),
+      height: ((raw['height'] as num?)?.toDouble() ?? 190).clamp(110.0, maxH),
       content: raw['content'] as String? ?? '',
       refId: raw['refId'] as String? ?? '',
       colorValue:
@@ -320,6 +346,10 @@ class CanvasNode {
         10,
         3600,
       ),
+      maxRetries: ((raw['maxRetries'] as num?)?.toInt() ?? 0).clamp(0, 5),
+      retryDelaySeconds:
+          ((raw['retryDelaySeconds'] as num?)?.toInt() ?? 2).clamp(0, 120),
+      recoversFailure: raw['recoversFailure'] == true,
     );
     if (includeRuntime) {
       node.runStatus = CanvasNodeRunStatus.parse(raw['runStatus']);
@@ -473,8 +503,15 @@ class WorkflowRun {
   String? currentRunningNodeId;
   String? activeApprovalNodeId;
   Completer<({bool approved, String note})>? approvalCompleter;
-  Process? activeProcess;
+  final Set<Process> activeProcesses = {};
+  final Set<HttpClient> activeHttpClients = {};
   int executedNodes = 0;
+
+  Process? get activeProcess => activeProcesses.firstOrNull;
+  set activeProcess(Process? p) {
+    activeProcesses.clear();
+    if (p != null) activeProcesses.add(p);
+  }
 
   CanvasNode? nodeById(String nodeId) {
     for (final n in nodes) {
@@ -502,28 +539,50 @@ class WorkflowRun {
   int get execSucceeded =>
       nodes.where((n) => n.runStatus == CanvasNodeRunStatus.succeeded).length;
 
+  /// Nodes ordered by longest-path topological depth so resume picks the
+  /// earliest upstream failure rather than raw array insertion order.
+  List<CanvasNode> get _topologicalExecutableNodes {
+    final exec = executableNodes;
+    final depth = <String, int>{for (final n in exec) n.id: 0};
+    for (var i = 0; i < exec.length; i++) {
+      var changed = false;
+      for (final e in edges) {
+        final f = depth[e.fromId];
+        final t = depth[e.toId];
+        if (f != null && t != null && f + 1 > t) {
+          depth[e.toId] = f + 1;
+          changed = true;
+        }
+      }
+      if (!changed) break;
+    }
+    final sorted = List<CanvasNode>.from(exec);
+    sorted.sort((a, b) => (depth[a.id] ?? 0).compareTo(depth[b.id] ?? 0));
+    return sorted;
+  }
+
   /// Best node to resume execution from after a failure or cancellation:
-  /// prefers the first failed executable node, then the first unreached/skipped
-  /// primary-lane node after at least one completed step.
+  /// prefers the earliest topological failed executable node, then the first
+  /// unreached/skipped primary-lane node after a cancellation.
   String? get resumableNodeId {
     if (running) return null;
-    for (final n in nodes) {
-      if (n.kind.isExecutable && n.runStatus == CanvasNodeRunStatus.failed) {
+    final ordered = _topologicalExecutableNodes;
+    for (final n in ordered) {
+      if (n.runStatus == CanvasNodeRunStatus.failed) {
         return n.id;
       }
     }
     if (cancelRequested) {
       final failOnlyIds = <String>{};
-      for (final n in nodes) {
+      for (final n in ordered) {
         final inc = edges.where((e) => e.toId == n.id).toList();
         if (inc.isNotEmpty &&
             inc.every((e) => e.branch == CanvasEdgeBranch.onFail)) {
           failOnlyIds.add(n.id);
         }
       }
-      for (final n in nodes) {
-        if (n.kind.isExecutable &&
-            !failOnlyIds.contains(n.id) &&
+      for (final n in ordered) {
+        if (!failOnlyIds.contains(n.id) &&
             (n.runStatus == CanvasNodeRunStatus.skipped ||
                 n.runStatus == CanvasNodeRunStatus.queued ||
                 n.runStatus == CanvasNodeRunStatus.idle)) {
@@ -655,11 +714,67 @@ class WorkflowCompletionEvent {
   final int? workflowRunId;
 }
 
+/// Alignment operation for multi-selected nodes on the canvas.
+enum CanvasNodeAlignment { left, centerH, right, top, centerV, bottom, distributeH, distributeV }
+
+class _CanvasSnapshot {
+  const _CanvasSnapshot({
+    required this.nodes,
+    required this.edges,
+    required this.workflowName,
+    required this.defaultAgentId,
+    required this.defaultModel,
+    required this.defaultEffort,
+  });
+
+  final List<CanvasNode> nodes;
+  final List<CanvasEdge> edges;
+  final String workflowName;
+  final String defaultAgentId;
+  final String defaultModel;
+  final String defaultEffort;
+}
+
+/// Bounded ring/tail string accumulator preventing O(N^2) allocations while
+/// streaming high-volume command or agent output.
+class _TailBuffer {
+  _TailBuffer({this.maxChars = 24000});
+
+  final int maxChars;
+  final List<String> _chunks = [];
+  int _length = 0;
+
+  void write(String chunk) {
+    if (chunk.isEmpty) return;
+    _chunks.add(chunk);
+    _length += chunk.length;
+    while (_length > maxChars && _chunks.length > 1) {
+      _length -= _chunks.removeAt(0).length;
+    }
+    if (_length > maxChars && _chunks.length == 1) {
+      final only = _chunks.first;
+      _chunks[0] = only.substring(only.length - maxChars);
+      _length = _chunks[0].length;
+    }
+  }
+
+  @override
+  String toString() => _chunks.join();
+}
+
 /// Manages Ayte's 2D Executable Workflow Canvas: nodes, directed pass/fail
-/// edges, templates, variable interpolation, Human-in-the-Loop approval gates,
-/// and DAG execution (usable interactively or serially from the Task Queue).
+/// edges, multi-workflow documents, undo/redo history, templates, variable
+/// interpolation, Human-in-the-Loop approval gates, and parallel DAG execution
+/// (usable interactively or serially from the Task Queue).
 class CanvasController extends ChangeNotifier {
   CanvasController._();
+
+  /// Creates an isolated controller instance for unit testing without mutating
+  /// the global singleton.
+  @visibleForTesting
+  CanvasController.forTest({String? storagePath})
+    : storagePathOverride = storagePath;
+
   static final instance = CanvasController._();
 
   static const currentCanvasTemplateId = '__current_canvas__';
@@ -672,11 +787,35 @@ class CanvasController extends ChangeNotifier {
   static const defaultJenkins69Url =
       'http://172.16.100.122:4875/view/快速构建/job/build-all-project/build?delay=0sec';
 
+  static const double maxBoardX = 24000.0;
+  static const double maxBoardY = 12000.0;
+  static const int maxParallelNodes = 4;
+  static const int _maxUndoDepth = 60;
+
   static bool isBuiltInTemplateId(String id) =>
       id == plmLocalRebuildTemplateId ||
       id == refreshModelTemplateId ||
       id == deploy69TemplateId ||
       id == bugVerifyTemplateId;
+
+  /// Computes a dynamic scene size large enough to comfortably fit all [nodes]
+  /// without clipping when workflows grow beyond the default 4800×2400 board.
+  static ({double width, double height}) computeBoardSize(
+    List<CanvasNode> nodes,
+  ) {
+    var maxX = 4800.0;
+    var maxY = 2400.0;
+    for (final n in nodes) {
+      final right = n.x + n.width + 1200.0;
+      final bottom = n.y + n.height + 900.0;
+      if (right > maxX) maxX = right;
+      if (bottom > maxY) maxY = bottom;
+    }
+    return (
+      width: math.min(maxBoardX + 1200.0, maxX),
+      height: math.min(maxBoardY + 900.0, maxY),
+    );
+  }
 
   @visibleForTesting
   String? storagePathOverride;
@@ -684,7 +823,26 @@ class CanvasController extends ChangeNotifier {
   final List<CanvasNode> _nodes = [];
   final List<CanvasEdge> _edges = [];
   final List<CanvasWorkflowTemplate> _templates = [];
+  final List<CanvasWorkflowTemplate> _workflows = [];
+  String _activeWorkflowId = 'wf_default';
   bool _loaded = false;
+  Future<void>? _loadFuture;
+  int _idSeq = 0;
+
+  // Undo / redo history stacks.
+  final List<_CanvasSnapshot> _undoStack = [];
+  final List<_CanvasSnapshot> _redoStack = [];
+  String? _lastTypingUndoNodeId;
+  DateTime? _lastTypingUndoAt;
+
+  // Debounced, serialized, atomic disk persistence.
+  Timer? _saveDebounceTimer;
+  Future<void> _saveQueue = Future<void>.value();
+  Future<void> _saveRunsQueue = Future<void>.value();
+
+  // Throttled streaming UI notifications (~75ms) to prevent rebuild storms.
+  Timer? _streamNotifyTimer;
+  bool _streamNotifyPending = false;
 
   /// Workflow-level default kernel, model, and effort inherited by any Agent
   /// node whose own field is left blank (`''`).
@@ -695,6 +853,281 @@ class CanvasController extends ChangeNotifier {
   String get defaultAgentId => _defaultAgentId;
   String get defaultModel => _defaultModel;
   String get defaultEffort => _defaultEffort;
+  bool get canUndo => _undoStack.isNotEmpty;
+  bool get canRedo => _redoStack.isNotEmpty;
+  String get activeWorkflowId => _activeWorkflowId;
+  List<CanvasWorkflowTemplate> get workflows => List.unmodifiable(_workflows);
+
+  String _nextId(String prefix) =>
+      '${prefix}_${DateTime.now().microsecondsSinceEpoch}_${++_idSeq}';
+
+  _CanvasSnapshot _captureSnapshot() => _CanvasSnapshot(
+    nodes: [for (final n in _nodes) n.clone()],
+    edges: [..._edges],
+    workflowName: _activeWorkflowName,
+    defaultAgentId: _defaultAgentId,
+    defaultModel: _defaultModel,
+    defaultEffort: _defaultEffort,
+  );
+
+  void _restoreSnapshot(_CanvasSnapshot snap) {
+    _nodes
+      ..clear()
+      ..addAll([for (final n in snap.nodes) n.clone()]);
+    _edges
+      ..clear()
+      ..addAll(snap.edges);
+    _activeWorkflowName = snap.workflowName;
+    _defaultAgentId = snap.defaultAgentId;
+    _defaultModel = snap.defaultModel;
+    _defaultEffort = snap.defaultEffort;
+    _syncActiveWorkflowDocument();
+    notifyListeners();
+    _scheduleSave();
+  }
+
+  /// Captures the current board state on the undo stack (call before a drag or
+  /// resize gesture so the entire gesture reverts as a single Ctrl+Z step).
+  void pushUndoSnapshot() {
+    _undoStack.add(_captureSnapshot());
+    if (_undoStack.length > _maxUndoDepth) {
+      _undoStack.removeAt(0);
+    }
+    _redoStack.clear();
+    _lastTypingUndoNodeId = null;
+  }
+
+  bool undo() {
+    if (_undoStack.isEmpty) return false;
+    _redoStack.add(_captureSnapshot());
+    final prev = _undoStack.removeLast();
+    _restoreSnapshot(prev);
+    return true;
+  }
+
+  bool redo() {
+    if (_redoStack.isEmpty) return false;
+    _undoStack.add(_captureSnapshot());
+    final next = _redoStack.removeLast();
+    _restoreSnapshot(next);
+    return true;
+  }
+
+  void _syncActiveWorkflowDocument() {
+    final name = _activeWorkflowName.trim().isEmpty
+        ? '默认工作流'
+        : _activeWorkflowName.trim();
+    final doc = CanvasWorkflowTemplate(
+      id: _activeWorkflowId,
+      name: name,
+      nodes: [for (final n in _nodes) n.clone()],
+      edges: [..._edges],
+      defaultAgentId: _defaultAgentId,
+      defaultModel: _defaultModel,
+      defaultEffort: _defaultEffort,
+    );
+    final idx = _workflows.indexWhere((w) => w.id == _activeWorkflowId);
+    if (idx >= 0) {
+      _workflows[idx] = doc;
+    } else {
+      _workflows.insert(0, doc);
+    }
+  }
+
+  /// Creates a new empty workflow document and switches the canvas to it
+  /// without discarding the current workflow.
+  CanvasWorkflowTemplate createWorkflow(String name) {
+    _syncActiveWorkflowDocument();
+    final trimmed = name.trim();
+    final id = _nextId('wf');
+    final doc = CanvasWorkflowTemplate(
+      id: id,
+      name: trimmed.isEmpty ? '新建工作流 ${_workflows.length + 1}' : trimmed,
+      nodes: const [],
+      edges: const [],
+      defaultAgentId: _defaultAgentId,
+      defaultModel: _defaultModel,
+      defaultEffort: _defaultEffort,
+    );
+    _workflows.add(doc);
+    _activeWorkflowId = id;
+    _selectedRunId = null;
+    _activeWorkflowName = doc.name;
+    _nodes.clear();
+    _edges.clear();
+    _undoStack.clear();
+    _redoStack.clear();
+    _singleStepLog = '';
+    notifyListeners();
+    _scheduleSave();
+    return doc;
+  }
+
+  /// Switches the editor to another saved workflow document by [workflowId].
+  bool switchWorkflow(String workflowId) {
+    if (workflowId == _activeWorkflowId) return true;
+    _syncActiveWorkflowDocument();
+    final idx = _workflows.indexWhere((w) => w.id == workflowId);
+    if (idx < 0) return false;
+    final target = _workflows[idx];
+    _activeWorkflowId = target.id;
+    _selectedRunId = null;
+    _activeWorkflowName = target.name;
+    _defaultAgentId = target.defaultAgentId.isEmpty ? 'agy' : target.defaultAgentId;
+    _defaultModel = target.defaultModel;
+    _defaultEffort = target.defaultEffort;
+    _nodes
+      ..clear()
+      ..addAll([for (final n in target.nodes) n.clone()]);
+    _edges
+      ..clear()
+      ..addAll(target.edges);
+    _undoStack.clear();
+    _redoStack.clear();
+    _singleStepLog = '';
+    notifyListeners();
+    _scheduleSave();
+    return true;
+  }
+
+  void renameActiveWorkflow(String name) {
+    final trimmed = name.trim();
+    if (trimmed.isEmpty || trimmed == _activeWorkflowName) return;
+    _activeWorkflowName = trimmed;
+    _syncActiveWorkflowDocument();
+    notifyListeners();
+    _scheduleSave();
+  }
+
+  bool deleteWorkflow(String workflowId) {
+    if (_workflows.length <= 1) return false;
+    final idx = _workflows.indexWhere((w) => w.id == workflowId);
+    if (idx < 0) return false;
+    _workflows.removeAt(idx);
+    if (_activeWorkflowId == workflowId) {
+      final fallback = _workflows.first;
+      _activeWorkflowId = fallback.id;
+      _selectedRunId = null;
+      _activeWorkflowName = fallback.name;
+      _defaultAgentId = fallback.defaultAgentId.isEmpty ? 'agy' : fallback.defaultAgentId;
+      _defaultModel = fallback.defaultModel;
+      _defaultEffort = fallback.defaultEffort;
+      _nodes
+        ..clear()
+        ..addAll([for (final n in fallback.nodes) n.clone()]);
+      _edges
+        ..clear()
+        ..addAll(fallback.edges);
+      _undoStack.clear();
+      _redoStack.clear();
+    }
+    notifyListeners();
+    _scheduleSave();
+    return true;
+  }
+
+  /// Exports the current workflow graph as a standalone portable JSON string.
+  String exportWorkflowJson({String? name}) {
+    final wfName = (name ?? _activeWorkflowName).trim();
+    return const JsonEncoder.withIndent('  ').convert({
+      'format': 'ayte-workflow',
+      'version': 4,
+      'name': wfName.isEmpty ? _resolveWorkflowName() : wfName,
+      'defaultAgentId': _defaultAgentId,
+      'defaultModel': _defaultModel,
+      'defaultEffort': _defaultEffort,
+      'nodes': [for (final n in _nodes) n.toJson()],
+      'edges': [for (final e in _edges) e.toJson()],
+    });
+  }
+
+  /// Imports a workflow JSON document (produced by [exportWorkflowJson] or
+  /// AI generation) onto the canvas, pushing an undo snapshot first.
+  ({String name, int nodeCount, int edgeCount}) importWorkflowJson(
+    String rawJson, {
+    bool createNewTab = false,
+  }) {
+    final decoded = jsonDecode(rawJson);
+    if (decoded is! Map) {
+      throw const FormatException('工作流 JSON 必须是对象格式');
+    }
+    final parsedNodes = <CanvasNode>[
+      if (decoded['nodes'] case final List list)
+        for (final item in list) ?CanvasNode.fromJson(item),
+    ];
+    if (parsedNodes.isEmpty) {
+      throw const FormatException('导入的 JSON 中未包含有效节点');
+    }
+    final validNodeIds = {for (final n in parsedNodes) n.id};
+    final parsedEdges = <CanvasEdge>[
+      if (decoded['edges'] case final List list)
+        for (final item in list)
+          if (CanvasEdge.fromJson(item) case final e?
+              when validNodeIds.contains(e.fromId) &&
+                  validNodeIds.contains(e.toId) &&
+                  e.fromId != e.toId)
+            e,
+    ];
+    final wfName = (decoded['name'] as String?)?.trim();
+    final resolvedName =
+        (wfName != null && wfName.isNotEmpty) ? wfName : '导入的工作流';
+
+    if (createNewTab) {
+      createWorkflow(resolvedName);
+    } else {
+      pushUndoSnapshot();
+    }
+
+    _selectedRunId = null;
+    _activeWorkflowName = resolvedName;
+    final agent = (decoded['defaultAgentId'] as String?)?.trim();
+    if (agent != null && agent.isNotEmpty) _defaultAgentId = agent;
+    _defaultModel = (decoded['defaultModel'] as String? ?? '').trim();
+    _defaultEffort = (decoded['defaultEffort'] as String? ?? '').trim();
+    _nodes
+      ..clear()
+      ..addAll(parsedNodes);
+    _edges
+      ..clear()
+      ..addAll(parsedEdges);
+    _singleStepLog = '';
+    _syncActiveWorkflowDocument();
+    notifyListeners();
+    _scheduleSave();
+    return (
+      name: resolvedName,
+      nodeCount: parsedNodes.length,
+      edgeCount: parsedEdges.length,
+    );
+  }
+
+  /// Applies an AI-generated (or modified) workflow onto the canvas and runs
+  /// topological auto-layout cleanly as a single undoable step.
+  void applyGeneratedWorkflow({
+    required String name,
+    required List<CanvasNode> nodes,
+    required List<CanvasEdge> edges,
+    bool createNewTab = false,
+  }) {
+    if (createNewTab) {
+      createWorkflow(name);
+    } else {
+      pushUndoSnapshot();
+    }
+    _selectedRunId = null;
+    _activeWorkflowName = name.trim().isEmpty ? 'AI 工作流' : name.trim();
+    _nodes
+      ..clear()
+      ..addAll([for (final n in nodes) n.clone()]);
+    _edges
+      ..clear()
+      ..addAll(edges);
+    _singleStepLog = '';
+    _autoLayoutInternal();
+    _syncActiveWorkflowDocument();
+    notifyListeners();
+    _scheduleSave();
+  }
 
   void setWorkflowDefaults({
     String? agentId,
@@ -715,14 +1148,16 @@ class CanvasController extends ChangeNotifier {
       changed = true;
     }
     if (changed) {
+      _syncActiveWorkflowDocument();
       notifyListeners();
-      unawaited(_save());
+      _scheduleSave();
     }
   }
 
   /// Resets all Agent nodes on the current canvas to inherit the workflow
   /// default kernel/model/effort (or optionally writes explicit overrides).
   void applyWorkflowDefaultsToAllAgents() {
+    pushUndoSnapshot();
     for (final n in _nodes) {
       if (n.kind == CanvasNodeKind.agent) {
         n.agentId = '';
@@ -730,8 +1165,9 @@ class CanvasController extends ChangeNotifier {
         n.effort = '';
       }
     }
+    _syncActiveWorkflowDocument();
     notifyListeners();
-    unawaited(_save());
+    _scheduleSave();
   }
 
   /// Resolves the effective kernel, model, and effort for an Agent [node],
@@ -907,6 +1343,7 @@ class CanvasController extends ChangeNotifier {
   @visibleForTesting
   void resetLoadedForTest() {
     _loaded = false;
+    _loadFuture = null;
   }
 
   String _resolveWorkflowNameFromNodes(
@@ -971,8 +1408,32 @@ class CanvasController extends ChangeNotifier {
     final run = runId != null ? runById(runId) : selectedRun;
     if (run != null) {
       run.log = '';
+      unawaited(_saveRuns());
     } else {
       _singleStepLog = '';
+    }
+    notifyListeners();
+  }
+
+  /// Batches rapid stdout/stderr streaming updates (~75ms) to eliminate global
+  /// widget rebuild storms while builds emit hundreds of lines per second.
+  void _scheduleStreamNotify() {
+    _streamNotifyPending = true;
+    if (_streamNotifyTimer != null) return;
+    _streamNotifyTimer = Timer(const Duration(milliseconds: 75), () {
+      _streamNotifyTimer = null;
+      if (_streamNotifyPending) {
+        _streamNotifyPending = false;
+        notifyListeners();
+      }
+    });
+  }
+
+  void _flushStreamNotify() {
+    _streamNotifyTimer?.cancel();
+    _streamNotifyTimer = null;
+    if (_streamNotifyPending) {
+      _streamNotifyPending = false;
     }
     notifyListeners();
   }
@@ -981,6 +1442,7 @@ class CanvasController extends ChangeNotifier {
     String chunk, {
     WorkflowRun? run,
     void Function(String)? onLogChunk,
+    bool immediate = false,
   }) {
     if (chunk.isEmpty) return;
     if (run != null) {
@@ -989,7 +1451,11 @@ class CanvasController extends ChangeNotifier {
       _singleStepLog = _trimTail('$_singleStepLog$chunk', max: 120000);
     }
     onLogChunk?.call(chunk);
-    notifyListeners();
+    if (immediate) {
+      _flushStreamNotify();
+    } else {
+      _scheduleStreamNotify();
+    }
   }
 
   String get _filePath =>
@@ -1011,59 +1477,86 @@ class CanvasController extends ChangeNotifier {
     return null;
   }
 
-  Future<void> load() async {
-    if (_loaded) return;
-    _loaded = true;
+  Future<void> load() {
+    if (_loaded) return Future<void>.value();
+    return _loadFuture ??= _loadInternal();
+  }
+
+  Future<void> _loadInternal() async {
     try {
       final file = File(_filePath);
-      if (file.existsSync()) {
-        final decoded = jsonDecode(await file.readAsString());
-        if (decoded is List) {
-          // Legacy v1 canvas.json format: bare list of nodes.
-          _nodes
-            ..clear()
-            ..addAll([for (final item in decoded) ?CanvasNode.fromJson(item)]);
-          _edges.clear();
-        } else if (decoded is Map) {
-          _defaultAgentId =
-              (decoded['defaultAgentId'] as String?)?.trim().isNotEmpty == true
-              ? (decoded['defaultAgentId'] as String).trim()
-              : 'agy';
-          _defaultModel = (decoded['defaultModel'] as String? ?? '').trim();
-          _defaultEffort = (decoded['defaultEffort'] as String? ?? '').trim();
-          _activeWorkflowName =
-              (decoded['activeWorkflowName'] as String? ?? '').trim();
-          _nodes
-            ..clear()
-            ..addAll([
-              if (decoded['nodes'] case final List list)
-                for (final item in list) ?CanvasNode.fromJson(item),
-            ]);
-          _edges
-            ..clear()
-            ..addAll([
-              if (decoded['edges'] case final List list)
-                for (final item in list) ?CanvasEdge.fromJson(item),
-            ]);
-          _templates
-            ..clear()
-            ..addAll([
-              if (decoded['templates'] case final List list)
-                for (final item in list) ?CanvasWorkflowTemplate.fromJson(item),
-            ]);
+      if (await file.exists()) {
+        final rawText = await file.readAsString();
+        try {
+          final decoded = jsonDecode(rawText);
+          if (decoded is List) {
+            // Legacy v1 canvas.json format: bare list of nodes.
+            _nodes
+              ..clear()
+              ..addAll([for (final item in decoded) ?CanvasNode.fromJson(item)]);
+            _edges.clear();
+          } else if (decoded is Map) {
+            _defaultAgentId =
+                (decoded['defaultAgentId'] as String?)?.trim().isNotEmpty == true
+                ? (decoded['defaultAgentId'] as String).trim()
+                : 'agy';
+            _defaultModel = (decoded['defaultModel'] as String? ?? '').trim();
+            _defaultEffort = (decoded['defaultEffort'] as String? ?? '').trim();
+            _activeWorkflowName =
+                (decoded['activeWorkflowName'] as String? ?? '').trim();
+            final savedActiveId = (decoded['activeWorkflowId'] as String?)?.trim();
+            if (savedActiveId != null && savedActiveId.isNotEmpty) {
+              _activeWorkflowId = savedActiveId;
+            }
+            _nodes
+              ..clear()
+              ..addAll([
+                if (decoded['nodes'] case final List list)
+                  for (final item in list) ?CanvasNode.fromJson(item),
+              ]);
+            _edges
+              ..clear()
+              ..addAll([
+                if (decoded['edges'] case final List list)
+                  for (final item in list) ?CanvasEdge.fromJson(item),
+              ]);
+            _templates
+              ..clear()
+              ..addAll([
+                if (decoded['templates'] case final List list)
+                  for (final item in list) ?CanvasWorkflowTemplate.fromJson(item),
+              ]);
+            _workflows
+              ..clear()
+              ..addAll([
+                if (decoded['workflows'] case final List list)
+                  for (final item in list) ?CanvasWorkflowTemplate.fromJson(item),
+              ]);
+          }
+        } on FormatException catch (e) {
+          debugPrint('CanvasController corrupted JSON backed up: $e');
+          // Preserve corrupted file as .bak so the user never silently loses work.
+          try {
+            await file.copy('${file.path}.bak');
+          } on Object {
+            // Ignore backup failure.
+          }
         }
       }
+      _syncActiveWorkflowDocument();
       await _loadRuns();
+      _loaded = true;
       notifyListeners();
     } on Object catch (e) {
       debugPrint('CanvasController load failed: $e');
+      _loadFuture = null;
     }
   }
 
   Future<void> _loadRuns() async {
     try {
       final file = File(_runsFilePath);
-      if (!file.existsSync()) return;
+      if (!await file.exists()) return;
       final decoded = jsonDecode(await file.readAsString());
       final list = decoded is Map ? decoded['runs'] : decoded;
       if (list is! List) return;
@@ -1088,55 +1581,122 @@ class CanvasController extends ChangeNotifier {
     }
   }
 
-  Future<void> _saveRuns() async {
-    if (Platform.environment.containsKey('FLUTTER_TEST') &&
-        storagePathOverride == null) {
-      return;
-    }
+  static Future<void> _writeFileAtomic(String targetPath, String content) async {
+    final file = File(targetPath);
+    await file.parent.create(recursive: true);
+    final tmp = File('$targetPath.tmp');
+    await tmp.writeAsString(content, flush: true);
     try {
-      final finished = [
-        for (final r in _runs)
-          if (!r.running) r,
-      ].take(_maxRetainedRuns).toList();
-      final file = File(_runsFilePath);
-      file.parent.createSync(recursive: true);
-      await file.writeAsString(
-        const JsonEncoder.withIndent('  ').convert({
-          'version': 1,
-          'runs': [for (final r in finished) r.toJson()],
-        }),
-      );
-    } on Object catch (e) {
-      debugPrint('CanvasController save runs failed: $e');
+      await tmp.rename(targetPath);
+    } on FileSystemException {
+      // Windows rename fails if destination is briefly held; copy + clean up.
+      await file.writeAsString(content, flush: true);
+      try {
+        if (await tmp.exists()) await tmp.delete();
+      } on Object {
+        // Ignore temp cleanup failure.
+      }
     }
   }
 
-  Future<void> _save() async {
+  Future<void> _saveRuns() {
+    if (Platform.environment.containsKey('FLUTTER_TEST') &&
+        storagePathOverride == null) {
+      return Future<void>.value();
+    }
+    final payload = const JsonEncoder.withIndent('  ').convert({
+      'version': 1,
+      'runs': [
+        for (final r in _runs.where((r) => !r.running).take(_maxRetainedRuns))
+          r.toJson(),
+      ],
+    });
+    final path = _runsFilePath;
+    _saveRunsQueue = _saveRunsQueue.then((_) async {
+      try {
+        await _writeFileAtomic(path, payload);
+      } on Object catch (e) {
+        debugPrint('CanvasController save runs failed: $e');
+      }
+    });
+    return _saveRunsQueue;
+  }
+
+  void _scheduleSave({bool immediate = false}) {
     if (Platform.environment.containsKey('FLUTTER_TEST') &&
         storagePathOverride == null) {
       return;
     }
-    try {
-      final file = File(_filePath);
-      file.parent.createSync(recursive: true);
-      await file.writeAsString(
-        const JsonEncoder.withIndent('  ').convert({
-          'version': 3,
-          'defaultAgentId': _defaultAgentId,
-          'defaultModel': _defaultModel,
-          'defaultEffort': _defaultEffort,
-          'activeWorkflowName': _activeWorkflowName,
-          'nodes': [for (final n in _nodes) n.toJson()],
-          'edges': [for (final e in _edges) e.toJson()],
-          'templates': [for (final t in _templates) t.toJson()],
-        }),
-      );
-    } on Object catch (e) {
-      debugPrint('CanvasController save failed: $e');
+    _saveDebounceTimer?.cancel();
+    if (immediate) {
+      unawaited(_save());
+      return;
     }
+    final delay = Platform.environment.containsKey('FLUTTER_TEST')
+        ? const Duration(milliseconds: 15)
+        : const Duration(milliseconds: 320);
+    _saveDebounceTimer = Timer(delay, () {
+      _saveDebounceTimer = null;
+      unawaited(_save());
+    });
+  }
+
+  /// Flushes any debounced board save immediately and awaits disk write.
+  Future<void> flushSave() {
+    _saveDebounceTimer?.cancel();
+    _saveDebounceTimer = null;
+    return _save();
+  }
+
+  Future<void> _save() {
+    if (Platform.environment.containsKey('FLUTTER_TEST') &&
+        storagePathOverride == null) {
+      return Future<void>.value();
+    }
+    _syncActiveWorkflowDocument();
+    final payload = const JsonEncoder.withIndent('  ').convert({
+      'version': 4,
+      'activeWorkflowId': _activeWorkflowId,
+      'defaultAgentId': _defaultAgentId,
+      'defaultModel': _defaultModel,
+      'defaultEffort': _defaultEffort,
+      'activeWorkflowName': _activeWorkflowName,
+      'nodes': [for (final n in _nodes) n.toJson()],
+      'edges': [for (final e in _edges) e.toJson()],
+      'templates': [for (final t in _templates) t.toJson()],
+      'workflows': [for (final w in _workflows) w.toJson()],
+    });
+    final path = _filePath;
+    _saveQueue = _saveQueue.then((_) async {
+      try {
+        await _writeFileAtomic(path, payload);
+      } on Object catch (e) {
+        debugPrint('CanvasController save failed: $e');
+      }
+    });
+    return _saveQueue;
   }
 
   // --- Graph Editing ----------------------------------------------------------
+
+  /// Returns true if adding a directed edge `fromId -> toId` would introduce a
+  /// cycle into the workflow DAG.
+  bool wouldCreateCycle(String fromId, String toId, {String? ignoreEdgeId}) {
+    if (fromId == toId) return true;
+    final visited = <String>{toId};
+    final stack = <String>[toId];
+    while (stack.isNotEmpty) {
+      final cur = stack.removeLast();
+      if (cur == fromId) return true;
+      for (final e in _edges) {
+        if (ignoreEdgeId != null && e.id == ignoreEdgeId) continue;
+        if (e.fromId == cur && visited.add(e.toId)) {
+          stack.add(e.toId);
+        }
+      }
+    }
+    return false;
+  }
 
   CanvasNode addNode({
     required CanvasNodeKind kind,
@@ -1155,22 +1715,30 @@ class CanvasController extends ChangeNotifier {
     String httpUrl = '',
     String httpHeaders = '',
     String conditionExpr = 'notContains:FAIL',
+    int timeoutSeconds = 600,
+    int maxRetries = 0,
+    int retryDelaySeconds = 2,
+    bool recoversFailure = false,
+    bool recordUndo = true,
   }) {
+    if (recordUndo) pushUndoSnapshot();
     final offset = (_nodes.length % 6) * 32.0;
+    final defaultWidth = kind == CanvasNodeKind.group ? 540.0 : 280.0;
     final defaultHeight = switch (kind) {
       CanvasNodeKind.trigger ||
       CanvasNodeKind.condition ||
       CanvasNodeKind.approval => 165.0,
       CanvasNodeKind.http => 185.0,
+      CanvasNodeKind.group => 340.0,
       _ => 190.0,
     };
     final node = CanvasNode(
-      id: 'node_${DateTime.now().microsecondsSinceEpoch}_${_nodes.length}',
+      id: _nextId('node'),
       kind: kind,
       title: title,
-      x: x ?? (80 + offset),
-      y: y ?? (80 + offset),
-      width: width ?? 280,
+      x: (x ?? (80 + offset)).clamp(0.0, maxBoardX),
+      y: (y ?? (80 + offset)).clamp(0.0, maxBoardY),
+      width: width ?? defaultWidth,
       height: height ?? defaultHeight,
       content: content,
       refId: refId,
@@ -1182,10 +1750,19 @@ class CanvasController extends ChangeNotifier {
       httpUrl: httpUrl,
       httpHeaders: httpHeaders,
       conditionExpr: conditionExpr,
+      timeoutSeconds: timeoutSeconds,
+      maxRetries: maxRetries,
+      retryDelaySeconds: retryDelaySeconds,
+      recoversFailure: recoversFailure,
     );
-    _nodes.add(node);
+    if (kind == CanvasNodeKind.group) {
+      // Group frames render behind workflow cards.
+      _nodes.insert(0, node);
+    } else {
+      _nodes.add(node);
+    }
     notifyListeners();
-    unawaited(_save());
+    _scheduleSave();
     return node;
   }
 
@@ -1193,9 +1770,16 @@ class CanvasController extends ChangeNotifier {
     String fromId,
     String toId, {
     CanvasEdgeBranch branch = CanvasEdgeBranch.onPass,
+    bool recordUndo = true,
   }) {
     if (fromId == toId) return null;
-    if (nodeById(fromId) == null || nodeById(toId) == null) return null;
+    final fromNode = nodeById(fromId);
+    final toNode = nodeById(toId);
+    if (fromNode == null || toNode == null) return null;
+    if (fromNode.kind == CanvasNodeKind.group ||
+        toNode.kind == CanvasNodeKind.group) {
+      return null;
+    }
     for (final existing in _edges) {
       if (existing.fromId == fromId &&
           existing.toId == toId &&
@@ -1203,53 +1787,235 @@ class CanvasController extends ChangeNotifier {
         return existing;
       }
     }
+    if (wouldCreateCycle(fromId, toId)) return null;
+    if (recordUndo) pushUndoSnapshot();
     final edge = CanvasEdge(
-      id: 'edge_${DateTime.now().microsecondsSinceEpoch}_${_edges.length}',
+      id: _nextId('edge'),
       fromId: fromId,
       toId: toId,
       branch: branch,
     );
     _edges.add(edge);
     notifyListeners();
-    unawaited(_save());
+    _scheduleSave();
     return edge;
   }
 
   void removeEdge(String edgeId) {
+    if (!_edges.any((e) => e.id == edgeId)) return;
+    pushUndoSnapshot();
     _edges.removeWhere((e) => e.id == edgeId);
     notifyListeners();
-    unawaited(_save());
+    _scheduleSave();
+  }
+
+  /// Updates an existing edge's branch or endpoints safely (validating cycles).
+  CanvasEdge? reconnectEdge(
+    String edgeId, {
+    String? fromId,
+    String? toId,
+    CanvasEdgeBranch? branch,
+  }) {
+    final idx = _edges.indexWhere((e) => e.id == edgeId);
+    if (idx < 0) return null;
+    final cur = _edges[idx];
+    final nextFrom = fromId ?? cur.fromId;
+    final nextTo = toId ?? cur.toId;
+    final nextBranch = branch ?? cur.branch;
+    if (nextFrom == nextTo) return null;
+    if (nodeById(nextFrom) == null || nodeById(nextTo) == null) return null;
+    if (wouldCreateCycle(nextFrom, nextTo, ignoreEdgeId: edgeId)) return null;
+    pushUndoSnapshot();
+    final updated = CanvasEdge(
+      id: cur.id,
+      fromId: nextFrom,
+      toId: nextTo,
+      branch: nextBranch,
+    );
+    _edges[idx] = updated;
+    notifyListeners();
+    _scheduleSave();
+    return updated;
+  }
+
+  /// Inserts a new node of [kind] midway along [edgeId], rewiring
+  /// `from -> newNode (edge.branch)` and `newNode -> to (onPass)`.
+  CanvasNode? insertNodeOnEdge(
+    String edgeId,
+    CanvasNodeKind kind, {
+    String? title,
+  }) {
+    final idx = _edges.indexWhere((e) => e.id == edgeId);
+    if (idx < 0) return null;
+    final edge = _edges[idx];
+    final from = nodeById(edge.fromId);
+    final to = nodeById(edge.toId);
+    if (from == null || to == null) return null;
+
+    pushUndoSnapshot();
+    final midX = ((from.x + to.x) / 2.0).clamp(0.0, maxBoardX);
+    final midY = ((from.y + to.y) / 2.0).clamp(0.0, maxBoardY);
+    final created = addNode(
+      kind: kind,
+      title: (title != null && title.trim().isNotEmpty)
+          ? title.trim()
+          : kind.label(true),
+      refId: from.refId,
+      x: midX,
+      y: midY,
+      recordUndo: false,
+    );
+    _edges.removeWhere((e) => e.id == edgeId);
+    _edges.add(
+      CanvasEdge(
+        id: _nextId('edge'),
+        fromId: edge.fromId,
+        toId: created.id,
+        branch: edge.branch,
+      ),
+    );
+    _edges.add(
+      CanvasEdge(
+        id: _nextId('edge'),
+        fromId: created.id,
+        toId: edge.toId,
+        branch: CanvasEdgeBranch.onPass,
+      ),
+    );
+    notifyListeners();
+    _scheduleSave();
+    return created;
   }
 
   void moveNode(String id, double dx, double dy) {
     for (final n in _nodes) {
       if (n.id == id) {
-        n.x = (n.x + dx).clamp(0, 4400);
-        n.y = (n.y + dy).clamp(0, 2200);
+        n.x = (n.x + dx).clamp(0.0, maxBoardX);
+        n.y = (n.y + dy).clamp(0.0, maxBoardY);
         notifyListeners();
         return;
       }
     }
+  }
+
+  /// Moves a set of selected nodes together by `(dx, dy)` in a single notify.
+  void moveNodes(Set<String> ids, double dx, double dy) {
+    if (ids.isEmpty || (dx == 0 && dy == 0)) return;
+    var changed = false;
+    for (final n in _nodes) {
+      if (ids.contains(n.id)) {
+        n.x = (n.x + dx).clamp(0.0, maxBoardX);
+        n.y = (n.y + dy).clamp(0.0, maxBoardY);
+        changed = true;
+      }
+    }
+    if (changed) notifyListeners();
+  }
+
+  /// Sets exact positions for multiple nodes (e.g. after snapping or nudge).
+  void setNodePositions(Map<String, ({double x, double y})> positions) {
+    if (positions.isEmpty) return;
+    var changed = false;
+    for (final n in _nodes) {
+      final pos = positions[n.id];
+      if (pos != null) {
+        n.x = pos.x.clamp(0.0, maxBoardX);
+        n.y = pos.y.clamp(0.0, maxBoardY);
+        changed = true;
+      }
+    }
+    if (changed) notifyListeners();
+  }
+
+  /// Aligns or distributes 2+ selected nodes cleanly (Figma-style alignment).
+  void alignNodes(Set<String> ids, CanvasNodeAlignment alignment) {
+    final selected = [
+      for (final n in _nodes)
+        if (ids.contains(n.id)) n,
+    ];
+    if (selected.length < 2) return;
+    pushUndoSnapshot();
+    switch (alignment) {
+      case CanvasNodeAlignment.left:
+        final target = selected.map((n) => n.x).reduce(math.min);
+        for (final n in selected) {
+          n.x = target;
+        }
+      case CanvasNodeAlignment.centerH:
+        final avg =
+            selected.map((n) => n.x + n.width / 2).reduce((a, b) => a + b) /
+            selected.length;
+        for (final n in selected) {
+          n.x = (avg - n.width / 2).clamp(0.0, maxBoardX);
+        }
+      case CanvasNodeAlignment.right:
+        final target = selected.map((n) => n.x + n.width).reduce(math.max);
+        for (final n in selected) {
+          n.x = (target - n.width).clamp(0.0, maxBoardX);
+        }
+      case CanvasNodeAlignment.top:
+        final target = selected.map((n) => n.y).reduce(math.min);
+        for (final n in selected) {
+          n.y = target;
+        }
+      case CanvasNodeAlignment.centerV:
+        final avg =
+            selected.map((n) => n.y + n.height / 2).reduce((a, b) => a + b) /
+            selected.length;
+        for (final n in selected) {
+          n.y = (avg - n.height / 2).clamp(0.0, maxBoardY);
+        }
+      case CanvasNodeAlignment.bottom:
+        final target = selected.map((n) => n.y + n.height).reduce(math.max);
+        for (final n in selected) {
+          n.y = (target - n.height).clamp(0.0, maxBoardY);
+        }
+      case CanvasNodeAlignment.distributeH:
+        if (selected.length >= 3) {
+          selected.sort((a, b) => a.x.compareTo(b.x));
+          final minX = selected.first.x;
+          final maxX = selected.last.x;
+          final step = (maxX - minX) / (selected.length - 1);
+          for (var i = 1; i < selected.length - 1; i++) {
+            selected[i].x = minX + step * i;
+          }
+        }
+      case CanvasNodeAlignment.distributeV:
+        if (selected.length >= 3) {
+          selected.sort((a, b) => a.y.compareTo(b.y));
+          final minY = selected.first.y;
+          final maxY = selected.last.y;
+          final step = (maxY - minY) / (selected.length - 1);
+          for (var i = 1; i < selected.length - 1; i++) {
+            selected[i].y = minY + step * i;
+          }
+        }
+    }
+    notifyListeners();
+    _scheduleSave();
   }
 
   void resizeNode(String id, double dw, double dh) {
     for (final n in _nodes) {
       if (n.id == id) {
-        n.width = (n.width + dw).clamp(200, 720);
-        n.height = (n.height + dh).clamp(120, 600);
+        final maxW = n.kind == CanvasNodeKind.group ? 1800.0 : 960.0;
+        final maxH = n.kind == CanvasNodeKind.group ? 1200.0 : 760.0;
+        n.width = (n.width + dw).clamp(200.0, maxW);
+        n.height = (n.height + dh).clamp(120.0, maxH);
         notifyListeners();
         return;
       }
     }
   }
 
-  void commitLayout() => unawaited(_save());
+  void commitLayout() => _scheduleSave();
 
   void updateNode(
     String id, {
     String? title,
     String? content,
     String? refId,
+    int? colorValue,
     String? agentId,
     String? model,
     String? effort,
@@ -1258,12 +2024,28 @@ class CanvasController extends ChangeNotifier {
     String? httpHeaders,
     String? conditionExpr,
     int? timeoutSeconds,
+    int? maxRetries,
+    int? retryDelaySeconds,
+    bool? recoversFailure,
   }) {
     for (final n in _nodes) {
       if (n.id == id) {
+        final now = DateTime.now();
+        final shouldPush =
+            _lastTypingUndoNodeId != id ||
+            _lastTypingUndoAt == null ||
+            now.difference(_lastTypingUndoAt!) >
+                const Duration(milliseconds: 1200);
+        if (shouldPush) {
+          pushUndoSnapshot();
+        }
+        _lastTypingUndoNodeId = id;
+        _lastTypingUndoAt = now;
+
         if (title != null) n.title = title;
         if (content != null) n.content = content;
         if (refId != null) n.refId = refId;
+        if (colorValue != null) n.colorValue = colorValue;
         if (agentId != null) n.agentId = agentId;
         if (model != null) n.model = model;
         if (effort != null) n.effort = effort;
@@ -1271,19 +2053,38 @@ class CanvasController extends ChangeNotifier {
         if (httpUrl != null) n.httpUrl = httpUrl;
         if (httpHeaders != null) n.httpHeaders = httpHeaders;
         if (conditionExpr != null) n.conditionExpr = conditionExpr;
-        if (timeoutSeconds != null) n.timeoutSeconds = timeoutSeconds;
+        if (timeoutSeconds != null) {
+          n.timeoutSeconds = timeoutSeconds.clamp(10, 3600);
+        }
+        if (maxRetries != null) n.maxRetries = maxRetries.clamp(0, 5);
+        if (retryDelaySeconds != null) {
+          n.retryDelaySeconds = retryDelaySeconds.clamp(0, 120);
+        }
+        if (recoversFailure != null) n.recoversFailure = recoversFailure;
         notifyListeners();
-        unawaited(_save());
+        _scheduleSave();
         return;
       }
     }
   }
 
   void removeNode(String id) {
+    if (nodeById(id) == null) return;
+    pushUndoSnapshot();
     _nodes.removeWhere((n) => n.id == id);
     _edges.removeWhere((e) => e.fromId == id || e.toId == id);
     notifyListeners();
-    unawaited(_save());
+    _scheduleSave();
+  }
+
+  void removeNodes(Set<String> ids) {
+    if (ids.isEmpty) return;
+    if (!_nodes.any((n) => ids.contains(n.id))) return;
+    pushUndoSnapshot();
+    _nodes.removeWhere((n) => ids.contains(n.id));
+    _edges.removeWhere((e) => ids.contains(e.fromId) || ids.contains(e.toId));
+    notifyListeners();
+    _scheduleSave();
   }
 
   /// Duplicates an existing node slightly offset for fast authoring.
@@ -1307,12 +2108,100 @@ class CanvasController extends ChangeNotifier {
       httpUrl: src.httpUrl,
       httpHeaders: src.httpHeaders,
       conditionExpr: src.conditionExpr,
+      timeoutSeconds: src.timeoutSeconds,
+      maxRetries: src.maxRetries,
+      retryDelaySeconds: src.retryDelaySeconds,
+      recoversFailure: src.recoversFailure,
     );
     return copy;
   }
 
+  /// Duplicates multiple selected nodes and preserves all internal edges
+  /// between them. Returns the list of newly created nodes.
+  List<CanvasNode> duplicateNodes(
+    Set<String> ids, {
+    double dx = 40,
+    double dy = 40,
+  }) {
+    final selected = [
+      for (final n in _nodes)
+        if (ids.contains(n.id)) n,
+    ];
+    if (selected.isEmpty) return const [];
+    final internalEdges = [
+      for (final e in _edges)
+        if (ids.contains(e.fromId) && ids.contains(e.toId)) e,
+    ];
+    return pasteNodes(
+      selected,
+      internalEdges,
+      dx: dx,
+      dy: dy,
+      appendCopySuffix: selected.length == 1,
+    );
+  }
+
+  /// Pastes copied [sourceNodes] and their internal [sourceEdges] offset by
+  /// `(dx, dy)` as a single undoable transaction.
+  List<CanvasNode> pasteNodes(
+    List<CanvasNode> sourceNodes,
+    List<CanvasEdge> sourceEdges, {
+    double dx = 44,
+    double dy = 44,
+    bool appendCopySuffix = false,
+  }) {
+    if (sourceNodes.isEmpty) return const [];
+    pushUndoSnapshot();
+    final idMap = <String, String>{};
+    final created = <CanvasNode>[];
+    for (final src in sourceNodes) {
+      final copy = addNode(
+        kind: src.kind,
+        title: appendCopySuffix ? '${src.title} (副本)' : src.title,
+        content: src.content,
+        refId: src.refId,
+        x: src.x + dx,
+        y: src.y + dy,
+        width: src.width,
+        height: src.height,
+        colorValue: src.colorValue,
+        agentId: src.agentId,
+        model: src.model,
+        effort: src.effort,
+        httpMethod: src.httpMethod,
+        httpUrl: src.httpUrl,
+        httpHeaders: src.httpHeaders,
+        conditionExpr: src.conditionExpr,
+        timeoutSeconds: src.timeoutSeconds,
+        maxRetries: src.maxRetries,
+        retryDelaySeconds: src.retryDelaySeconds,
+        recoversFailure: src.recoversFailure,
+        recordUndo: false,
+      );
+      idMap[src.id] = copy.id;
+      created.add(copy);
+    }
+    for (final e in sourceEdges) {
+      final f = idMap[e.fromId];
+      final t = idMap[e.toId];
+      if (f != null && t != null && f != t) {
+        _edges.add(
+          CanvasEdge(
+            id: _nextId('edge'),
+            fromId: f,
+            toId: t,
+            branch: e.branch,
+          ),
+        );
+      }
+    }
+    notifyListeners();
+    _scheduleSave();
+    return created;
+  }
+
   /// One-click authoring helper: creates a downstream node neatly placed beside
-  /// [fromId] and wires the [branch] edge immediately.
+  /// [fromId] (or at explicit [x]/[y]) and wires the [branch] edge immediately.
   CanvasNode? addConnectedNode({
     required String fromId,
     required CanvasEdgeBranch branch,
@@ -1321,14 +2210,21 @@ class CanvasController extends ChangeNotifier {
     String content = '',
     String refId = '',
     String httpUrl = '',
+    double? x,
+    double? y,
   }) {
     final src = nodeById(fromId);
     if (src == null) return null;
+    pushUndoSnapshot();
     final siblings = _edges.where((e) => e.fromId == fromId).length;
-    final targetX = (src.x + src.width + 80).clamp(40.0, 4400.0);
-    final targetY = (src.y +
-            (branch == CanvasEdgeBranch.onFail ? 220.0 : siblings * 185.0))
-        .clamp(40.0, 2100.0);
+    final targetX = (x ?? (src.x + src.width + 80)).clamp(40.0, maxBoardX);
+    final targetY =
+        (y ??
+                (src.y +
+                    (branch == CanvasEdgeBranch.onFail
+                        ? 220.0
+                        : siblings * 185.0)))
+            .clamp(40.0, maxBoardY);
     final created = addNode(
       kind: kind,
       title: title,
@@ -1337,18 +2233,31 @@ class CanvasController extends ChangeNotifier {
       x: targetX,
       y: targetY,
       httpUrl: httpUrl,
+      recordUndo: false,
     );
-    connect(fromId, created.id, branch: branch);
+    connect(fromId, created.id, branch: branch, recordUndo: false);
     return created;
   }
 
-  /// Arranges all nodes cleanly from left to right by DAG topological depth,
-  /// placing failure-branch nodes neatly on a lower lane so edges never tangle.
+  /// Arranges all non-group nodes cleanly from left to right by DAG topological
+  /// depth, placing failure-branch nodes neatly on a lower lane.
   void autoLayout() {
     if (_nodes.isEmpty) return;
-    final depth = <String, int>{for (final n in _nodes) n.id: 0};
+    pushUndoSnapshot();
+    _autoLayoutInternal();
+    notifyListeners();
+    _scheduleSave();
+  }
+
+  void _autoLayoutInternal() {
+    final layoutNodes = [
+      for (final n in _nodes)
+        if (n.kind != CanvasNodeKind.group) n,
+    ];
+    if (layoutNodes.isEmpty) return;
+    final depth = <String, int>{for (final n in layoutNodes) n.id: 0};
     final failOnly = <String>{};
-    for (final n in _nodes) {
+    for (final n in layoutNodes) {
       final incoming = _edges.where((e) => e.toId == n.id).toList();
       if (incoming.isNotEmpty &&
           incoming.every((e) => e.branch == CanvasEdgeBranch.onFail)) {
@@ -1357,7 +2266,7 @@ class CanvasController extends ChangeNotifier {
     }
 
     // Relax longest-path depths up to N iterations (DAG-safe even with cycles).
-    for (var iter = 0; iter < _nodes.length; iter++) {
+    for (var iter = 0; iter < layoutNodes.length; iter++) {
       var changed = false;
       for (final e in _edges) {
         if (!depth.containsKey(e.fromId) || !depth.containsKey(e.toId)) {
@@ -1375,7 +2284,7 @@ class CanvasController extends ChangeNotifier {
     // Group primary-lane nodes by column depth.
     final columns = <int, List<CanvasNode>>{};
     final failNodes = <CanvasNode>[];
-    for (final n in _nodes) {
+    for (final n in layoutNodes) {
       if (failOnly.contains(n.id)) {
         failNodes.add(n);
       } else {
@@ -1407,19 +2316,19 @@ class CanvasController extends ChangeNotifier {
       node.x = startX + (i + 1) * colGap;
       node.y = maxMainY + 76.0;
     }
-
-    notifyListeners();
-    unawaited(_save());
   }
 
   void clearBoard() {
+    if (_nodes.isNotEmpty || _edges.isNotEmpty) {
+      pushUndoSnapshot();
+    }
     _selectedRunId = null;
     _nodes.clear();
     _edges.clear();
     _singleStepLog = '';
     _activeWorkflowName = '';
     notifyListeners();
-    unawaited(_save());
+    _scheduleSave();
   }
 
   // --- Templates --------------------------------------------------------------
@@ -2861,41 +3770,45 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
 
   CanvasWorkflowTemplate saveCurrentAsTemplate(String name) {
     final trimmed = name.trim();
+    final resolvedName = trimmed.isEmpty ? '工作流模板' : trimmed;
+    final existingIdx = _templates.indexWhere((t) => t.name == resolvedName);
+    final tplId = existingIdx >= 0
+        ? _templates[existingIdx].id
+        : _nextId('tpl');
     final tpl = CanvasWorkflowTemplate(
-      id: 'tpl_${DateTime.now().millisecondsSinceEpoch}',
-      name: trimmed.isEmpty ? '工作流模板' : trimmed,
+      id: tplId,
+      name: resolvedName,
       nodes: [for (final n in _nodes) n.clone()],
       edges: [..._edges],
       defaultAgentId: _defaultAgentId,
       defaultModel: _defaultModel,
       defaultEffort: _defaultEffort,
     );
-    _templates.removeWhere((t) => t.name == tpl.name);
+    if (existingIdx >= 0) {
+      _templates.removeAt(existingIdx);
+    }
     _templates.insert(0, tpl);
     notifyListeners();
-    unawaited(_save());
+    _scheduleSave();
     return tpl;
   }
 
   void deleteTemplate(String id) {
     _templates.removeWhere((t) => t.id == id);
     notifyListeners();
-    unawaited(_save());
+    _scheduleSave();
   }
 
   void applyTemplate(CanvasWorkflowTemplate tpl) {
     // Switching the editor template NEVER interrupts background workflow runs.
+    if (_nodes.isNotEmpty || _edges.isNotEmpty) {
+      pushUndoSnapshot();
+    }
     _selectedRunId = null;
     _activeWorkflowName = tpl.name;
-    if (tpl.defaultAgentId.isNotEmpty) {
-      _defaultAgentId = tpl.defaultAgentId;
-    }
-    if (tpl.defaultModel.isNotEmpty) {
-      _defaultModel = tpl.defaultModel;
-    }
-    if (tpl.defaultEffort.isNotEmpty) {
-      _defaultEffort = tpl.defaultEffort;
-    }
+    _defaultAgentId = tpl.defaultAgentId.isEmpty ? 'agy' : tpl.defaultAgentId;
+    _defaultModel = tpl.defaultModel;
+    _defaultEffort = tpl.defaultEffort;
     _nodes
       ..clear()
       ..addAll([for (final n in tpl.nodes) n.clone()]);
@@ -2903,8 +3816,9 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
       ..clear()
       ..addAll(tpl.edges);
     _singleStepLog = '';
+    _syncActiveWorkflowDocument();
     notifyListeners();
-    unawaited(_save());
+    _scheduleSave();
   }
 
   List<({String id, String name})> get runnableWorkflowChoices => [
@@ -2938,21 +3852,56 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
     return map;
   }
 
+  /// Safely interpolates `{{key}}`, `{{key ?? fallback}}`, and escaping
+  /// filters (`{{key | shell}}`, `{{key | json}}`, `{{key | url}}`).
   static String interpolate(String template, Map<String, String> vars) {
-    return template.replaceAllMapped(RegExp(r'\{\{\s*([^{}\s]+)\s*\}\}'), (m) {
-      final key = m.group(1)!;
-      return vars[key] ?? m.group(0)!;
+    return template.replaceAllMapped(RegExp(r'\{\{\s*([^{}]+?)\s*\}\}'), (m) {
+      var expr = m.group(1)!.trim();
+      String? filter;
+      final pipeIdx = expr.indexOf('|');
+      if (pipeIdx > 0) {
+        filter = expr.substring(pipeIdx + 1).trim().toLowerCase();
+        expr = expr.substring(0, pipeIdx).trim();
+      }
+      String? fallback;
+      final fbIdx = expr.indexOf('??');
+      if (fbIdx > 0) {
+        fallback = expr.substring(fbIdx + 2).trim();
+        if (fallback.length >= 2 &&
+            ((fallback.startsWith("'") && fallback.endsWith("'")) ||
+                (fallback.startsWith('"') && fallback.endsWith('"')))) {
+          fallback = fallback.substring(1, fallback.length - 1);
+        }
+        expr = expr.substring(0, fbIdx).trim();
+      }
+      final rawVal = vars[expr];
+      final value = (rawVal != null && rawVal.isNotEmpty)
+          ? rawVal
+          : (fallback ?? (rawVal ?? m.group(0)!));
+      if (rawVal == null && fallback == null) {
+        return value;
+      }
+      return switch (filter) {
+        'shell' => "'${value.replaceAll("'", "'\\''")}'",
+        'json' => (() {
+          final encoded = jsonEncode(value);
+          return encoded.substring(1, encoded.length - 1);
+        })(),
+        'url' => Uri.encodeComponent(value),
+        _ => value,
+      };
     });
   }
 
   /// Extracts unique local evidence / media file paths (screenshots, videos,
-  /// trace logs, diffs) referenced inside node output or workflow logs.
+  /// trace logs, diffs) across both Windows (`C:\...`) and POSIX (`/...`)
+  /// outputs.
   static List<String> extractEvidencePaths(String text) {
     if (text.isEmpty) return const [];
     final seen = <String>{};
     final result = <String>[];
     final pattern = RegExp(
-      r'''(/[A-Za-z0-9._\-/@+~]+(?:\.(?:png|jpe?g|webp|gif|webm|mp4|mov|diff)|/trace\.md|/git\.diff))''',
+      r'''([A-Za-z]:[\\/][^\s"'`<>|*?]+?(?:\.(?:png|jpe?g|webp|gif|webm|mp4|mov|diff)|[\\/]trace\.md|[\\/]git\.diff)|(?<![A-Za-z0-9_:\\])/[A-Za-z0-9._\-/@+~]+(?:\.(?:png|jpe?g|webp|gif|webm|mp4|mov|diff)|/trace\.md|/git\.diff))''',
       caseSensitive: false,
     );
     for (final m in pattern.allMatches(text)) {
@@ -2997,14 +3946,112 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
     }
     final op = trimmed.substring(0, colon).trim();
     final arg = trimmed.substring(colon + 1).trim();
-    return switch (op) {
-      'contains' => prevOutput.contains(arg),
-      'notContains' => !prevOutput.contains(arg),
-      'equals' => prevOutput.trim() == arg,
-      'regex' => RegExp(arg, multiLine: true).hasMatch(prevOutput),
-      'exitZero' => (prevExitCode ?? 0) == 0,
-      _ => prevOutput.contains(trimmed),
+    switch (op) {
+      case 'contains':
+        return prevOutput.contains(arg);
+      case 'notContains':
+        return !prevOutput.contains(arg);
+      case 'equals':
+        return prevOutput.trim() == arg;
+      case 'regex':
+        try {
+          return RegExp(arg, multiLine: true).hasMatch(prevOutput);
+        } on FormatException {
+          return false;
+        }
+      case 'exitZero':
+        return (prevExitCode ?? 0) == 0;
+      default:
+        return prevOutput.contains(trimmed);
+    }
+  }
+
+  /// Resolves a cross-platform shell executable and argument list for
+  /// `CanvasNodeKind.command` nodes (BaoCode/Git Bash or PowerShell on Windows;
+  /// zsh/bash/sh on macOS & Linux).
+  static ({String executable, List<String> args, bool isBash})
+  resolveCommandShell(String command) {
+    if (Platform.isWindows) {
+      final bashCandidates = <String>[
+        p.join(DataDirectory.current.path, 'tools', 'bash-exe', 'bash.exe'),
+        r'C:\Program Files\Git\bin\bash.exe',
+        r'C:\Program Files\Git\usr\bin\bash.exe',
+        r'C:\Program Files (x86)\Git\bin\bash.exe',
+      ];
+      for (final candidate in bashCandidates) {
+        if (File(candidate).existsSync()) {
+          return (executable: candidate, args: ['-c', command], isBash: true);
+        }
+      }
+      return (
+        executable: 'powershell.exe',
+        args: ['-NoProfile', '-NonInteractive', '-Command', command],
+        isBash: false,
+      );
+    }
+    if (File('/bin/zsh').existsSync()) {
+      return (executable: '/bin/zsh', args: ['-lc', command], isBash: true);
+    }
+    if (File('/bin/bash').existsSync()) {
+      return (executable: '/bin/bash', args: ['-lc', command], isBash: true);
+    }
+    return (executable: '/bin/sh', args: ['-c', command], isBash: true);
+  }
+
+  static void _killProcessTree(Process proc) {
+    final pid = proc.pid;
+    if (Platform.isWindows) {
+      if (pid > 0) {
+        unawaited(
+          Process.run('taskkill', ['/PID', '$pid', '/T', '/F'])
+              .catchError((Object _) => ProcessResult(0, 1, '', '')),
+        );
+      }
+      proc.kill();
+    } else {
+      proc.kill(ProcessSignal.sigterm);
+      if (pid > 0) {
+        Timer(const Duration(milliseconds: 400), () {
+          proc.kill(ProcessSignal.sigkill);
+        });
+      }
+    }
+  }
+
+  static Map<String, String> _buildCommandEnvironment(
+    Map<String, String> vars, {
+    String? runDir,
+  }) {
+    final env = <String, String>{
+      ...Platform.environment,
+      'PATH': AcpAgentService.buildEnrichedPath(),
+      'CHERE_INVOKING': '1',
+      if (runDir != null && runDir.isNotEmpty) 'AYTE_RUN_DIR': runDir,
     };
+    for (final e in vars.entries) {
+      if (e.key.startsWith('input.')) {
+        final safeKey = e.key
+            .substring(6)
+            .toUpperCase()
+            .replaceAll(RegExp(r'[^A-Z0-9_]'), '_');
+        if (safeKey.isNotEmpty && e.value.length <= 16000) {
+          env['AYTE_INPUT_$safeKey'] = e.value;
+        }
+      }
+    }
+    if (vars['prev.output'] case final po? when po.length <= 16000) {
+      env['AYTE_PREV_OUTPUT'] = po;
+    }
+    if (vars['prev.exitCode'] case final pe?) {
+      env['AYTE_PREV_EXIT_CODE'] = pe;
+    }
+    if (vars['approval.note'] case final an?) {
+      env['AYTE_APPROVAL_NOTE'] = an;
+    }
+    if (vars['cwd'] case final cwd? when cwd.isNotEmpty) {
+      env['AYTE_CWD'] = cwd;
+    }
+    return env;
   }
 
   // --- Single Node Execution --------------------------------------------------
@@ -3013,7 +4060,8 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
     final node = nodeById(id);
     if (node == null || node.running) return;
     final vars = <String, String>{'cwd': node.refId};
-    // Also seed trigger inputs if any exist on canvas so {{input.*}} works in single-step test.
+    // Seed trigger inputs and completed upstream outputs so single-step tests
+    // can reference {{input.*}} and {{prev.output}} directly.
     for (final n in _nodes) {
       if (n.kind == CanvasNodeKind.trigger) {
         final parsed = parseKeyValueLines(n.content);
@@ -3024,26 +4072,49 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
           vars['cwd'] = n.refId;
         }
       }
+      if (n.output.isNotEmpty) {
+        vars['${n.id}.output'] = n.output;
+        vars['${n.id}.status'] =
+            n.runStatus == CanvasNodeRunStatus.succeeded ? 'PASS' : 'FAIL';
+      }
     }
+    var prevOutput = '';
+    int? prevExit = 0;
+    for (final e in _edges) {
+      if (e.toId == node.id) {
+        final pred = nodeById(e.fromId);
+        if (pred != null && pred.output.isNotEmpty) {
+          prevOutput = pred.output;
+          prevExit = pred.exitCode ?? 0;
+          break;
+        }
+      }
+    }
+    vars['prev.output'] = prevOutput;
+    vars['prev.exitCode'] = '${prevExit ?? 0}';
     _singleStepRunningNodeId = node.id;
-    _appendRunLog('\n▶ [单步试跑] ${node.title} (${node.kind.label(true)})\n');
+    _appendRunLog(
+      '\n▶ [单步试跑] ${node.title} (${node.kind.label(true)})\n',
+      immediate: true,
+    );
     try {
-      final passed = await _executeNode(
+      final passed = await _executeNodeWithRetry(
         node,
         vars: vars,
-        prevOutput: '',
-        prevExitCode: 0,
+        prevOutput: prevOutput,
+        prevExitCode: prevExit,
       );
       _appendRunLog(
         passed
             ? '\n✓ [单步试跑] ${node.title} 通过\n'
             : '\n✗ [单步试跑] ${node.title} 未通过（exit=${node.exitCode ?? 1}）\n',
+        immediate: true,
       );
     } finally {
       if (_singleStepRunningNodeId == node.id) {
         _singleStepRunningNodeId = null;
       }
-      notifyListeners();
+      _flushStreamNotify();
     }
   }
 
@@ -3103,8 +4174,18 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
 
   void _stopSingleRun(WorkflowRun run) {
     run.cancelRequested = true;
-    run.activeProcess?.kill();
-    run.activeProcess = null;
+    for (final proc in List<Process>.from(run.activeProcesses)) {
+      _killProcessTree(proc);
+    }
+    run.activeProcesses.clear();
+    for (final client in List<HttpClient>.from(run.activeHttpClients)) {
+      try {
+        client.close(force: true);
+      } on Object {
+        // Ignore already-closed HTTP client.
+      }
+    }
+    run.activeHttpClients.clear();
     if (run.approvalCompleter != null && !run.approvalCompleter!.isCompleted) {
       run.approvalCompleter!.complete((approved: false, note: ''));
     }
@@ -3135,8 +4216,8 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
     for (final run in _runs) {
       if (run.running) _stopSingleRun(run);
     }
-    for (final proc in _singleStepProcesses.values) {
-      proc.kill();
+    for (final proc in List<Process>.from(_singleStepProcesses.values)) {
+      _killProcessTree(proc);
     }
     _singleStepProcesses.clear();
     if (_singleStepApprovalCompleter != null &&
@@ -3165,6 +4246,7 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
     Map<String, String> inputs = const {},
     bool selectOnStart = true,
   }) => runWorkflow(
+    templateId: run.sourceTemplateId,
     defaultCwd: defaultCwd,
     inputs: inputs,
     selectOnStart: selectOnStart,
@@ -3178,30 +4260,41 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
 
   /// Resumes a finished/failed/cancelled [sourceRun] starting from
   /// [startNodeId], preserving upstream completed nodes' statuses, outputs,
-  /// and captured variables (`{{input.*}}`, `{{approval.note}}`,
-  /// `{{prev.output}}`, `{{nodeId.output}}`) while resetting [startNodeId] and
-  /// its downstream subgraph to execute fresh.
+  /// and captured variables while resetting [startNodeId] and its downstream
+  /// subgraph to execute fresh. When [useLatestEditorConfig] is true, any
+  /// matching nodes modified on the current editor canvas inherit their latest
+  /// script/prompt/settings so users can fix a broken step and resume cleanly.
   Future<WorkflowRunResult> resumeWorkflowFromNode(
     WorkflowRun sourceRun,
     String startNodeId, {
     String? defaultCwd,
     Map<String, String> inputs = const {},
     bool selectOnStart = true,
-  }) => runWorkflow(
-    templateId: sourceRun.sourceTemplateId,
-    defaultCwd: defaultCwd,
-    inputs: inputs,
-    selectOnStart: selectOnStart,
-    runName: sourceRun.name,
-    customNodes: sourceRun.nodes,
-    customEdges: sourceRun.edges,
-    defaultAgentIdOverride: sourceRun.defaultAgentId,
-    defaultModelOverride: sourceRun.defaultModel,
-    defaultEffortOverride: sourceRun.defaultEffort,
-    startNodeId: startNodeId,
-    preserveRuntimeFromNodes: sourceRun.nodes,
-    initialVars: sourceRun.capturedVars,
-  );
+    bool useLatestEditorConfig = true,
+  }) {
+    final mergedNodes = <CanvasNode>[
+      for (final n in sourceRun.nodes)
+        if (useLatestEditorConfig && nodeById(n.id) != null)
+          nodeById(n.id)!.clone()
+        else
+          n.clone(),
+    ];
+    return runWorkflow(
+      templateId: sourceRun.sourceTemplateId,
+      defaultCwd: defaultCwd,
+      inputs: inputs,
+      selectOnStart: selectOnStart,
+      runName: sourceRun.name,
+      customNodes: mergedNodes,
+      customEdges: sourceRun.edges,
+      defaultAgentIdOverride: sourceRun.defaultAgentId,
+      defaultModelOverride: sourceRun.defaultModel,
+      defaultEffortOverride: sourceRun.defaultEffort,
+      startNodeId: startNodeId,
+      preserveRuntimeFromNodes: sourceRun.nodes,
+      initialVars: sourceRun.capturedVars,
+    );
+  }
 
   /// Starts a workflow run directly from any chosen [startNodeId] on the
   /// current editable canvas, seeding trigger inputs automatically.
@@ -3219,11 +4312,11 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
   );
 
   static Set<String> _reachableNodeIds(
-    String startId,
+    Iterable<String> startIds,
     List<CanvasEdge> edges,
   ) {
-    final visited = <String>{startId};
-    final frontier = <String>[startId];
+    final visited = <String>{...startIds};
+    final frontier = <String>[...startIds];
     while (frontier.isNotEmpty) {
       final cur = frontier.removeAt(0);
       for (final e in edges) {
@@ -3237,8 +4330,7 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
 
   /// Runs either the current canvas, a saved/built-in template by [templateId],
   /// or an explicit [customNodes]/[customEdges] snapshot as an isolated
-  /// concurrent [WorkflowRun]. Multiple calls can execute in parallel without
-  /// blocking one another or mutating the editor canvas.
+  /// concurrent [WorkflowRun] using a dependency-aware parallel DAG scheduler.
   Future<WorkflowRunResult> runWorkflow({
     String? templateId,
     String? defaultCwd,
@@ -3271,7 +4363,7 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
       final tpl = resolveTemplate(templateId, defaultCwd: defaultCwd);
       if (tpl == null) {
         final err = '未找到工作流模板：$templateId';
-        _appendRunLog('[Workflow] $err\n', onLogChunk: onLogChunk);
+        _appendRunLog('[Workflow] $err\n', onLogChunk: onLogChunk, immediate: true);
         return WorkflowRunResult(ok: false, log: err, error: err);
       }
       runNodes = [for (final n in tpl.nodes) n.clone()];
@@ -3301,7 +4393,7 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
     ];
     if (execNodes.isEmpty) {
       const err = '画布中没有可执行节点（请先从「模板」载入或添加触发/Shell/Agent 节点）。';
-      _appendRunLog('[Workflow] $err\n', onLogChunk: onLogChunk);
+      _appendRunLog('[Workflow] $err\n', onLogChunk: onLogChunk, immediate: true);
       return const WorkflowRunResult(ok: false, log: err, error: err);
     }
 
@@ -3315,13 +4407,13 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
       }
       if (startNode == null) {
         final err = '未找到可续跑的起始节点：$startNodeId';
-        _appendRunLog('[Workflow] $err\n', onLogChunk: onLogChunk);
+        _appendRunLog('[Workflow] $err\n', onLogChunk: onLogChunk, immediate: true);
         return WorkflowRunResult(ok: false, log: err, error: err);
       }
     }
 
     final reachableFromStart = startNode != null
-        ? _reachableNodeIds(startNode.id, runEdges)
+        ? _reachableNodeIds([startNode.id], runEdges)
         : null;
     final priorById = <String, CanvasNode>{
       if (preserveRuntimeFromNodes != null)
@@ -3339,7 +4431,7 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
             prior.runStatus != CanvasNodeRunStatus.queued) {
           n.runStatus = prior.runStatus == CanvasNodeRunStatus.running ||
                   prior.runStatus == CanvasNodeRunStatus.waitingApproval
-              ? CanvasNodeRunStatus.succeeded
+              ? CanvasNodeRunStatus.failed
               : prior.runStatus;
           n.output = prior.output;
           n.exitCode = prior.exitCode;
@@ -3390,8 +4482,21 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
     onRunStarted?.call(run.id);
     notifyListeners();
 
-    void logLine(String msg) {
-      _appendRunLog('$msg\n', run: run, onLogChunk: onLogChunk);
+    void logLine(String msg, {bool immediate = false}) {
+      _appendRunLog(
+        '$msg\n',
+        run: run,
+        onLogChunk: onLogChunk,
+        immediate: immediate,
+      );
+    }
+
+    // Create an isolated per-run temp folder so concurrent runs never collide.
+    Directory? runTempDir;
+    try {
+      runTempDir = await Directory.systemTemp.createTemp('ayte_wf_${run.id}_');
+    } on Object {
+      runTempDir = null;
     }
 
     // Build initial variable context: prior captured vars -> Trigger defaults -> explicit inputs.
@@ -3400,6 +4505,7 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
       'cwd': (defaultCwd != null && defaultCwd.isNotEmpty)
           ? defaultCwd
           : (initialVars['cwd'] ?? ''),
+      if (runTempDir != null) 'runDir': runTempDir.path,
       for (final e in inputs.entries) 'input.${e.key}': e.value,
     };
     for (final n in execNodes) {
@@ -3428,8 +4534,8 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
       ..clear()
       ..addAll(vars);
 
-    // Entry queue: either the explicit resume breakpoint or DAG root nodes.
-    final queue = <({String nodeId, String prevOutput, int? prevExit})>[];
+    // Determine entry root nodes & active subgraph.
+    final entrySeeds = <({String nodeId, String prevOutput, int? prevExit})>[];
     if (startNode != null) {
       String seedPrevOutput = vars['prev.output'] ?? '';
       int? seedPrevExit = int.tryParse(vars['prev.exitCode'] ?? '') ?? 0;
@@ -3446,15 +4552,16 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
           if (pred.runStatus == CanvasNodeRunStatus.succeeded) break;
         }
       }
-      queue.add((
+      entrySeeds.add((
         nodeId: startNode.id,
         prevOutput: seedPrevOutput,
         prevExit: seedPrevExit,
       ));
     } else {
-      final incomingCount = <String, int>{for (final n in execNodes) n.id: 0};
+      final execIds = {for (final n in execNodes) n.id};
+      final incomingCount = <String, int>{for (final id in execIds) id: 0};
       for (final e in run.edges) {
-        if (incomingCount.containsKey(e.toId)) {
+        if (execIds.contains(e.fromId) && execIds.contains(e.toId)) {
           incomingCount[e.toId] = incomingCount[e.toId]! + 1;
         }
       }
@@ -3472,11 +4579,107 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
         roots.add(execNodes.first);
       }
       for (final r in roots) {
-        queue.add((nodeId: r.id, prevOutput: '', prevExit: 0));
+        entrySeeds.add((nodeId: r.id, prevOutput: '', prevExit: 0));
       }
     }
 
-    final visited = <String>{};
+    final activeIds = _reachableNodeIds(
+      entrySeeds.map((s) => s.nodeId),
+      run.edges,
+    ).where((id) => run.nodeById(id)?.kind.isExecutable == true).toSet();
+
+    // Build dependency maps restricted to activeIds for proper diamond fan-in.
+    final incomingEdges = <String, List<CanvasEdge>>{
+      for (final id in activeIds) id: [],
+    };
+    final outgoingEdges = <String, List<CanvasEdge>>{
+      for (final id in activeIds) id: [],
+    };
+    for (final e in run.edges) {
+      if (activeIds.contains(e.fromId) && activeIds.contains(e.toId)) {
+        incomingEdges[e.toId]!.add(e);
+        outgoingEdges[e.fromId]!.add(e);
+      }
+    }
+
+    final resolvedCount = <String, int>{for (final id in activeIds) id: 0};
+    final firedInputs =
+        <String, List<({String fromId, String output, int? exitCode})>>{
+          for (final id in activeIds) id: [],
+        };
+    final completedIds = <String>{};
+    final readyQueue = <({String nodeId, String prevOutput, int? prevExit})>[];
+    final queuedIds = <String>{};
+
+    for (final seed in entrySeeds) {
+      if (queuedIds.add(seed.nodeId)) {
+        readyQueue.add(seed);
+      }
+    }
+
+    void resolveDownstream(
+      String fromId, {
+      required bool executed,
+      required bool passed,
+      required String output,
+      required int? exitCode,
+    }) {
+      for (final edge in outgoingEdges[fromId] ?? const <CanvasEdge>[]) {
+        final targetId = edge.toId;
+        if (completedIds.contains(targetId) || queuedIds.contains(targetId)) {
+          continue;
+        }
+        final branchFired =
+            executed &&
+            (edge.branch == CanvasEdgeBranch.always ||
+                (passed && edge.branch == CanvasEdgeBranch.onPass) ||
+                (!passed && edge.branch == CanvasEdgeBranch.onFail));
+        if (branchFired) {
+          firedInputs[targetId]!.add((
+            fromId: fromId,
+            output: output,
+            exitCode: exitCode,
+          ));
+        }
+        resolvedCount[targetId] = (resolvedCount[targetId] ?? 0) + 1;
+        final totalIn = incomingEdges[targetId]?.length ?? 0;
+        if (resolvedCount[targetId]! >= totalIn) {
+          final inputsForTarget = firedInputs[targetId]!;
+          if (inputsForTarget.isNotEmpty) {
+            final joinedOutput = inputsForTarget.length == 1
+                ? inputsForTarget.first.output
+                : [
+                    for (final item in inputsForTarget)
+                      '[${run.nodeById(item.fromId)?.title ?? item.fromId}]\n${item.output}',
+                  ].join('\n\n');
+            final lastExit = inputsForTarget.last.exitCode;
+            if (queuedIds.add(targetId)) {
+              readyQueue.add((
+                nodeId: targetId,
+                prevOutput: joinedOutput,
+                prevExit: lastExit,
+              ));
+            }
+          } else {
+            // Every incoming branch to this join was inactive: skip & cascade.
+            completedIds.add(targetId);
+            final skippedNode = run.nodeById(targetId);
+            if (skippedNode != null &&
+                skippedNode.runStatus == CanvasNodeRunStatus.queued) {
+              skippedNode.runStatus = CanvasNodeRunStatus.skipped;
+            }
+            resolveDownstream(
+              targetId,
+              executed: false,
+              passed: false,
+              output: '',
+              exitCode: null,
+            );
+          }
+        }
+      }
+    }
+
     var executedCount = 0;
     var hadUnhandledFailure = false;
     String? failedNodeId;
@@ -3484,46 +4687,69 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
     if (startNode != null) {
       logLine(
         '[Workflow #${run.id}] 从断点节点「${startNode.title}」续跑「${run.name}」（已保留 $preservedCount 个已完成上游节点）...',
+        immediate: true,
       );
     } else {
       logLine(
         '[Workflow #${run.id}] 开始执行「${run.name}」（共 ${execNodes.length} 个可执行节点）...',
+        immediate: true,
       );
     }
 
     try {
-      while (queue.isNotEmpty && !run.cancelRequested) {
-        final step = queue.removeAt(0);
-        if (!visited.add(step.nodeId)) continue;
-        final node = run.nodeById(step.nodeId);
-        if (node == null || !node.kind.isExecutable) continue;
+      final inflight = <Future<void>>{};
 
+      Future<void> runStep(
+        ({String nodeId, String prevOutput, int? prevExit}) step,
+      ) async {
+        if (run.cancelRequested) return;
+        final node = run.nodeById(step.nodeId);
+        if (node == null || !node.kind.isExecutable) {
+          completedIds.add(step.nodeId);
+          return;
+        }
         executedCount++;
         run.executedNodes = executedCount;
         run.currentRunningNodeId = node.id;
-        vars['prev.output'] = step.prevOutput;
-        vars['prev.exitCode'] = '${step.prevExit ?? 0}';
-        logLine('\n━━ ▶ [${node.title}] (${node.kind.label(true)}) ━━');
 
-        final passed = await _executeNode(
+        final stepVars = Map<String, String>.from(vars)
+          ..['prev.output'] = step.prevOutput
+          ..['prev.exitCode'] = '${step.prevExit ?? 0}';
+        logLine(
+          '\n━━ ▶ [${node.title}] (${node.kind.label(true)}) ━━',
+          immediate: true,
+        );
+
+        final passed = await _executeNodeWithRetry(
           node,
           run: run,
-          vars: vars,
+          vars: stepVars,
           prevOutput: step.prevOutput,
           prevExitCode: step.prevExit,
           defaultCwd: defaultCwd,
+          runDir: runTempDir?.path,
           onLogChunk: onLogChunk,
         );
 
+        // Merge back trigger inputs & approval notes produced by this node.
+        for (final entry in stepVars.entries) {
+          if (entry.key.startsWith('input.') ||
+              entry.key == 'approval.note' ||
+              entry.key == 'cwd') {
+            vars[entry.key] = entry.value;
+          }
+        }
+        vars['prev.output'] = node.output;
+        vars['prev.exitCode'] = '${node.exitCode ?? (passed ? 0 : 1)}';
         vars['${node.id}.output'] = node.output;
         vars['${node.id}.status'] = passed ? 'PASS' : 'FAIL';
         run.capturedVars
           ..clear()
           ..addAll(vars);
+        completedIds.add(node.id);
 
         if (run.cancelRequested) {
-          logLine('■ 工作流 #${run.id} 已被手动停止。');
-          break;
+          return;
         }
 
         final durStr = node.runDuration == null
@@ -3533,32 +4759,50 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
           passed
               ? '✓ [${node.title}] 通过$durStr'
               : '✗ [${node.title}] 未通过（exit=${node.exitCode ?? 1}$durStr）',
+          immediate: true,
         );
 
-        final outgoing = [
-          for (final e in run.edges)
-            if (e.fromId == node.id) e,
-        ];
-        final matching = [
-          for (final e in outgoing)
-            if (e.branch == CanvasEdgeBranch.always ||
-                (passed && e.branch == CanvasEdgeBranch.onPass) ||
-                (!passed && e.branch == CanvasEdgeBranch.onFail))
-              e,
-        ];
-
-        if (!passed && matching.isEmpty) {
-          hadUnhandledFailure = true;
-          failedNodeId ??= node.id;
+        final outgoing = outgoingEdges[node.id] ?? const <CanvasEdge>[];
+        if (!passed) {
+          final hasRecovery = outgoing.any(
+            (e) =>
+                e.branch == CanvasEdgeBranch.onFail &&
+                (run.nodeById(e.toId)?.recoversFailure ?? false),
+          );
+          if (!hasRecovery) {
+            hadUnhandledFailure = true;
+            failedNodeId ??= node.id;
+          }
         }
 
-        for (final e in matching) {
-          queue.add((
-            nodeId: e.toId,
-            prevOutput: node.output,
-            prevExit: node.exitCode,
-          ));
+        resolveDownstream(
+          node.id,
+          executed: true,
+          passed: passed,
+          output: node.output,
+          exitCode: node.exitCode,
+        );
+      }
+
+      while (!run.cancelRequested &&
+          (readyQueue.isNotEmpty || inflight.isNotEmpty)) {
+        while (!run.cancelRequested &&
+            readyQueue.isNotEmpty &&
+            inflight.length < maxParallelNodes) {
+          final next = readyQueue.removeAt(0);
+          late final Future<void> task;
+          task = runStep(next).whenComplete(() => inflight.remove(task));
+          inflight.add(task);
         }
+        if (inflight.isNotEmpty) {
+          await Future.any(inflight);
+        }
+      }
+      if (inflight.isNotEmpty) {
+        await Future.wait(inflight);
+      }
+      if (run.cancelRequested) {
+        logLine('■ 工作流 #${run.id} 已被手动停止。', immediate: true);
       }
 
       // Mark any unreached queued nodes as skipped.
@@ -3573,7 +4817,8 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
       run.currentRunningNodeId = null;
       run.activeApprovalNodeId = null;
       run.approvalCompleter = null;
-      run.activeProcess = null;
+      run.activeProcesses.clear();
+      run.activeHttpClients.clear();
       run.capturedVars
         ..clear()
         ..addAll(vars);
@@ -3584,6 +4829,12 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
           : hadUnhandledFailure
           ? '节点 ${run.nodeById(failedNodeId ?? '')?.title ?? failedNodeId} 执行失败'
           : null;
+      logLine(
+        ok
+            ? '\n[Workflow #${run.id}] 全部执行完成 ✓'
+            : '\n[Workflow #${run.id}] 执行中止 ✗',
+        immediate: true,
+      );
       final succeededCount = run.execSucceeded;
       final completion = WorkflowCompletionEvent(
         runId: ++_completionSequence,
@@ -3598,8 +4849,14 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
         error: run.error,
       );
       _lastCompletionEvent = completion;
-      notifyListeners();
+      _flushStreamNotify();
       unawaited(_saveRuns());
+      if (runTempDir != null) {
+        final tempToClean = runTempDir;
+        unawaited(
+          tempToClean.delete(recursive: true).catchError((Object _) => tempToClean),
+        );
+      }
       if (!run.cancelRequested &&
           !Platform.environment.containsKey('FLUTTER_TEST')) {
         unawaited(_notifySystemWorkflowFinished(completion));
@@ -3607,11 +4864,6 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
     }
 
     final ok = !run.cancelRequested && !hadUnhandledFailure;
-    logLine(
-      ok
-          ? '\n[Workflow #${run.id}] 全部执行完成 ✓'
-          : '\n[Workflow #${run.id}] 执行中止 ✗',
-    );
     return WorkflowRunResult(
       ok: ok,
       log: run.log,
@@ -3650,6 +4902,53 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
     }
   }
 
+  Future<bool> _executeNodeWithRetry(
+    CanvasNode node, {
+    WorkflowRun? run,
+    required Map<String, String> vars,
+    required String prevOutput,
+    required int? prevExitCode,
+    String? defaultCwd,
+    String? runDir,
+    void Function(String chunk)? onLogChunk,
+  }) async {
+    final canRetry =
+        node.kind == CanvasNodeKind.command ||
+        node.kind == CanvasNodeKind.http ||
+        node.kind == CanvasNodeKind.agent;
+    final totalAttempts = canRetry ? (1 + node.maxRetries.clamp(0, 5)) : 1;
+    for (var attempt = 0; attempt < totalAttempts; attempt++) {
+      final ok = await _executeNode(
+        node,
+        run: run,
+        vars: vars,
+        prevOutput: prevOutput,
+        prevExitCode: prevExitCode,
+        defaultCwd: defaultCwd,
+        runDir: runDir,
+        onLogChunk: onLogChunk,
+      );
+      if (ok || (run?.cancelRequested ?? false) || attempt + 1 >= totalAttempts) {
+        return ok;
+      }
+      final delaySec = node.retryDelaySeconds * (attempt + 1);
+      _appendRunLog(
+        '\n↻ [${node.title}] 第 ${attempt + 1}/$totalAttempts 次失败，${delaySec}s 后自动重试…\n',
+        run: run,
+        onLogChunk: onLogChunk,
+        immediate: true,
+      );
+      if (delaySec > 0) {
+        final deadline = DateTime.now().add(Duration(seconds: delaySec));
+        while (DateTime.now().isBefore(deadline)) {
+          if (run?.cancelRequested ?? false) return false;
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+        }
+      }
+    }
+    return false;
+  }
+
   Future<bool> _executeNode(
     CanvasNode node, {
     WorkflowRun? run,
@@ -3657,15 +4956,27 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
     required String prevOutput,
     required int? prevExitCode,
     String? defaultCwd,
+    String? runDir,
     void Function(String chunk)? onLogChunk,
   }) async {
     bool isCancelled() => run?.cancelRequested ?? false;
+    Process? ownedProc;
     void setActiveProcess(Process? p) {
       if (run != null) {
-        run.activeProcess = p;
+        if (ownedProc != null) run.activeProcesses.remove(ownedProc);
+        ownedProc = p;
+        if (p != null) {
+          if (run.cancelRequested) {
+            _killProcessTree(p);
+          } else {
+            run.activeProcesses.add(p);
+          }
+        }
       } else if (p != null) {
+        ownedProc = p;
         _singleStepProcesses[node.id] = p;
       } else {
+        ownedProc = null;
         _singleStepProcesses.remove(node.id);
       }
     }
@@ -3676,7 +4987,7 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
     node.exitCode = null;
     node.startedAt = DateTime.now();
     node.finishedAt = null;
-    notifyListeners();
+    _flushStreamNotify();
 
     final cwd = _resolveCwd(node.refId, vars, defaultCwd);
 
@@ -3711,56 +5022,87 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
             node.runStatus = CanvasNodeRunStatus.succeeded;
             return true;
           }
-          final effectiveDir = cwd.isNotEmpty && Directory(cwd).existsSync()
-              ? cwd
-              : null;
+          final effectiveDir =
+              cwd.isNotEmpty && await Directory(cwd).exists() ? cwd : null;
           _appendRunLog(
             '\$ $cmd\n${effectiveDir != null ? "(cwd: $effectiveDir)\n" : ""}',
             run: run,
             onLogChunk: onLogChunk,
           );
-          final env = <String, String>{
-            ...Platform.environment,
-            'PATH': AcpAgentService.buildEnrichedPath(),
-          };
+          final env = _buildCommandEnvironment(vars, runDir: runDir);
+          final shell = resolveCommandShell(cmd);
           final proc = await Process.start(
-            '/bin/zsh',
-            ['-lc', cmd],
+            shell.executable,
+            shell.args,
             workingDirectory: effectiveDir,
             environment: env,
           );
           setActiveProcess(proc);
+          if (isCancelled()) {
+            _killProcessTree(proc);
+            node.exitCode = -1;
+            node.runStatus = CanvasNodeRunStatus.failed;
+            return false;
+          }
           unawaited(proc.stdin.close().catchError((_) {}));
-          final outBuf = StringBuffer();
+          final outBuf = _TailBuffer(maxChars: 24000);
+          final outDone = Completer<void>();
+          final errDone = Completer<void>();
           final s1 = proc.stdout
               .transform(const Utf8Decoder(allowMalformed: true))
-              .listen((c) {
-                outBuf.write(c);
-                node.output = _trimTail(outBuf.toString());
-                _appendRunLog(c, run: run, onLogChunk: onLogChunk);
-              });
+              .listen(
+                (c) {
+                  outBuf.write(c);
+                  node.output = outBuf.toString();
+                  _appendRunLog(c, run: run, onLogChunk: onLogChunk);
+                },
+                onDone: () {
+                  if (!outDone.isCompleted) outDone.complete();
+                },
+                onError: (_) {
+                  if (!outDone.isCompleted) outDone.complete();
+                },
+              );
           final s2 = proc.stderr
               .transform(const Utf8Decoder(allowMalformed: true))
-              .listen((c) {
-                outBuf.write(c);
-                node.output = _trimTail(outBuf.toString());
-                _appendRunLog(c, run: run, onLogChunk: onLogChunk);
-              });
+              .listen(
+                (c) {
+                  outBuf.write(c);
+                  node.output = outBuf.toString();
+                  _appendRunLog(c, run: run, onLogChunk: onLogChunk);
+                },
+                onDone: () {
+                  if (!errDone.isCompleted) errDone.complete();
+                },
+                onError: (_) {
+                  if (!errDone.isCompleted) errDone.complete();
+                },
+              );
           final code = await proc.exitCode.timeout(
             Duration(seconds: node.timeoutSeconds),
             onTimeout: () {
-              proc.kill();
+              _killProcessTree(proc);
               _appendRunLog(
-                '\n[Timeout] 节点超时（${node.timeoutSeconds}s），已终止进程。\n',
+                '\n[Timeout] 节点超时（${node.timeoutSeconds}s），已终止进程树。\n',
                 run: run,
                 onLogChunk: onLogChunk,
+                immediate: true,
               );
               return -1;
             },
           );
+          // Drain trailing buffered stdout/stderr chunks cleanly before closing.
+          try {
+            await Future.wait([outDone.future, errDone.future]).timeout(
+              const Duration(seconds: 2),
+            );
+          } on TimeoutException {
+            // Child process left stdio open; force close listeners.
+          }
           await s1.cancel();
           await s2.cancel();
           setActiveProcess(null);
+          node.output = outBuf.toString();
           node.exitCode = code;
           if (node.output.trim().isEmpty) node.output = '(Exit $code)';
           final ok = code == 0 && !isCancelled();
@@ -3785,7 +5127,9 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
             '[Agent:${cfg.agentId} · $modelTag$effortTag] 正在启动内核并发送任务（cwd: ${cwd.isEmpty ? "默认" : cwd}）...\n',
             run: run,
             onLogChunk: onLogChunk,
+            immediate: true,
           );
+          final outBuf = _TailBuffer(maxChars: 24000);
           final res = await AcpAgentService.instance.runHeadlessPrompt(
             agentId: cfg.agentId,
             model: cfg.model,
@@ -3795,7 +5139,8 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
             timeout: Duration(seconds: node.timeoutSeconds),
             onProcessStarted: setActiveProcess,
             onChunk: (c) {
-              node.output = _trimTail('${node.output}$c');
+              outBuf.write(c);
+              node.output = outBuf.toString();
               _appendRunLog(c, run: run, onLogChunk: onLogChunk);
             },
           );
@@ -3808,12 +5153,16 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
               '[Error] ${res.error!}\n',
               run: run,
               onLogChunk: onLogChunk,
+              immediate: true,
             );
           }
+          // Inspect the node's OWN prompt template (not interpolated upstream
+          // output) so mentioning VERDICT: PASS in an upstream node never
+          // falsely arms the hard verdict gate on downstream nodes.
           final requiresPassVerdict = RegExp(
             r'VERDICT\s*:\s*PASS\b',
             caseSensitive: false,
-          ).hasMatch(prompt);
+          ).hasMatch(node.content);
           final verdictPass = RegExp(
             r'VERDICT\s*:\s*PASS\b',
             caseSensitive: false,
@@ -3828,6 +5177,7 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
               '\n[硬门禁阻断] 该节点要求明确输出 VERDICT: PASS，但实际输出未确认通过，已判定失败以防虚报成功。\n',
               run: run,
               onLogChunk: onLogChunk,
+              immediate: true,
             );
           }
           final ok =
@@ -3852,19 +5202,25 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
             '→ ${node.httpMethod.trim().toUpperCase()} $urlStr\n',
             run: run,
             onLogChunk: onLogChunk,
+            immediate: true,
           );
           final client = HttpClient()
             ..connectionTimeout = Duration(
               seconds: node.timeoutSeconds.clamp(5, 60),
             );
+          run?.activeHttpClients.add(client);
           try {
+            if (isCancelled()) return false;
             final method = node.httpMethod.trim().toUpperCase();
             final req = await client.openUrl(method, uri);
             for (final line in const LineSplitter().convert(node.httpHeaders)) {
               final idx = line.indexOf(':');
               if (idx <= 0) continue;
               final k = line.substring(0, idx).trim();
-              final v = interpolate(line.substring(idx + 1).trim(), vars);
+              final v = interpolate(
+                line.substring(idx + 1).trim(),
+                vars,
+              ).replaceAll(RegExp(r'[\r\n]+'), ' ');
               if (k.isNotEmpty) req.headers.set(k, v);
             }
             final body = interpolate(node.content, vars).trim();
@@ -3872,32 +5228,45 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
               req.headers.contentType ??= ContentType.json;
               req.write(body);
             }
-            final resp = await req.close().timeout(
-              Duration(seconds: node.timeoutSeconds),
-            );
-            final respBody = await resp
-                .transform(const Utf8Decoder(allowMalformed: true))
-                .join();
+            final timeout = Duration(seconds: node.timeoutSeconds);
+            final resp = await req.close().timeout(timeout);
+            // Bounded response read (max 2 MB) with timeout to prevent OOM/hang.
+            final bytes = <int>[];
+            const maxRespBytes = 2 * 1024 * 1024;
+            await for (final chunk in resp.timeout(timeout)) {
+              if (isCancelled()) break;
+              if (bytes.length + chunk.length > maxRespBytes) {
+                bytes.addAll(chunk.take(maxRespBytes - bytes.length));
+                break;
+              }
+              bytes.addAll(chunk);
+            }
+            final respBody = utf8.decode(bytes, allowMalformed: true);
             node.output = _trimTail('HTTP ${resp.statusCode}\n$respBody');
             _appendRunLog('${node.output}\n', run: run, onLogChunk: onLogChunk);
-            final ok = resp.statusCode >= 200 && resp.statusCode < 300;
+            final ok =
+                !isCancelled() &&
+                resp.statusCode >= 200 &&
+                resp.statusCode < 300;
             node.exitCode = ok ? 0 : resp.statusCode;
             node.runStatus = ok
                 ? CanvasNodeRunStatus.succeeded
                 : CanvasNodeRunStatus.failed;
             return ok;
           } finally {
+            run?.activeHttpClients.remove(client);
             client.close(force: true);
           }
 
         case CanvasNodeKind.condition:
+          final resolvedExpr = interpolate(node.conditionExpr, vars);
           final ok = evaluateCondition(
-            node.conditionExpr,
+            resolvedExpr,
             prevOutput: prevOutput,
             prevExitCode: prevExitCode,
           );
           node.output =
-              '规则: ${node.conditionExpr}\n结果: ${ok ? "通过 (PASS)" : "未通过 (FAIL)"}';
+              '规则: $resolvedExpr\n结果: ${ok ? "通过 (PASS)" : "未通过 (FAIL)"}';
           _appendRunLog('${node.output}\n', run: run, onLogChunk: onLogChunk);
           node.exitCode = ok ? 0 : 1;
           node.runStatus = ok
@@ -3925,15 +5294,27 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
             '⏸ 流程已暂停，等待人工决策：「${node.title}」\n',
             run: run,
             onLogChunk: onLogChunk,
+            immediate: true,
           );
-          notifyListeners();
-          final decision = await completer.future;
+          _flushStreamNotify();
+          var timedOut = false;
+          final decision = await completer.future.timeout(
+            Duration(seconds: node.timeoutSeconds),
+            onTimeout: () {
+              timedOut = true;
+              return (approved: false, note: '审批超时（${node.timeoutSeconds}s）自动驳回');
+            },
+          );
           if (run != null) {
-            run.activeApprovalNodeId = null;
-            run.approvalCompleter = null;
+            if (run.activeApprovalNodeId == node.id) {
+              run.activeApprovalNodeId = null;
+              run.approvalCompleter = null;
+            }
           } else {
-            _singleStepApprovalNodeId = null;
-            _singleStepApprovalCompleter = null;
+            if (_singleStepApprovalNodeId == node.id) {
+              _singleStepApprovalNodeId = null;
+              _singleStepApprovalCompleter = null;
+            }
           }
           vars['approval.note'] = decision.note;
           node.exitCode = decision.approved ? 0 : 1;
@@ -3943,22 +5324,33 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
           final noteLine = decision.note.isEmpty
               ? ''
               : '\n人工补充意见：${decision.note}';
-          node.output =
-              '${decision.approved ? "✅ 人工已放行" : "❌ 人工已驳回"}$noteLine\n\n${node.output}';
+          final statusTag = decision.approved
+              ? '✅ 人工已放行'
+              : (timedOut ? '⏱ 审批已超时' : '❌ 人工已驳回');
+          node.output = '$statusTag$noteLine\n\n${node.output}';
           _appendRunLog(
-            '${decision.approved ? "✅ 人工已放行" : "❌ 人工已驳回"}${decision.note.isEmpty ? "" : "（意见：${decision.note}）"}\n',
+            '$statusTag${decision.note.isEmpty ? "" : "（意见：${decision.note}）"}\n',
             run: run,
             onLogChunk: onLogChunk,
+            immediate: true,
           );
           return decision.approved;
 
-        case CanvasNodeKind.note || CanvasNodeKind.chat || CanvasNodeKind.file:
+        case CanvasNodeKind.note ||
+            CanvasNodeKind.chat ||
+            CanvasNodeKind.file ||
+            CanvasNodeKind.group:
           node.runStatus = CanvasNodeRunStatus.idle;
           return true;
       }
     } on Object catch (e) {
       node.output = 'Error: $e';
-      _appendRunLog('[Error] $e\n', run: run, onLogChunk: onLogChunk);
+      _appendRunLog(
+        '[Error] $e\n',
+        run: run,
+        onLogChunk: onLogChunk,
+        immediate: true,
+      );
       node.exitCode = 1;
       node.runStatus = CanvasNodeRunStatus.failed;
       return false;
@@ -3966,7 +5358,7 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
       setActiveProcess(null);
       node.running = false;
       node.finishedAt = DateTime.now();
-      notifyListeners();
+      _flushStreamNotify();
     }
   }
 
@@ -3976,6 +5368,22 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
     String? defaultCwd,
   ) {
     final interpolated = interpolate(nodeRef, vars).trim();
+    if (interpolated.isNotEmpty && Directory(interpolated).existsSync()) {
+      return interpolated;
+    }
+    if (vars['input.repo'] case final r?
+        when r.isNotEmpty && Directory(r).existsSync()) {
+      return r;
+    }
+    if (vars['cwd'] case final c?
+        when c.isNotEmpty && Directory(c).existsSync()) {
+      return c;
+    }
+    if (defaultCwd != null &&
+        defaultCwd.isNotEmpty &&
+        Directory(defaultCwd).existsSync()) {
+      return defaultCwd;
+    }
     if (interpolated.isNotEmpty) return interpolated;
     if (vars['input.repo'] case final r? when r.isNotEmpty) return r;
     if (vars['cwd'] case final c? when c.isNotEmpty) return c;
