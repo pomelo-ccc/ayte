@@ -4,6 +4,8 @@ import 'dart:io';
 
 import 'package:path/path.dart' as p;
 
+import '../platform/data_dir.dart';
+
 /// Persistent local SenseVoiceSmall (ONNX via `sherpa-onnx`) recognizer.
 ///
 /// Supports both:
@@ -44,19 +46,28 @@ if hasattr(sys.stdin, "reconfigure"):
     sys.stdin.reconfigure(encoding="utf-8")
 
 model_dir = sys.argv[1]
+initial_lang = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else "auto"
 model_path = os.path.join(model_dir, "model.int8.onnx")
 if not os.path.exists(model_path):
     model_path = os.path.join(model_dir, "model.onnx")
 tokens_path = os.path.join(model_dir, "tokens.txt")
 
 threads = max(2, min(6, (os.cpu_count() or 4) // 2))
-recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-    model=model_path,
-    tokens=tokens_path,
-    num_threads=threads,
-    use_itn=True,
-    language="auto",
-)
+VALID_LANGS = {"auto", "zh", "en", "ja", "ko", "yue"}
+current_lang = initial_lang if initial_lang in VALID_LANGS else "auto"
+
+
+def build_recognizer(lang):
+    return sherpa_onnx.OfflineRecognizer.from_sense_voice(
+        model=model_path,
+        tokens=tokens_path,
+        num_threads=threads,
+        use_itn=True,
+        language=lang,
+    )
+
+
+recognizer = build_recognizer(current_lang)
 
 TAG_RE = re.compile(r"<\|[^|]+\|>")
 CJK_RE = re.compile(r"[\u4e00-\u9fff]")
@@ -179,6 +190,12 @@ for line in sys.stdin:
         partial = bool(req.get("partial", False))
         sid = req.get("session")
         sr = int(req.get("sr", 16000))
+        req_lang = req.get("lang") or "auto"
+        if req_lang not in VALID_LANGS:
+            req_lang = "auto"
+        if req_lang != current_lang:
+            recognizer = build_recognizer(req_lang)
+            current_lang = req_lang
 
         if not wav_path or not os.path.exists(wav_path):
             print(json.dumps({"text": "", "error": "录音文件不存在"}, ensure_ascii=False), flush=True)
@@ -218,9 +235,27 @@ for line in sys.stdin:
         print(json.dumps({"text": "", "error": str(exc)}, ensure_ascii=False), flush=True)
 ''';
 
+  /// Maps a BCP-47 language tag (e.g. `zh-CN`, `en-US`, `ja-JP`, `auto`) to
+  /// SenseVoice's language code (`zh`, `en`, `ja`, `ko`, `yue`, `auto`).
+  static String mapSenseVoiceLanguage(String? bcp47) {
+    final norm = (bcp47 ?? '').trim().toLowerCase();
+    if (norm.isEmpty || norm == 'auto') return 'auto';
+    if (norm == 'yue' || norm == 'zh-hk') return 'yue';
+    if (norm.startsWith('zh')) return 'zh';
+    if (norm.startsWith('en')) return 'en';
+    if (norm.startsWith('ja')) return 'ja';
+    if (norm.startsWith('ko')) return 'ko';
+    return 'auto';
+  }
+
   /// Locates the isolated Python runtime (`voice-runtime`) shared by
   /// SenseVoice STT and Edge Neural TTS.
   static String? locatePythonExe() {
+    final managed = Platform.isWindows
+        ? p.join(DataDirectory.current.path, 'voice', 'runtime', 'Scripts', 'python.exe')
+        : p.join(DataDirectory.current.path, 'voice', 'runtime', 'bin', 'python');
+    if (File(managed).existsSync()) return managed;
+
     final exeDir = p.dirname(Platform.resolvedExecutable);
     final candidates = <String>{
       exeDir,
@@ -237,19 +272,27 @@ for line in sys.stdin:
   }
 
   /// Locates the local SenseVoice model directory and Python `sherpa-onnx`
-  /// runtime relative to the executable or `D:\Ayte`.
+  /// runtime inside Ayte's managed data directory, relative to the executable,
+  /// or `D:\Ayte`.
   static ({String pythonExe, String modelDir})? locateInstallation() {
     final pythonExe = locatePythonExe();
     if (pythonExe == null) return null;
+
+    final managedModelDir = p.join(
+      DataDirectory.current.path,
+      'voice',
+      'models',
+      'sense-voice',
+    );
     final exeDir = p.dirname(Platform.resolvedExecutable);
-    final candidates = <String>{
-      exeDir,
-      if (Platform.isWindows) r'D:\Ayte',
-      p.dirname(exeDir),
+    final modelDirs = <String>{
+      managedModelDir,
+      p.join(exeDir, 'voice-models', 'sense-voice'),
+      if (Platform.isWindows) p.join(r'D:\Ayte', 'voice-models', 'sense-voice'),
+      p.join(p.dirname(exeDir), 'voice-models', 'sense-voice'),
     };
 
-    for (final base in candidates) {
-      final dir = p.join(base, 'voice-models', 'sense-voice');
+    for (final dir in modelDirs) {
       final hasModel =
           File(p.join(dir, 'model.int8.onnx')).existsSync() ||
           File(p.join(dir, 'model.onnx')).existsSync();
@@ -277,7 +320,7 @@ for line in sys.stdin:
 
   /// Pre-warms the worker in the background (e.g. shortly after app launch or
   /// as soon as recording starts) so live streaming & stopping take ~0.1s.
-  void warmUp() {
+  void warmUp({String language = 'auto'}) {
     if (Platform.environment['FLUTTER_TEST'] == 'true') return;
     if (_worker != null || _starting != null) {
       _touchIdleTimer();
@@ -285,7 +328,9 @@ for line in sys.stdin:
     }
     if (!isInstalled) return;
     _touchIdleTimer();
-    unawaited(_ensureStarted().catchError((Object _) {}));
+    unawaited(
+      _ensureStarted(initialLanguage: language).catchError((Object _) {}),
+    );
   }
 
   /// Runs a fast non-blocking live decode on an actively growing WAV file.
@@ -293,6 +338,7 @@ for line in sys.stdin:
   Future<String?> transcribeLive(
     String wavPath, {
     required int sessionId,
+    String language = 'auto',
   }) async {
     if (!isReady || _pending != null) return null;
     final proc = _worker;
@@ -308,6 +354,7 @@ for line in sys.stdin:
           'partial': true,
           'session': sessionId,
           'sr': 16000,
+          'lang': mapSenseVoiceLanguage(language),
         }),
       );
       await proc.stdin.flush();
@@ -322,8 +369,12 @@ for line in sys.stdin:
   }
 
   /// Transcribes [wavFile] using the local SenseVoice ONNX recognizer.
-  Future<String> transcribe(File wavFile, {int? sessionId}) async {
-    await _ensureStarted();
+  Future<String> transcribe(
+    File wavFile, {
+    int? sessionId,
+    String language = 'auto',
+  }) async {
+    await _ensureStarted(initialLanguage: language);
     _touchIdleTimer();
     // Wait briefly if a live partial decode is currently finishing.
     final inflight = _pending;
@@ -347,6 +398,7 @@ for line in sys.stdin:
         'partial': false,
         'session': ?sessionId,
         'sr': 16000,
+        'lang': mapSenseVoiceLanguage(language),
       }),
     );
     await proc.stdin.flush();
@@ -365,12 +417,12 @@ for line in sys.stdin:
     return (resp['text'] as String? ?? '').trim();
   }
 
-  Future<void> _ensureStarted() {
+  Future<void> _ensureStarted({String initialLanguage = 'auto'}) {
     if (_worker != null && _ready != null && _ready!.isCompleted) {
       return Future.value();
     }
     if (_starting != null) return _starting!;
-    final future = _startInternal();
+    final future = _startInternal(initialLanguage: initialLanguage);
     _starting = future;
     future.whenComplete(() {
       if (identical(_starting, future)) _starting = null;
@@ -378,11 +430,11 @@ for line in sys.stdin:
     return future;
   }
 
-  Future<void> _startInternal() async {
+  Future<void> _startInternal({String initialLanguage = 'auto'}) async {
     final install = locateInstallation();
     if (install == null) {
       throw StateError(
-        '未找到本地 SenseVoice 模型或运行环境（需 D:\\Ayte\\voice-models\\sense-voice 与 voice-runtime），请在「设置 → 语音」切换引擎。',
+        '尚未安装本地 SenseVoice 语音组件，请在「设置 → 语音」点击一键在线下载安装，或切换为自定义 API。',
       );
     }
 
@@ -398,7 +450,12 @@ for line in sys.stdin:
 
     final proc = await Process.start(
       install.pythonExe,
-      ['-u', workerFile.path, install.modelDir],
+      [
+        '-u',
+        workerFile.path,
+        install.modelDir,
+        mapSenseVoiceLanguage(initialLanguage),
+      ],
       environment: const {'PYTHONIOENCODING': 'utf-8'},
     );
     _worker = proc;

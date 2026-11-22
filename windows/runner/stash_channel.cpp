@@ -100,6 +100,7 @@ StashChannel::~StashChannel() {
   Unregister();
   UnregisterVoice();
   CancelVoiceRecording();
+  StopVoiceAudio();
 }
 
 std::optional<std::pair<UINT, UINT>> StashChannel::Parse(
@@ -216,9 +217,64 @@ std::string WaveErrorString(MMRESULT err) {
   return "waveIn error " + std::to_string(err);
 }
 
+std::string MciPlayErrorString(MCIERROR err) {
+  wchar_t buf[256] = {};
+  if (::mciGetErrorStringW(err, buf, 256)) {
+    return Utf8FromUtf16(buf);
+  }
+  return "MCI error " + std::to_string(err);
+}
+
+// Synthesizes a soft, pleasant in-memory 16kHz mono PCM WAV chime (zero files,
+// <0.1ms playback via PlaySoundW SND_MEMORY | SND_ASYNC).
+std::vector<uint8_t> BuildEarconWav(const std::string& kind) {
+  constexpr double kPi = 3.14159265358979323846;
+  struct Tone {
+    double freq;
+    double ms;
+    double amp;
+  };
+  std::vector<Tone> tones;
+  if (kind == "start") {
+    tones = {{660.0, 55.0, 0.14}, {880.0, 75.0, 0.16}};
+  } else if (kind == "stop") {
+    tones = {{780.0, 48.0, 0.13}, {580.0, 62.0, 0.13}};
+  } else {
+    // exit conversation mode: gentle descending triad
+    tones = {{740.0, 55.0, 0.13}, {587.0, 55.0, 0.13}, {440.0, 90.0, 0.14}};
+  }
+  std::vector<int16_t> samples;
+  for (const auto& t : tones) {
+    const size_t count =
+        static_cast<size_t>((t.ms / 1000.0) * static_cast<double>(kVoiceSampleRate));
+    const size_t fade = (std::min)(count / 4, static_cast<size_t>(160));
+    for (size_t i = 0; i < count; ++i) {
+      double env = 1.0;
+      if (i < fade) {
+        env = static_cast<double>(i) / static_cast<double>(fade);
+      } else if (i + fade > count) {
+        env = static_cast<double>(count - i) / static_cast<double>(fade);
+      }
+      const double phase =
+          2.0 * kPi * t.freq * static_cast<double>(i) /
+          static_cast<double>(kVoiceSampleRate);
+      const double val = std::sin(phase) * t.amp * env;
+      samples.push_back(static_cast<int16_t>(val * 32767.0));
+    }
+  }
+  const uint32_t data_bytes = static_cast<uint32_t>(samples.size() * 2);
+  std::vector<uint8_t> wav(44 + data_bytes);
+  BuildWavHeader(wav.data(), data_bytes);
+  if (data_bytes > 0) {
+    std::memcpy(wav.data() + 44, samples.data(), data_bytes);
+  }
+  return wav;
+}
+
 }  // namespace
 
-std::string StashChannel::StartVoiceRecording(const std::string& utf8_path) {
+std::string StashChannel::StartVoiceRecording(const std::string& utf8_path,
+                                              int device_id) {
   CancelVoiceRecording();
   if (utf8_path.empty()) {
     return "Empty output path";
@@ -257,10 +313,16 @@ std::string StashChannel::StartVoiceRecording(const std::string& utf8_path) {
   fmt.nBlockAlign = fmt.nChannels * (fmt.wBitsPerSample / 8);
   fmt.nAvgBytesPerSec = fmt.nSamplesPerSec * fmt.nBlockAlign;
 
+  const UINT dev = device_id < 0 ? WAVE_MAPPER : static_cast<UINT>(device_id);
   HWAVEIN hwi = nullptr;
-  MMRESULT res = ::waveInOpen(&hwi, WAVE_MAPPER, &fmt,
+  MMRESULT res = ::waveInOpen(&hwi, dev, &fmt,
                               reinterpret_cast<DWORD_PTR>(ev), 0,
                               CALLBACK_EVENT);
+  if (res != MMSYSERR_NOERROR && dev != WAVE_MAPPER) {
+    // Selected device unplugged: gracefully fall back to WAVE_MAPPER.
+    res = ::waveInOpen(&hwi, WAVE_MAPPER, &fmt,
+                       reinterpret_cast<DWORD_PTR>(ev), 0, CALLBACK_EVENT);
+  }
   if (res != MMSYSERR_NOERROR) {
     ::CloseHandle(ev);
     ::CloseHandle(file);
@@ -275,6 +337,7 @@ std::string StashChannel::StartVoiceRecording(const std::string& utf8_path) {
   wave_data_bytes_.store(0);
   wave_level_milli_.store(0);
   wave_silence_ms_.store(0);
+  wave_total_ms_.store(0);
   wave_heard_speech_.store(false);
 
   wave_thread_ = std::thread([this, hwi, ev, file]() {
@@ -290,6 +353,11 @@ std::string StashChannel::StartVoiceRecording(const std::string& utf8_path) {
     }
     ::waveInStart(hwi);
 
+    // Adaptive ambient noise floor: calibrate over the first ~250ms, then track
+    // slowly during silence so AC/fan hum doesn't keep VAD stuck forever.
+    double noise_floor_rms = 0.006;
+    uint32_t calibrated_ms = 0;
+
     auto drain = [&](bool requeue) {
       bool flushed = false;
       for (int i = 0; i < kVoiceBufferCount; ++i) {
@@ -301,7 +369,6 @@ std::string StashChannel::StartVoiceRecording(const std::string& utf8_path) {
             wave_data_bytes_.fetch_add(static_cast<uint32_t>(bytes_written));
             flushed = true;
 
-            // Compute RMS audio level (0..1) and track speech/silence for VAD.
             const size_t sample_count = headers[i].dwBytesRecorded / 2;
             if (sample_count > 0) {
               const auto* pcm =
@@ -313,16 +380,31 @@ std::string StashChannel::StartVoiceRecording(const std::string& utf8_path) {
               }
               const double rms =
                   std::sqrt(sum_sq / static_cast<double>(sample_count));
-              const double scaled = (std::min)(1.0, rms * 5.5);
-              wave_level_milli_.store(static_cast<int>(scaled * 1000.0));
-
               const uint32_t chunk_ms = static_cast<uint32_t>(
                   (sample_count * 1000) / kVoiceSampleRate);
-              if (rms >= 0.014) {
+              wave_total_ms_.fetch_add(chunk_ms);
+
+              if (calibrated_ms < 260) {
+                noise_floor_rms =
+                    calibrated_ms == 0 ? rms : (noise_floor_rms * 0.5 + rms * 0.5);
+                calibrated_ms += chunk_ms;
+              }
+              const double speech_threshold =
+                  (std::max)(0.011, (std::min)(0.085, noise_floor_rms * 2.4));
+              const double visual_rms =
+                  (std::max)(0.0, rms - noise_floor_rms * 0.7);
+              const double scaled = (std::min)(1.0, visual_rms * 6.0);
+              wave_level_milli_.store(static_cast<int>(scaled * 1000.0));
+
+              if (rms >= speech_threshold) {
                 wave_heard_speech_.store(true);
                 wave_silence_ms_.store(0);
-              } else if (wave_heard_speech_.load()) {
-                wave_silence_ms_.fetch_add(chunk_ms);
+              } else {
+                // Slowly adapt noise floor downward/upward during quiet frames.
+                noise_floor_rms = noise_floor_rms * 0.92 + rms * 0.08;
+                if (wave_heard_speech_.load()) {
+                  wave_silence_ms_.fetch_add(chunk_ms);
+                }
               }
             }
           }
@@ -416,6 +498,85 @@ void StashChannel::CancelVoiceRecording() {
     wave_file_ = INVALID_HANDLE_VALUE;
   }
   voice_recording_path_.clear();
+}
+
+std::string StashChannel::PlayVoiceAudio(const std::string& utf8_path,
+                                         int play_id) {
+  StopVoiceAudio();
+  if (utf8_path.empty()) {
+    return "Empty audio path";
+  }
+  const std::wstring path = Utf16FromUtf8(utf8_path);
+  const std::wstring open_cmd =
+      L"open \"" + path + L"\" type mpegvideo alias ayte_tts_play";
+  MCIERROR err = ::mciSendStringW(open_cmd.c_str(), nullptr, 0, nullptr);
+  if (err != 0) {
+    return MciPlayErrorString(err);
+  }
+  voice_play_device_id_ = ::mciGetDeviceIDW(L"ayte_tts_play");
+  voice_play_id_ = play_id;
+  voice_playing_ = true;
+  voice_paused_ = false;
+  err = ::mciSendStringW(L"play ayte_tts_play notify", nullptr, 0, window_);
+  if (err != 0) {
+    StopVoiceAudio();
+    return MciPlayErrorString(err);
+  }
+  return "";
+}
+
+bool StashChannel::PauseVoiceAudio() {
+  if (!voice_playing_ || voice_paused_) return false;
+  voice_paused_ = true;
+  if (::mciSendStringW(L"pause ayte_tts_play", nullptr, 0, nullptr) != 0) {
+    voice_paused_ = false;
+    return false;
+  }
+  return true;
+}
+
+bool StashChannel::ResumeVoiceAudio() {
+  if (!voice_playing_ || !voice_paused_) return false;
+  voice_paused_ = false;
+  if (::mciSendStringW(L"play ayte_tts_play notify", nullptr, 0, window_) !=
+      0) {
+    voice_paused_ = true;
+    return false;
+  }
+  return true;
+}
+
+void StashChannel::StopVoiceAudio() {
+  if (!voice_playing_ && voice_play_device_id_ == 0) {
+    return;
+  }
+  voice_playing_ = false;
+  voice_paused_ = false;
+  voice_play_device_id_ = 0;
+  ::mciSendStringW(L"stop ayte_tts_play", nullptr, 0, nullptr);
+  ::mciSendStringW(L"close ayte_tts_play", nullptr, 0, nullptr);
+}
+
+bool StashChannel::HandleMciNotify(WPARAM flags, LPARAM device) {
+  if (!voice_playing_ || voice_play_device_id_ == 0 ||
+      static_cast<UINT>(device) != voice_play_device_id_) {
+    return false;
+  }
+  if (flags == MCI_NOTIFY_ABORTED && voice_paused_) {
+    // Pausing aborts the active play notification; keep device open for resume.
+    return true;
+  }
+  if (flags == MCI_NOTIFY_SUPERSEDED) {
+    return true;
+  }
+  const int finished_id = voice_play_id_;
+  StopVoiceAudio();
+  if (flags == MCI_NOTIFY_SUCCESSFUL || flags == MCI_NOTIFY_FAILURE) {
+    voice_channel_->InvokeMethod(
+        "playbackDone",
+        std::make_unique<flutter::EncodableValue>(finished_id));
+  }
+  return true;
 }
 
 void StashChannel::Post(HWND window, std::function<void()> task) {
@@ -519,12 +680,100 @@ void StashChannel::HandleVoiceMethodCall(
     return;
   }
   if (method == "startRecording") {
-    const std::string err = StartVoiceRecording(text == nullptr ? "" : *text);
+    std::string path;
+    int device_id = -1;
+    if (text != nullptr) {
+      path = *text;
+    } else if (call.arguments() != nullptr) {
+      if (const auto* map =
+              std::get_if<flutter::EncodableMap>(call.arguments())) {
+        const auto p_it = map->find(flutter::EncodableValue("path"));
+        if (p_it != map->end()) {
+          if (const auto* s = std::get_if<std::string>(&p_it->second)) {
+            path = *s;
+          }
+        }
+        const auto d_it = map->find(flutter::EncodableValue("deviceId"));
+        if (d_it != map->end()) {
+          if (const auto* i = std::get_if<int32_t>(&d_it->second)) {
+            device_id = *i;
+          }
+        }
+      }
+    }
+    const std::string err = StartVoiceRecording(path, device_id);
     if (err.empty()) {
       result->Success(flutter::EncodableValue(true));
     } else {
       result->Error("MCI_RECORD_START", err);
     }
+    return;
+  }
+  if (method == "listInputDevices") {
+    flutter::EncodableList list;
+    const UINT count = ::waveInGetNumDevs();
+    for (UINT i = 0; i < count; ++i) {
+      WAVEINCAPSW caps = {};
+      if (::waveInGetDevCapsW(i, &caps, sizeof(caps)) == MMSYSERR_NOERROR) {
+        list.push_back(flutter::EncodableValue(flutter::EncodableMap{
+            {flutter::EncodableValue("id"),
+             flutter::EncodableValue(static_cast<int32_t>(i))},
+            {flutter::EncodableValue("name"),
+             flutter::EncodableValue(Utf8FromUtf16(caps.szPname))},
+        }));
+      }
+    }
+    result->Success(flutter::EncodableValue(list));
+    return;
+  }
+  if (method == "playAudio") {
+    std::string path;
+    int play_id = 0;
+    if (call.arguments() != nullptr) {
+      if (const auto* map =
+              std::get_if<flutter::EncodableMap>(call.arguments())) {
+        const auto p_it = map->find(flutter::EncodableValue("path"));
+        if (p_it != map->end()) {
+          if (const auto* s = std::get_if<std::string>(&p_it->second)) {
+            path = *s;
+          }
+        }
+        const auto id_it = map->find(flutter::EncodableValue("id"));
+        if (id_it != map->end()) {
+          if (const auto* i = std::get_if<int32_t>(&id_it->second)) {
+            play_id = *i;
+          }
+        }
+      }
+    }
+    const std::string err = PlayVoiceAudio(path, play_id);
+    if (err.empty()) {
+      result->Success(flutter::EncodableValue(true));
+    } else {
+      result->Error("MCI_PLAY", err);
+    }
+    return;
+  }
+  if (method == "pauseAudio") {
+    result->Success(flutter::EncodableValue(PauseVoiceAudio()));
+    return;
+  }
+  if (method == "resumeAudio") {
+    result->Success(flutter::EncodableValue(ResumeVoiceAudio()));
+    return;
+  }
+  if (method == "stopAudio") {
+    StopVoiceAudio();
+    result->Success(flutter::EncodableValue(true));
+    return;
+  }
+  if (method == "playEarcon") {
+    earcon_wav_ = BuildEarconWav(text == nullptr ? "start" : *text);
+    if (!earcon_wav_.empty()) {
+      ::PlaySoundW(reinterpret_cast<LPCWSTR>(earcon_wav_.data()), nullptr,
+                   SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+    }
+    result->Success(flutter::EncodableValue(true));
     return;
   }
   if (method == "stopRecording") {
@@ -550,6 +799,8 @@ void StashChannel::HandleVoiceMethodCall(
             {flutter::EncodableValue("silenceMs"),
              flutter::EncodableValue(
                  static_cast<int>(wave_silence_ms_.load()))},
+            {flutter::EncodableValue("totalMs"),
+             flutter::EncodableValue(static_cast<int>(wave_total_ms_.load()))},
             {flutter::EncodableValue("heardSpeech"),
              flutter::EncodableValue(wave_heard_speech_.load())},
         }));

@@ -210,19 +210,45 @@ class AttentionService {
 
   void _notify(AgentThread thread, AttentionEvent event, {bool sound = true}) {
     final voiceConfig = VoiceSettingsStore.instance.config;
+    final isActiveThread =
+        identical(workspace.current, thread) || _inView(thread);
     var autoReadSpoken = false;
-    if (event == AttentionEvent.finished &&
-        sound &&
-        voiceConfig.enabled &&
-        voiceConfig.effectiveAutoRead &&
-        !_lastTurnHadError(thread)) {
-      final reply = _lastReply(thread);
-      if (reply != null && reply.trim().isNotEmpty) {
+    if (sound && voiceConfig.enabled && isActiveThread) {
+      if (event == AttentionEvent.finished &&
+          voiceConfig.effectiveAutoRead &&
+          !_lastTurnHadError(thread)) {
+        // Read the full last turn reply (not _lastReply/oneLineExcerpt which
+        // truncates at 140 chars and strips fenced-code backticks).
+        final fullReply =
+            thread.session.lastTurnReply ?? thread.session.lastReply;
+        if (fullReply != null && fullReply.trim().isNotEmpty) {
+          autoReadSpoken = true;
+          unawaited(
+            VoiceTtsService.instance.speak(
+              fullReply,
+              isZh: VoiceTextCleaner.containsCjk(fullReply),
+              autoRead: true,
+            ),
+          );
+        }
+      } else if (event == AttentionEvent.needsInput &&
+          voiceConfig.conversationMode) {
+        final l10n = this.l10n();
+        final session = thread.session;
+        final String prompt;
+        if (session.pendingInteraction == null && session.canStartPlan) {
+          prompt = l10n.attentionPlanReady;
+        } else {
+          final detail = _request(session.pendingInteraction, l10n);
+          prompt = detail == null
+              ? l10n.attentionNeedsInput
+              : '${l10n.attentionNeedsInput}：$detail';
+        }
         autoReadSpoken = true;
         unawaited(
           VoiceTtsService.instance.speak(
-            reply,
-            isZh: VoiceTextCleaner.containsCjk(reply),
+            prompt,
+            isZh: VoiceTextCleaner.containsCjk(prompt),
             autoRead: true,
           ),
         );

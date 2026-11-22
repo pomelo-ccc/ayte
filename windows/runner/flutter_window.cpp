@@ -177,6 +177,11 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     return 0;
   }
 
+  if (message == MM_MCINOTIFY && stash_ != nullptr &&
+      stash_->HandleMciNotify(wparam, lparam)) {
+    return 0;
+  }
+
   if (message == AppWindows::kCloseMessage) {
     if (app_windows_ != nullptr) {
       app_windows_->ClosePendingWindows();

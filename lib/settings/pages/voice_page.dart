@@ -13,9 +13,11 @@ import '../../platform/app_platform.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/codicons.dart';
 import '../../voice/voice_hotkey.dart';
+import '../../voice/voice_model_installer.dart';
 import '../../voice/voice_settings.dart';
 import '../../voice/voice_stt_service.dart';
 import '../../voice/voice_tts_service.dart';
+import '../../voice/wav_recorder.dart';
 import '../user_settings.dart';
 import 'settings_dropdown.dart';
 import 'settings_widgets.dart';
@@ -38,6 +40,7 @@ class _VoiceSettingsPageState extends State<VoiceSettingsPage> {
   final _ttsKeyController = TextEditingController();
 
   List<SystemVoiceInfo> _systemVoices = const [];
+  List<VoiceInputDevice> _inputDevices = const [];
   bool _hasSttKey = false;
   bool _hasTtsKey = false;
   String? _sttTestResult;
@@ -46,6 +49,7 @@ class _VoiceSettingsPageState extends State<VoiceSettingsPage> {
   VoiceSettingsStore get _store => VoiceSettingsStore.instance;
   VoiceSttService get _stt => VoiceSttService.instance;
   VoiceTtsService get _tts => VoiceTtsService.instance;
+  VoiceModelInstaller get _installer => VoiceModelInstaller.instance;
 
   @override
   void initState() {
@@ -56,14 +60,16 @@ class _VoiceSettingsPageState extends State<VoiceSettingsPage> {
   Future<void> _loadAsync() async {
     final results = await Future.wait([
       _tts.listSystemVoices(),
+      WavRecorder.listInputDevices(),
       _store.readSttApiKey(),
       _store.readTtsApiKey(),
     ]);
     if (!mounted) return;
     setState(() {
       _systemVoices = results[0] as List<SystemVoiceInfo>;
-      _hasSttKey = (results[1] as String?)?.isNotEmpty == true;
-      _hasTtsKey = (results[2] as String?)?.isNotEmpty == true;
+      _inputDevices = results[1] as List<VoiceInputDevice>;
+      _hasSttKey = (results[2] as String?)?.isNotEmpty == true;
+      _hasTtsKey = (results[3] as String?)?.isNotEmpty == true;
     });
   }
 
@@ -189,6 +195,7 @@ class _VoiceSettingsPageState extends State<VoiceSettingsPage> {
         _store,
         _stt,
         _tts,
+        _installer,
         VoiceHotkeyService.instance,
       ]),
       builder: (context, _) {
@@ -225,6 +232,13 @@ class _VoiceSettingsPageState extends State<VoiceSettingsPage> {
           orElse: () => VoiceConfig.supportedLanguages.first,
         );
         final langLabel = isZh ? langEntry.zh : langEntry.en;
+        final selectedDevice = _inputDevices
+            .where((d) => d.id == cfg.sttInputDeviceId)
+            .firstOrNull;
+        final inputDeviceLabel = cfg.sttInputDeviceId < 0 ||
+                selectedDevice == null
+            ? (isZh ? '系统默认麦克风' : 'System Default Microphone')
+            : selectedDevice.name;
         final voiceLabel = cfg.ttsVoice.isEmpty
             ? (isZh ? '自动（按语言匹配系统音色）' : 'Auto (match language)')
             : cfg.ttsVoice;
@@ -232,12 +246,15 @@ class _VoiceSettingsPageState extends State<VoiceSettingsPage> {
         final rateLabel = '${VoiceConfig.rateSteps[rateIndex]}x';
         final testingStt = _stt.isListening && identical(_stt.activeOwner, this);
         final previewingTts = _tts.isSpeakingId('__voice_settings_preview__');
+        final localInstalled = _installer.isInstalled;
+        final localInstalling = _installer.isInstalling;
+        final installLocation = _installer.installedLocation;
 
         return SettingsPage(
           title: isZh ? '语音' : 'Voice',
           description: isZh
-              ? '在对话输入框中说话转文字，并朗读 AI 回复或播报任务完成提醒。默认使用系统免费语音，也支持自定义 OpenAI 兼容 API。'
-              : 'Dictate prompts with your microphone and listen to AI replies. Uses free system speech by default, with optional OpenAI-compatible APIs.',
+              ? '在对话输入框中说话转文字，并朗读 AI 回复或播报任务完成提醒。默认使用本地免费高精度 AI 识别与 Edge 真人音色，也支持自定义 OpenAI 兼容 API。'
+              : 'Dictate prompts with your microphone and listen to AI replies. Uses local SenseVoice AI & Edge Neural voices by default, with optional OpenAI-compatible APIs.',
           children: [
             SettingsCard(
               children: [
@@ -252,13 +269,108 @@ class _VoiceSettingsPageState extends State<VoiceSettingsPage> {
                 SettingsSwitchRow(
                   label: isZh ? '连续语音对话模式' : 'Hands-Free Voice Conversation Mode',
                   description: isZh
-                      ? '一键联动：说话停顿自动结束 → AI 纠错并自动发送 → 回复完成自动用真人音色朗读'
-                      : 'Combines auto-stop on silence pause, AI correction + auto-send, and auto-read AI replies',
+                      ? '一键联动：说话停顿自动结束 → AI 纠错并自动发送 → 回复完成自动用真人音色朗读 → 读完自动重新开麦'
+                      : 'Combines auto-stop on silence pause, AI correction + auto-send, auto-read replies & follow-up mic',
                   value: cfg.conversationMode,
                   enabled: cfg.enabled,
                   onChanged: (v) =>
                       unawaited(_update(cfg.copyWith(conversationMode: v))),
                 ),
+                SettingsSwitchRow(
+                  label: isZh ? '语音操作提示音' : 'Voice Earcon Chimes',
+                  description: isZh
+                      ? '开麦、自动收麦和退出连续对话时播放极轻的提示音，免手对话时无需紧盯屏幕'
+                      : 'Play subtle audio chimes when starting/stopping recording or exiting conversation mode',
+                  value: cfg.earcons,
+                  enabled: cfg.enabled,
+                  onChanged: (v) =>
+                      unawaited(_update(cfg.copyWith(earcons: v))),
+                ),
+              ],
+            ),
+            SettingsGroup(
+              title: isZh
+                  ? '本地语音组件（SenseVoice 识别 + Edge 真人音色）'
+                  : 'Local Voice Runtime (SenseVoice + Edge Neural TTS)',
+              children: [
+                SettingsRow(
+                  label: localInstalled && !localInstalling
+                      ? (isZh ? '已安装就绪' : 'Installed & Ready')
+                      : localInstalling
+                      ? _installer.statusMessage
+                      : (isZh ? '尚未安装本地语音包' : 'Local Voice Pack Not Installed'),
+                  description: localInstalled && !localInstalling
+                      ? (isZh
+                            ? '离线高精度中英识别与微软 Edge 神经网络播报均已就绪${installLocation != null ? '（$installLocation）' : ''}'
+                            : 'Offline SenseVoice STT and Edge Neural TTS are ready${installLocation != null ? ' ($installLocation)' : ''}')
+                      : localInstalling
+                      ? (_installer.stage == VoiceInstallStage.downloadingModel
+                            ? '${VoiceModelInstaller.formatMb(_installer.downloadedBytes)} / ${VoiceModelInstaller.formatMb(_installer.totalBytes)}'
+                                '${_installer.speedBytesPerSec > 0 ? ' · ${(_installer.speedBytesPerSec / (1024 * 1024)).toStringAsFixed(1)} MB/s' : ''}'
+                            : (isZh
+                                  ? '首次安装约需 1–2 分钟，支持断点续传与国内镜像加速…'
+                                  : 'First-time setup takes ~1–2 minutes with automatic mirror fallback…'))
+                      : _installer.stage == VoiceInstallStage.error &&
+                            _installer.error != null
+                      ? (isZh
+                            ? '下载失败：${_installer.error}（已保留断点，点击重试可继续下载）'
+                            : 'Download failed: ${_installer.error} (resumable)')
+                      : (isZh
+                            ? '一键在线下载独立 Python 运行时（sherpa-onnx + edge-tts）与 SenseVoiceSmall 离线模型（约 245 MB），支持国内镜像加速与断点续传'
+                            : 'One-click online install of isolated Python runtime (sherpa-onnx + edge-tts) & SenseVoiceSmall model (~245 MB) with resume'),
+                  trailing: localInstalling
+                      ? IdeButton(
+                          label: isZh ? '取消下载' : 'Cancel',
+                          icon: Codicons.close,
+                          secondary: true,
+                          onPressed: _installer.cancel,
+                        )
+                      : localInstalled
+                      ? Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Codicons.check,
+                              size: 14,
+                              color: AppColors.accent,
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              isZh ? '已就绪' : 'Ready',
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                                color: AppColors.accent,
+                              ),
+                            ),
+                          ],
+                        )
+                      : IdeButton(
+                          label: _installer.stage == VoiceInstallStage.error
+                              ? (isZh ? '重试在线下载' : 'Retry Download')
+                              : (isZh ? '一键在线下载安装' : 'Download & Install'),
+                          icon: Codicons.cloudDownload,
+                          onPressed: () =>
+                              unawaited(_installer.install(isZh: isZh)),
+                        ),
+                ),
+                if (localInstalling)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(4),
+                      child: LinearProgressIndicator(
+                        value: _installer.progress > 0.02
+                            ? _installer.progress
+                            : null,
+                        minHeight: 5,
+                        backgroundColor: AppColors.border,
+                        valueColor: AlwaysStoppedAnimation<Color>(
+                          AppColors.accent,
+                        ),
+                      ),
+                    ),
+                  ),
               ],
             ),
             SettingsGroup(
@@ -310,8 +422,39 @@ class _VoiceSettingsPageState extends State<VoiceSettingsPage> {
                     ],
                   ),
                 ),
+                if (AppPlatform.isWindows)
+                  SettingsRow(
+                    label: isZh ? '麦克风输入设备' : 'Microphone Input Device',
+                    description: isZh
+                        ? '接有耳机麦、外置 USB 麦克风或虚拟声卡时可在此指定输入源'
+                        : 'Select a specific microphone or keep the Windows default',
+                    trailing: SettingsDropdown(
+                      current: inputDeviceLabel,
+                      semanticLabel: inputDeviceLabel,
+                      entries: () => [
+                        IdeMenuAction(
+                          isZh ? '系统默认麦克风' : 'System Default Microphone',
+                          checked: cfg.sttInputDeviceId < 0,
+                          onSelected: () => unawaited(
+                            _update(cfg.copyWith(sttInputDeviceId: -1)),
+                          ),
+                        ),
+                        for (final dev in _inputDevices)
+                          IdeMenuAction(
+                            dev.name,
+                            checked: cfg.sttInputDeviceId == dev.id,
+                            onSelected: () => unawaited(
+                              _update(cfg.copyWith(sttInputDeviceId: dev.id)),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
                 SettingsRow(
                   label: isZh ? '识别语言' : 'Language',
+                  description: isZh
+                      ? '日常纯中文/中英混输建议选「中文」或「自动」；指定语言可避免短句被误判为粤语或日语'
+                      : 'Pin a language (e.g. Chinese) to prevent short utterances from being misclassified',
                   trailing: SettingsDropdown(
                     current: langLabel,
                     semanticLabel: langLabel,

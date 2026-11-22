@@ -684,11 +684,11 @@ void followSettingsFiles(SettingsFiles files) {
   VoiceHotkeyService.instance.follow(VoiceSettingsStore.instance);
   // Pre-warm local SenseVoice model shortly after startup so the very first
   // voice prompt starts streaming immediately with zero cold-start delay.
-  if (AppPlatform.isWindows) {
+  if (!kIsWeb) {
     Timer(const Duration(seconds: 2), () {
       final cfg = VoiceSettingsStore.instance.config;
       if (cfg.enabled && cfg.sttEngine == VoiceSttEngine.localAi) {
-        LocalSenseVoice.instance.warmUp();
+        LocalSenseVoice.instance.warmUp(language: cfg.sttLanguage);
       }
     });
   }

@@ -2,18 +2,38 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 
-/// Records 16kHz 16-bit mono PCM WAV audio from the system default microphone.
+/// Describes a microphone input device reported by the OS (`waveInGetDevCapsW`).
+@immutable
+class VoiceInputDevice {
+  const VoiceInputDevice({required this.id, required this.name});
+
+  final int id;
+  final String name;
+
+  @override
+  bool operator ==(Object other) =>
+      other is VoiceInputDevice && other.id == id && other.name == name;
+
+  @override
+  int get hashCode => Object.hash(id, name);
+}
+
+/// Records 16kHz 16-bit mono PCM WAV audio from the selected microphone.
 ///
-/// On Windows, uses Ayte's native C++ `winmm.dll` MCI method channel
-/// (`baocode/voice` — <2ms start/stop, zero subprocess startup lag) with a
-/// PowerShell fallback when the native channel is unavailable. On macOS/Linux,
-/// falls back to `ffmpeg`, `rec` (SoX), or `arecord`.
+/// On Windows, uses Ayte's native C++ `winmm.dll` `waveIn` method channel
+/// (`baocode/voice` — <2ms start/stop, zero subprocess startup lag, adaptive
+/// ambient noise floor VAD) with a PowerShell fallback when the native channel
+/// is unavailable. On macOS/Linux, falls back to `ffmpeg`, `rec` (SoX), or
+/// `arecord`.
 class WavRecorder {
   WavRecorder({MethodChannel? channel})
     : _channel = channel ?? const MethodChannel('baocode/voice');
+
+  static const _defaultChannel = MethodChannel('baocode/voice');
 
   final MethodChannel _channel;
   Process? _process;
@@ -24,9 +44,48 @@ class WavRecorder {
   bool get isRecording => _recording;
   String? get activeFilePath => _recording ? _outputPath : null;
 
-  /// Reads real-time microphone RMS level (0.0..1.0) and VAD silence duration
-  /// from Windows native C++ `waveIn` recording.
-  Future<({double level, int silenceMs, bool heardSpeech})?>
+  /// Lists available microphone input devices on Windows (empty on other OSes).
+  static Future<List<VoiceInputDevice>> listInputDevices({
+    MethodChannel? channel,
+  }) async {
+    if (Platform.environment['FLUTTER_TEST'] == 'true' || !Platform.isWindows) {
+      return const [];
+    }
+    try {
+      final raw = await (channel ?? _defaultChannel)
+          .invokeMethod<List<Object?>>('listInputDevices');
+      if (raw == null) return const [];
+      final devices = <VoiceInputDevice>[];
+      for (final entry in raw) {
+        if (entry is Map<Object?, Object?>) {
+          final id = (entry['id'] as num?)?.toInt();
+          final name = (entry['name'] as String?)?.trim();
+          if (id != null && name != null && name.isNotEmpty) {
+            devices.add(VoiceInputDevice(id: id, name: name));
+          }
+        }
+      }
+      return devices;
+    } on Object {
+      return const [];
+    }
+  }
+
+  /// Plays a gentle synthesized UI earcon (`start`, `stop`, `exit`) on Windows.
+  static Future<void> playEarcon(String kind, {MethodChannel? channel}) async {
+    if (Platform.environment['FLUTTER_TEST'] == 'true' || !Platform.isWindows) {
+      return;
+    }
+    try {
+      await (channel ?? _defaultChannel).invokeMethod<bool>('playEarcon', kind);
+    } on Object {
+      // Earcons are strictly best-effort.
+    }
+  }
+
+  /// Reads real-time microphone RMS level (0.0..1.0), VAD silence duration,
+  /// and total captured duration from Windows native C++ `waveIn` recording.
+  Future<({double level, int silenceMs, int totalMs, bool heardSpeech})?>
   readMetrics() async {
     if (!_recording || !_usingNativeWindows) return null;
     try {
@@ -37,6 +96,7 @@ class WavRecorder {
       return (
         level: (raw['level'] as num?)?.toDouble() ?? 0.0,
         silenceMs: (raw['silenceMs'] as num?)?.toInt() ?? 0,
+        totalMs: (raw['totalMs'] as num?)?.toInt() ?? 0,
         heardSpeech: raw['heardSpeech'] == true,
       );
     } on Object {
@@ -44,8 +104,9 @@ class WavRecorder {
     }
   }
 
-  /// Starts recording to a temporary `.wav` file.
-  Future<void> start() async {
+  /// Starts recording to a temporary `.wav` file using [deviceId]
+  /// (`-1` selects the OS default microphone).
+  Future<void> start({int deviceId = -1}) async {
     if (_recording) return;
     final dir = await Directory.systemTemp.createTemp('ayte_voice_');
     final wavPath = p.join(dir.path, 'recording.wav');
@@ -53,7 +114,10 @@ class WavRecorder {
     _usingNativeWindows = false;
 
     if (Platform.isWindows) {
-      final startedNative = await _tryStartWindowsNative(wavPath);
+      final startedNative = await _tryStartWindowsNative(
+        wavPath,
+        deviceId: deviceId,
+      );
       if (startedNative) {
         _usingNativeWindows = true;
       } else {
@@ -176,9 +240,15 @@ class WavRecorder {
     }
   }
 
-  Future<bool> _tryStartWindowsNative(String wavPath) async {
+  Future<bool> _tryStartWindowsNative(
+    String wavPath, {
+    int deviceId = -1,
+  }) async {
     try {
-      final ok = await _channel.invokeMethod<bool>('startRecording', wavPath);
+      final ok = await _channel.invokeMethod<bool>('startRecording', {
+        'path': wavPath,
+        'deviceId': deviceId,
+      });
       return ok == true;
     } on MissingPluginException {
       return false;

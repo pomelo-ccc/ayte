@@ -6,6 +6,7 @@ import 'package:baocode/models/secret_store.dart';
 import 'package:baocode/voice/local_sensevoice.dart';
 import 'package:baocode/voice/voice_ai_corrector.dart';
 import 'package:baocode/voice/voice_hotkey.dart';
+import 'package:baocode/voice/voice_model_installer.dart';
 import 'package:baocode/voice/voice_settings.dart';
 import 'package:baocode/voice/voice_stt_service.dart';
 import 'package:baocode/voice/voice_text_cleaner.dart';
@@ -209,12 +210,12 @@ void main() => print('hi');
 
       service.registerComposer(
         ownerA,
-        onTrigger: () => hitsA++,
+        onTrigger: ({autoOpened = false}) => hitsA++,
         isFocused: () => focusA,
       );
       service.registerComposer(
         ownerB,
-        onTrigger: () => hitsB++,
+        onTrigger: ({autoOpened = false}) => hitsB++,
         isFocused: () => focusB,
       );
 
@@ -342,6 +343,129 @@ void main() => print('hi');
         VoiceSttService.isStopConversationCommand('帮我把结束对话功能优化一下'),
         isFalse,
       );
+    });
+  });
+
+  group('Voice v2 optimizations (streaming TTS, commands, language, guards)', () {
+    test('splits long speech cleanly with concise first chunk and intact filenames', () {
+      const sample =
+          '已经帮你修好了 main.dart 里的 3.14 浮点数问题！接下来我们优化一下语音播报的响应速度。'
+          '第三句会和短句合并在一起播报，确保语调自然连贯。';
+      final chunks = VoiceTtsService.splitIntoSpeechSentences(sample);
+      expect(chunks.length, greaterThanOrEqualTo(2));
+      expect(chunks.first, contains('main.dart'));
+      expect(chunks.first, contains('3.14'));
+      expect(chunks.first.length, lessThanOrEqualTo(75));
+
+      const longFirst =
+          '这是一段非常长没有句号的开头介绍，用来测试第一句超过八十五个字符时会自动按逗号切分出较短的首包，从而把首次出声时间压到半秒以内，让交互体验更加自然流畅。';
+      final splitLong = VoiceTtsService.splitIntoSpeechSentences(longFirst);
+      expect(splitLong.length, greaterThanOrEqualTo(2));
+      expect(splitLong.first.length, lessThanOrEqualTo(76));
+    });
+
+    test('maps BCP-47 tags to SenseVoice language codes accurately', () {
+      expect(LocalSenseVoice.mapSenseVoiceLanguage('zh-CN'), 'zh');
+      expect(LocalSenseVoice.mapSenseVoiceLanguage('en-US'), 'en');
+      expect(LocalSenseVoice.mapSenseVoiceLanguage('ja-JP'), 'ja');
+      expect(LocalSenseVoice.mapSenseVoiceLanguage('zh-HK'), 'yue');
+      expect(LocalSenseVoice.mapSenseVoiceLanguage('auto'), 'auto');
+      expect(LocalSenseVoice.mapSenseVoiceLanguage(null), 'auto');
+    });
+
+    test('matches exact voice commands without false positives on prompts', () {
+      expect(
+        VoiceSttService.matchVoiceCommand('结束对话。'),
+        VoiceCommand.stopConversation,
+      );
+      expect(
+        VoiceSttService.matchVoiceCommand('清空输入框！'),
+        VoiceCommand.clearInput,
+      );
+      expect(
+        VoiceSttService.matchVoiceCommand('停止生成'),
+        VoiceCommand.stopGeneration,
+      );
+      expect(
+        VoiceSttService.matchVoiceCommand('撤销输入'),
+        VoiceCommand.undoInput,
+      );
+      expect(
+        VoiceSttService.matchVoiceCommand('请帮我添加一个清空输入框按钮'),
+        isNull,
+      );
+    });
+
+    test('merges user glossary and dynamic workspace terms deduplicated', () {
+      expect(
+        VoiceSttService.mergeGlossaries(
+          'Ayte, Flutter, SenseVoice',
+          'ayte, composer.dart, voice_tts_service.dart',
+        ),
+        'Ayte, Flutter, SenseVoice, composer.dart, voice_tts_service.dart',
+      );
+    });
+
+    test('persists sttInputDeviceId and earcons cleanly and omits defaults', () {
+      final def = VoiceConfig.fromSettings((_) => null);
+      expect(def.sttInputDeviceId, -1);
+      expect(def.earcons, isTrue);
+
+      final custom = VoiceConfig.fromSettings(
+        (k) => {
+          VoiceConfig.sttInputDeviceIdKey: 2,
+          VoiceConfig.earconsKey: false,
+        }[k],
+      );
+      expect(custom.sttInputDeviceId, 2);
+      expect(custom.earcons, isFalse);
+
+      final customMap = custom.toSettingsMap();
+      expect(customMap[VoiceConfig.sttInputDeviceIdKey], 2);
+      expect(customMap[VoiceConfig.earconsKey], false);
+    });
+
+    test('conversation follow-up guards against unfocused window and unsent drafts', () {
+      final store = VoiceSettingsStore(secrets: MemorySecretStore());
+      store.resetForTest(const VoiceConfig(enabled: true, conversationMode: true));
+      var windowFocused = true;
+      var hasDraft = false;
+      var autoTriggered = 0;
+
+      final service = VoiceHotkeyService(
+        store: store,
+        isWindowFocused: () => windowFocused,
+      );
+      final owner = Object();
+      service.registerComposer(
+        owner,
+        onTrigger: ({autoOpened = false}) {
+          if (autoOpened) autoTriggered++;
+        },
+        isFocused: () => true,
+        hasDraft: () => hasDraft,
+      );
+
+      // Unfocused window: never silently open mic.
+      windowFocused = false;
+      service.handleConversationFollowUp();
+      expect(autoTriggered, 0);
+
+      // Focused window but unsent draft present: never clobber user draft.
+      windowFocused = true;
+      hasDraft = true;
+      service.handleConversationFollowUp();
+      expect(autoTriggered, 0);
+
+      // Focused window and clean composer: auto-opens mic with autoOpened=true.
+      hasDraft = false;
+      service.handleConversationFollowUp();
+      expect(autoTriggered, 1);
+    });
+
+    test('formats installer byte sizes cleanly', () {
+      expect(VoiceModelInstaller.formatMb(1024 * 1024), '1.0 MB');
+      expect(VoiceModelInstaller.formatMb(239233841), '228.2 MB');
     });
   });
 }

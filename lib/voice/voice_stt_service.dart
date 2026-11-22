@@ -15,6 +15,9 @@ import 'wav_recorder.dart';
 /// Current state of Speech-to-Text capture.
 enum VoiceSttState { idle, starting, listening, transcribing, correcting }
 
+/// Short exact-utterance voice control commands recognized locally.
+enum VoiceCommand { stopConversation, clearInput, stopGeneration, undoInput }
+
 /// Result delivered when a dictation session completes.
 class VoiceSttResult {
   const VoiceSttResult(this.text, {this.error});
@@ -26,6 +29,7 @@ class VoiceSttResult {
 }
 
 /// Unified Speech-to-Text service supporting:
+/// - **Local AI engine** (SenseVoiceSmall int8 ONNX via `sherpa-onnx`)
 /// - **System engine** (Windows `System.Speech.Recognition`, free & offline)
 /// - **OpenAI-compatible API** (`/audio/transcriptions` multipart WAV upload)
 class VoiceSttService extends ChangeNotifier {
@@ -35,6 +39,11 @@ class VoiceSttService extends ChangeNotifier {
       _store = store;
 
   static final VoiceSttService instance = VoiceSttService();
+
+  /// Maximum waiting time when the microphone was auto-opened in Conversation
+  /// Mode and nobody speaks, preventing endless recording.
+  static const int autoOpenNoSpeechTimeoutMs = 9000;
+  static const int _maxRetainedFailedRecordings = 3;
 
   final VoiceSettingsStore? _store;
   final WavRecorder _recorder;
@@ -57,10 +66,14 @@ class VoiceSttService extends ChangeNotifier {
   bool _streamPolling = false;
   bool _metricsPolling = false;
   double _audioLevel = 0.0;
+  double _vadCountdownProgress = 0.0;
   final List<double> _levelHistory = <double>[0.1, 0.1, 0.1, 0.1, 0.1];
   VoidCallback? _onAutoStop;
+  VoidCallback? _onNoSpeechTimeout;
+  bool _autoOpened = false;
   bool _autoStopTriggered = false;
   Completer<void>? _correctCancel;
+  final List<File> _failedRecordings = [];
 
   VoiceSttState get state => _state;
   bool get isStarting => _state == VoiceSttState.starting;
@@ -68,8 +81,12 @@ class VoiceSttService extends ChangeNotifier {
   bool get isTranscribing => _state == VoiceSttState.transcribing;
   bool get isCorrecting => _state == VoiceSttState.correcting;
   bool get isBusy => _state != VoiceSttState.idle;
+  bool get isAutoOpened => _autoOpened;
   double get audioLevel => _audioLevel;
+  double get vadCountdownProgress => _vadCountdownProgress;
   List<double> get levelHistory => List.unmodifiable(_levelHistory);
+  bool get canRetryLastRecording => _failedRecordings.isNotEmpty && !isBusy;
+  int get retainedRecordingCount => _failedRecordings.length;
   String get partialText => _partialText;
   String get liveTranscript => mergeTranscript(_finalSegments, _partialText);
 
@@ -141,24 +158,74 @@ class VoiceSttService extends ChangeNotifier {
     'exitconversation',
     'stopvoice',
   };
+  static const _clearInputPhrases = <String>{
+    '清空输入框',
+    '清空输入',
+    '清除输入框',
+    '清除输入',
+    '清空内容',
+    '清空草稿',
+    'clearinput',
+    'clearall',
+  };
+  static const _stopGenerationPhrases = <String>{
+    '停止生成',
+    '别生成了',
+    '暂停生成',
+    '停止回答',
+    '停止输出',
+    'stopgenerating',
+    'stopgeneration',
+  };
+  static const _undoInputPhrases = <String>{
+    '撤销输入',
+    '撤回输入',
+    '撤销刚才的',
+    '撤销刚才那句',
+    '撤销',
+    'undoinput',
+  };
 
-  /// Returns true when a short dictated utterance is purely a command to exit
-  /// hands-free Voice Conversation Mode (so it exits cleanly instead of being
-  /// sent as a chat prompt).
-  static bool isStopConversationCommand(String text) {
+  /// Matches exact short voice control commands while ignoring normal longer
+  /// prompts that merely mention these words.
+  static VoiceCommand? matchVoiceCommand(String text) {
     final normalized = text
         .trim()
         .toLowerCase()
         .replaceAll(_stopPhrasePunct, '');
-    if (normalized.isEmpty || normalized.length > 20) return false;
-    return _stopConversationPhrases.contains(normalized);
+    if (normalized.isEmpty || normalized.length > 20) return null;
+    if (_stopConversationPhrases.contains(normalized)) {
+      return VoiceCommand.stopConversation;
+    }
+    if (_clearInputPhrases.contains(normalized)) {
+      return VoiceCommand.clearInput;
+    }
+    if (_stopGenerationPhrases.contains(normalized)) {
+      return VoiceCommand.stopGeneration;
+    }
+    if (_undoInputPhrases.contains(normalized)) {
+      return VoiceCommand.undoInput;
+    }
+    return null;
   }
 
+  /// Returns true when a short dictated utterance is purely a command to exit
+  /// hands-free Voice Conversation Mode (so it exits cleanly instead of being
+  /// sent as a chat prompt).
+  static bool isStopConversationCommand(String text) =>
+      matchVoiceCommand(text) == VoiceCommand.stopConversation;
+
   /// Starts capturing voice input for [owner].
-  /// Optionally passes [onAutoStop] to trigger automatic stop when VAD detects
-  /// a silence pause after speech.
+  /// Optionally passes [onAutoStop] for VAD silence auto-stop and
+  /// [onNoSpeechTimeout] when [autoOpened] is true and nobody speaks within
+  /// [autoOpenNoSpeechTimeoutMs].
   /// Returns true if listening started successfully.
-  Future<bool> start({Object? owner, VoidCallback? onAutoStop}) async {
+  Future<bool> start({
+    Object? owner,
+    VoidCallback? onAutoStop,
+    VoidCallback? onNoSpeechTimeout,
+    bool autoOpened = false,
+  }) async {
     if (_state == VoiceSttState.starting ||
         _state == VoiceSttState.transcribing ||
         _state == VoiceSttState.correcting) {
@@ -175,8 +242,11 @@ class VoiceSttService extends ChangeNotifier {
     _finalSegments.clear();
     _activeOwner = owner;
     _onAutoStop = onAutoStop;
+    _onNoSpeechTimeout = onNoSpeechTimeout;
+    _autoOpened = autoOpened;
     _autoStopTriggered = false;
     _audioLevel = 0.0;
+    _vadCountdownProgress = 0.0;
     _levelHistory.fillRange(0, _levelHistory.length, 0.1);
     _state = VoiceSttState.starting;
     notifyListeners();
@@ -186,13 +256,13 @@ class VoiceSttService extends ChangeNotifier {
       if (config.sttEngine == VoiceSttEngine.localAi) {
         if (!LocalSenseVoice.isInstalled) {
           throw StateError(
-            '未检测到本地 SenseVoice 模型（D:\\Ayte\\voice-models\\sense-voice），请在「设置 → 语音」切换引擎。',
+            '尚未安装本地 SenseVoice 语音组件，请在「设置 → 语音」点击一键在线下载安装。',
           );
         }
         // Pre-warm the ONNX model in background while recording so live
         // streaming and final stopping produce results in ~0.1s.
-        LocalSenseVoice.instance.warmUp();
-        await _recorder.start();
+        LocalSenseVoice.instance.warmUp(language: config.sttLanguage);
+        await _recorder.start(deviceId: config.sttInputDeviceId);
       } else if (config.sttEngine == VoiceSttEngine.system) {
         await _startSystemStt(config);
       } else {
@@ -200,6 +270,9 @@ class VoiceSttService extends ChangeNotifier {
       }
       if (_state != VoiceSttState.starting || !identical(_activeOwner, owner)) {
         return false;
+      }
+      if (config.earcons) {
+        unawaited(WavRecorder.playEarcon('start'));
       }
       _state = VoiceSttState.listening;
       _startedAt = DateTime.now();
@@ -224,6 +297,8 @@ class VoiceSttService extends ChangeNotifier {
       _state = VoiceSttState.idle;
       _activeOwner = null;
       _onAutoStop = null;
+      _onNoSpeechTimeout = null;
+      _autoOpened = false;
       notifyListeners();
       return false;
     }
@@ -240,6 +315,27 @@ class VoiceSttService extends ChangeNotifier {
       _levelHistory.add(_audioLevel.clamp(0.08, 1.0));
 
       final cfg = _settings.config;
+      if (cfg.effectiveVadAutoStop &&
+          metrics.heardSpeech &&
+          cfg.sttVadSilenceMs > 0) {
+        _vadCountdownProgress =
+            (metrics.silenceMs / cfg.sttVadSilenceMs).clamp(0.0, 1.0);
+      } else {
+        _vadCountdownProgress = 0.0;
+      }
+
+      if (_autoOpened &&
+          !_autoStopTriggered &&
+          !metrics.heardSpeech &&
+          _elapsed.inMilliseconds >= autoOpenNoSpeechTimeoutMs) {
+        _autoStopTriggered = true;
+        final cb = _onNoSpeechTimeout;
+        if (cb != null) {
+          scheduleMicrotask(cb);
+        }
+        return;
+      }
+
       if (cfg.effectiveVadAutoStop &&
           !_autoStopTriggered &&
           metrics.heardSpeech &&
@@ -276,11 +372,12 @@ class VoiceSttService extends ChangeNotifier {
       final file = File(path);
       if (!await file.exists()) return;
       final length = await file.length();
-      // Require at least ~0.25s (8000 bytes) of new PCM before re-decoding.
+      // Require at least ~0.25s (6000 bytes) of new PCM before re-decoding.
       if (length - _lastStreamBytes < 6000) return;
       final text = await LocalSenseVoice.instance.transcribeLive(
         path,
         sessionId: sid,
+        language: _settings.config.sttLanguage,
       );
       if (_state != VoiceSttState.listening || sid != _streamSessionId) return;
       if (text != null) {
@@ -297,12 +394,29 @@ class VoiceSttService extends ChangeNotifier {
     }
   }
 
+  /// Merges user-configured glossary with dynamic workspace terms (project name,
+  /// recent filenames) without duplicates.
+  static String mergeGlossaries(String configured, String? extra) {
+    final seen = <String>{};
+    final out = <String>[];
+    for (final source in [configured, extra ?? '']) {
+      for (final raw in source.split(RegExp(r'[,，\n]+'))) {
+        final item = raw.trim();
+        if (item.isNotEmpty && seen.add(item.toLowerCase())) {
+          out.add(item);
+        }
+      }
+    }
+    return out.join(', ');
+  }
+
   /// Runs AI post-correction on [rawText] while exposing [VoiceSttState.correcting]
   /// so the composer voice bar displays a subtle progress badge with a Skip button.
   Future<String> correctWithAi(
     String rawText, {
     required Object owner,
     String? lastReply,
+    String? extraGlossary,
     String? model,
     String? location,
   }) async {
@@ -314,10 +428,14 @@ class VoiceSttService extends ChangeNotifier {
     _state = VoiceSttState.correcting;
     notifyListeners();
     try {
+      final glossary = mergeGlossaries(
+        _settings.config.sttGlossary,
+        extraGlossary,
+      );
       return await VoiceAiCorrector.correct(
         trimmed,
         lastReply: lastReply,
-        glossary: _settings.config.sttGlossary,
+        glossary: glossary,
         model: model,
         location: location,
         cancel: cancel.future,
@@ -359,7 +477,11 @@ class VoiceSttService extends ChangeNotifier {
     _elapsedTimer = null;
     _streamTimer?.cancel();
     _streamTimer = null;
+    _vadCountdownProgress = 0.0;
     final config = _settings.config;
+    if (config.earcons) {
+      unawaited(WavRecorder.playEarcon('stop'));
+    }
 
     if (config.sttEngine == VoiceSttEngine.localAi) {
       return _stopLocalAiRecordingAndTranscribe();
@@ -382,6 +504,10 @@ class VoiceSttService extends ChangeNotifier {
     _partialText = '';
     _finalSegments.clear();
     _activeOwner = null;
+    _onAutoStop = null;
+    _onNoSpeechTimeout = null;
+    _autoOpened = false;
+    _vadCountdownProgress = 0.0;
 
     final proc = _systemProcess;
     _systemProcess = null;
@@ -640,11 +766,87 @@ exit ([AyteSpeechHost]::Run("$escapedCulture"))
     return result;
   }
 
+  void _retainFailedRecording(File file) {
+    _failedRecordings.removeWhere((f) => f.path == file.path);
+    _failedRecordings.add(file);
+    while (_failedRecordings.length > _maxRetainedFailedRecordings) {
+      final evicted = _failedRecordings.removeAt(0);
+      unawaited(WavRecorder.cleanupFile(evicted));
+    }
+  }
+
+  /// Deletes all retained failed recordings and clears the retry state.
+  Future<void> clearFailedRecordings() async {
+    final files = List<File>.from(_failedRecordings);
+    _failedRecordings.clear();
+    _lastError = null;
+    notifyListeners();
+    for (final f in files) {
+      await WavRecorder.cleanupFile(f);
+    }
+  }
+
+  /// Retries transcribing the most recently retained failed WAV recording so a
+  /// temporary network/API hiccup never loses what the user dictated.
+  Future<VoiceSttResult> retryLastRecording({Object? owner}) async {
+    if (isBusy || _failedRecordings.isEmpty) {
+      return const VoiceSttResult('');
+    }
+    final wavFile = _failedRecordings.removeLast();
+    if (!await wavFile.exists()) {
+      notifyListeners();
+      return const VoiceSttResult('', error: '找不到保留的录音文件');
+    }
+    _activeOwner = owner;
+    _lastError = null;
+    _state = VoiceSttState.transcribing;
+    notifyListeners();
+
+    final config = _settings.config;
+    var retain = false;
+    try {
+      final String text;
+      if (config.sttEngine == VoiceSttEngine.openaiCompatible) {
+        final apiKey = await _settings.readSttApiKey();
+        if (apiKey == null || apiKey.isEmpty) {
+          throw StateError('未配置语音识别 API Key');
+        }
+        text = await transcribeWavViaOpenAi(
+          wavFile: wavFile,
+          baseUrl: config.sttApiBaseUrl,
+          apiKey: apiKey,
+          model: config.sttModel,
+          language: config.sttLanguage,
+        );
+      } else {
+        text = await LocalSenseVoice.instance.transcribe(
+          wavFile,
+          language: config.sttLanguage,
+        );
+      }
+      return VoiceSttResult(text);
+    } on Object catch (error) {
+      retain = true;
+      _retainFailedRecording(wavFile);
+      final message = _friendlyError(error);
+      _lastError = message;
+      return VoiceSttResult('', error: message);
+    } finally {
+      if (!retain) {
+        await WavRecorder.cleanupFile(wavFile);
+      }
+      _state = VoiceSttState.idle;
+      _activeOwner = null;
+      notifyListeners();
+    }
+  }
+
   Future<VoiceSttResult> _stopLocalAiRecordingAndTranscribe() async {
     _state = VoiceSttState.transcribing;
     notifyListeners();
 
     File? wavFile;
+    var retain = false;
     try {
       wavFile = await _recorder.stop();
       if (wavFile == null) {
@@ -653,16 +855,26 @@ exit ([AyteSpeechHost]::Run("$escapedCulture"))
       final text = await LocalSenseVoice.instance.transcribe(
         wavFile,
         sessionId: _settings.config.sttStreaming ? _streamSessionId : null,
+        language: _settings.config.sttLanguage,
       );
       return VoiceSttResult(text);
     } on Object catch (error) {
+      if (wavFile != null && await wavFile.exists()) {
+        retain = true;
+        _retainFailedRecording(wavFile);
+      }
       final message = _friendlyError(error);
       _lastError = message;
       return VoiceSttResult('', error: message);
     } finally {
-      await WavRecorder.cleanupFile(wavFile);
+      if (!retain) {
+        await WavRecorder.cleanupFile(wavFile);
+      }
       _state = VoiceSttState.idle;
       _activeOwner = null;
+      _onAutoStop = null;
+      _onNoSpeechTimeout = null;
+      _autoOpened = false;
       _partialText = '';
       _finalSegments.clear();
       _startedAt = null;
@@ -676,7 +888,7 @@ exit ([AyteSpeechHost]::Run("$escapedCulture"))
     if (key == null || key.isEmpty) {
       throw StateError('尚未配置语音识别 API Key，请前往「设置 → 语音」填写，或切换回系统内置免费引擎。');
     }
-    await _recorder.start();
+    await _recorder.start(deviceId: config.sttInputDeviceId);
   }
 
   Future<VoiceSttResult> _stopApiRecordingAndTranscribe(
@@ -686,6 +898,7 @@ exit ([AyteSpeechHost]::Run("$escapedCulture"))
     notifyListeners();
 
     File? wavFile;
+    var retain = false;
     try {
       wavFile = await _recorder.stop();
       if (wavFile == null) {
@@ -693,6 +906,8 @@ exit ([AyteSpeechHost]::Run("$escapedCulture"))
       }
       final apiKey = await _settings.readSttApiKey();
       if (apiKey == null || apiKey.isEmpty) {
+        retain = true;
+        _retainFailedRecording(wavFile);
         return const VoiceSttResult('', error: '未配置语音识别 API Key');
       }
       final text = await transcribeWavViaOpenAi(
@@ -704,13 +919,22 @@ exit ([AyteSpeechHost]::Run("$escapedCulture"))
       );
       return VoiceSttResult(text);
     } on Object catch (error) {
+      if (wavFile != null && await wavFile.exists()) {
+        retain = true;
+        _retainFailedRecording(wavFile);
+      }
       final message = _friendlyError(error);
       _lastError = message;
       return VoiceSttResult('', error: message);
     } finally {
-      await WavRecorder.cleanupFile(wavFile);
+      if (!retain) {
+        await WavRecorder.cleanupFile(wavFile);
+      }
       _state = VoiceSttState.idle;
       _activeOwner = null;
+      _onAutoStop = null;
+      _onNoSpeechTimeout = null;
+      _autoOpened = false;
       _partialText = '';
       _finalSegments.clear();
       _startedAt = null;

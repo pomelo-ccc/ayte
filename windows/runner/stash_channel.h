@@ -16,6 +16,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 // `baocode/stash` (see lib/stash/stash_host.dart; the macOS app answers the
 // same in StashPanel.swift): the shortcut that shows the stash's panel from
@@ -41,8 +42,11 @@ class StashChannel {
   StashChannel(const StashChannel&) = delete;
   StashChannel& operator=(const StashChannel&) = delete;
 
-  // The window's WM_HOTKEY: handled when it is the stash's.
+  // The window's WM_HOTKEY: handled when it is the stash's or voice's.
   bool HandleHotkey(WPARAM id);
+
+  // The window's MM_MCINOTIFY: handled when it belongs to voice TTS playback.
+  bool HandleMciNotify(WPARAM flags, LPARAM device);
 
   // A kRunMessage's task: run when |alive| (the channel still is), dropped
   // otherwise.
@@ -65,9 +69,13 @@ class StashChannel {
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   bool RegisterVoice(const std::string& spec);
   void UnregisterVoice();
-  std::string StartVoiceRecording(const std::string& utf8_path);
+  std::string StartVoiceRecording(const std::string& utf8_path, int device_id);
   std::string StopVoiceRecording();
   void CancelVoiceRecording();
+  std::string PlayVoiceAudio(const std::string& utf8_path, int play_id);
+  bool PauseVoiceAudio();
+  bool ResumeVoiceAudio();
+  void StopVoiceAudio();
 
   // Runs |task| on the platform thread, from any other.
   static void Post(HWND window, std::function<void()> task);
@@ -84,8 +92,14 @@ class StashChannel {
   std::atomic<uint32_t> wave_data_bytes_{0};
   std::atomic<int> wave_level_milli_{0};
   std::atomic<uint32_t> wave_silence_ms_{0};
+  std::atomic<uint32_t> wave_total_ms_{0};
   std::atomic<bool> wave_heard_speech_{false};
   std::thread wave_thread_;
+  UINT voice_play_device_id_ = 0;
+  int voice_play_id_ = 0;
+  bool voice_playing_ = false;
+  bool voice_paused_ = false;
+  std::vector<uint8_t> earcon_wav_;
 
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel_;
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>

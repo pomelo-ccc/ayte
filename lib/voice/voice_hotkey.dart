@@ -1,7 +1,7 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
 
 import 'voice_settings.dart';
 import 'voice_stt_service.dart';
@@ -12,20 +12,27 @@ class _ComposerRegistration {
     required this.owner,
     required this.onTrigger,
     required this.isFocused,
+    required this.hasDraft,
   });
 
   final Object owner;
-  final VoidCallback onTrigger;
+  final void Function({bool autoOpened}) onTrigger;
   final bool Function() isFocused;
+  final bool Function() hasDraft;
 }
 
 /// Manages the system-wide global hotkey (`baocode/voice`) that brings Ayte to
-/// the foreground and toggles voice input in the active chat composer.
+/// the foreground and toggles voice input in the active chat composer, and
+/// routes native audio completion callbacks (`playbackDone`).
 class VoiceHotkeyService extends ChangeNotifier {
-  VoiceHotkeyService({MethodChannel? channel, VoiceSettingsStore? store})
-    : _channel = channel ?? const MethodChannel('baocode/voice'),
-      // ignore: prefer_initializing_formals
-      _store = store {
+  VoiceHotkeyService({
+    MethodChannel? channel,
+    VoiceSettingsStore? store,
+    bool Function()? isWindowFocused,
+  }) : _channel = channel ?? const MethodChannel('baocode/voice'),
+       // ignore: prefer_initializing_formals
+       _store = store,
+       _isWindowFocusedOverride = isWindowFocused {
     _channel.setMethodCallHandler(_handleNativeCall);
   }
 
@@ -33,6 +40,7 @@ class VoiceHotkeyService extends ChangeNotifier {
 
   final MethodChannel _channel;
   final VoiceSettingsStore? _store;
+  final bool Function()? _isWindowFocusedOverride;
 
   VoiceSettingsStore get _settings => _store ?? VoiceSettingsStore.instance;
 
@@ -47,6 +55,19 @@ class VoiceHotkeyService extends ChangeNotifier {
   /// application already holds it; `null` when empty or unsupported).
   bool? get hotkeyTaken => _hotkeyTaken;
 
+  bool _isWindowFocused() {
+    final override = _isWindowFocusedOverride;
+    if (override != null) return override();
+    try {
+      return switch (WidgetsBinding.instance.lifecycleState) {
+        null || AppLifecycleState.resumed => true,
+        _ => false,
+      };
+    } on Object {
+      return true;
+    }
+  }
+
   /// Starts syncing the native global hotkey with [VoiceSettingsStore].
   void follow([VoiceSettingsStore? store]) {
     final target = store ?? _settings;
@@ -59,12 +80,18 @@ class VoiceHotkeyService extends ChangeNotifier {
 
   /// Automatically re-opens the mic in the active composer after an auto-read
   /// AI reply finishes speaking while Conversation Mode is active.
+  ///
+  /// Guards against opening the microphone while the user switched away from
+  /// Ayte or already has an unsent draft in the active composer.
   @visibleForTesting
   void handleConversationFollowUp() {
     final cfg = _settings.config;
     if (!cfg.enabled || !cfg.conversationMode) return;
     if (VoiceSttService.instance.isBusy) return;
-    handleHotkeyPressed();
+    if (!_isWindowFocused()) return;
+    final target = _pickTargetComposer();
+    if (target == null || target.hasDraft()) return;
+    target.onTrigger(autoOpened: true);
   }
 
   void _syncFromSettings() {
@@ -106,12 +133,13 @@ class VoiceHotkeyService extends ChangeNotifier {
     await _applyHotkey(desired);
   }
 
-  /// Registers a mounted dock composer so the global hotkey can toggle voice
-  /// input on it.
+  /// Registers a mounted dock composer so the global hotkey and conversation
+  /// follow-up can toggle voice input on it.
   void registerComposer(
     Object owner, {
-    required VoidCallback onTrigger,
+    required void Function({bool autoOpened}) onTrigger,
     required bool Function() isFocused,
+    bool Function()? hasDraft,
   }) {
     _composers.removeWhere((r) => identical(r.owner, owner));
     _composers.add(
@@ -119,6 +147,7 @@ class VoiceHotkeyService extends ChangeNotifier {
         owner: owner,
         onTrigger: onTrigger,
         isFocused: isFocused,
+        hasDraft: hasDraft ?? () => false,
       ),
     );
   }
@@ -135,6 +164,14 @@ class VoiceHotkeyService extends ChangeNotifier {
     _composers.removeWhere((r) => identical(r.owner, owner));
   }
 
+  _ComposerRegistration? _pickTargetComposer() {
+    if (_composers.isEmpty) return null;
+    for (var i = _composers.length - 1; i >= 0; i--) {
+      if (_composers[i].isFocused()) return _composers[i];
+    }
+    return _composers.last;
+  }
+
   /// Dispatches a global hotkey press to the active composer.
   @visibleForTesting
   void handleHotkeyPressed() {
@@ -146,27 +183,22 @@ class VoiceHotkeyService extends ChangeNotifier {
     if (activeVoiceOwner != null) {
       for (final reg in _composers) {
         if (identical(reg.owner, activeVoiceOwner)) {
-          reg.onTrigger();
+          reg.onTrigger(autoOpened: false);
           return;
         }
       }
     }
 
-    // 2. Otherwise prefer whichever composer currently has focus.
-    for (var i = _composers.length - 1; i >= 0; i--) {
-      if (_composers[i].isFocused()) {
-        _composers[i].onTrigger();
-        return;
-      }
-    }
-
-    // 3. Fall back to the most recently active mounted dock composer.
-    _composers.last.onTrigger();
+    // 2. Otherwise prefer whichever composer currently has focus, or most recent.
+    _pickTargetComposer()?.onTrigger(autoOpened: false);
   }
 
   Future<Object?> _handleNativeCall(MethodCall call) async {
     if (call.method == 'pressed') {
       handleHotkeyPressed();
+    } else if (call.method == 'playbackDone') {
+      final playId = (call.arguments as num?)?.toInt() ?? 0;
+      VoiceTtsService.instance.handleNativePlaybackDone(playId);
     }
     return null;
   }

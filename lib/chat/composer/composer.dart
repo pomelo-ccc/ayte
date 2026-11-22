@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:bao_markdown/bao_markdown.dart';
+import 'package:path/path.dart' as p;
 
 import '../../kernel/agent_kernel.dart';
 import '../../kernel/kernel_types.dart';
@@ -52,9 +53,14 @@ import '../../ide/file_service.dart'
 import '../../ide/ide_notifications.dart';
 import '../../ide/transfer_progress.dart';
 import '../../platform/app_platform.dart';
+import '../../settings/settings_dialog.dart'
+    show SettingsOpener, SettingsSection;
+import '../../voice/local_sensevoice.dart';
 import '../../voice/voice_hotkey.dart';
 import '../../voice/voice_settings.dart';
 import '../../voice/voice_stt_service.dart';
+import '../../voice/voice_tts_service.dart';
+import '../../voice/wav_recorder.dart';
 import 'remote_drops.dart';
 
 /// An open query: a /command's (a slash starting a word), or a mention's
@@ -381,6 +387,7 @@ class ChatComposerState extends State<ChatComposer>
         this,
         onTrigger: _triggerVoiceFromHotkey,
         isFocused: () => _focusNode.hasFocus,
+        hasDraft: () => _controller.text.trim().isNotEmpty,
       );
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1393,6 +1400,13 @@ class ChatComposerState extends State<ChatComposer>
           return KeyEventResult.handled;
         }
       }
+      if (!stt.isBusy &&
+          VoiceTtsService.instance.isSpeaking &&
+          noMods &&
+          event.logicalKey == LogicalKeyboardKey.escape) {
+        unawaited(VoiceTtsService.instance.stop());
+        return KeyEventResult.handled;
+      }
     }
     if (event is KeyDownEvent &&
         event.logicalKey == LogicalKeyboardKey.keyE &&
@@ -1725,10 +1739,183 @@ class ChatComposerState extends State<ChatComposer>
   String _voiceReplacedOriginal = '';
   bool _voiceUpdatingText = false;
 
-  void _triggerVoiceFromHotkey() {
+  void _triggerVoiceFromHotkey({bool autoOpened = false}) {
     if (!mounted) return;
     _focusNode.requestFocus();
-    unawaited(_toggleVoiceInput());
+    unawaited(_toggleVoiceInput(autoOpened: autoOpened));
+  }
+
+  /// Collects project name and recent session filenames as dynamic hotwords
+  /// for AI proofreading so spoken code/file terms transcribe accurately.
+  String _buildWorkspaceGlossary() {
+    final terms = <String>[];
+    final seen = <String>{};
+    void addTerm(String? raw) {
+      final t = raw?.trim() ?? '';
+      if (t.length >= 2 && t.length <= 48 && seen.add(t.toLowerCase())) {
+        terms.add(t);
+      }
+    }
+
+    final root = widget.session.root;
+    if (root != null && root.isNotEmpty) {
+      addTerm(p.basename(root));
+    }
+    final session = widget.session;
+    final count = session.itemCount;
+    for (var i = count - 1; i >= math.max(0, count - 40) && terms.length < 12; i--) {
+      final item = session.itemAt(i);
+      if (item case CodeDiffItem(:final fileName) when fileName.isNotEmpty) {
+        addTerm(fileName.split(RegExp(r'[/\\]')).last);
+      } else if (item case ToolCallItem(
+        kind: ToolKind.edit || ToolKind.read,
+        :final target,
+      ) when target.isNotEmpty) {
+        addTerm(target.split(RegExp(r'[/\\]')).last);
+      }
+    }
+    return terms.join(', ');
+  }
+
+  bool _handleVoiceCommand(VoiceCommand cmd, VoiceConfig cfg) {
+    final notifications = IdeNotificationsScope.maybeOf(context);
+    final isZh = Localizations.localeOf(context).languageCode == 'zh';
+    switch (cmd) {
+      case VoiceCommand.stopConversation:
+        if (!cfg.conversationMode) return false;
+        _restoreVoiceSpanOriginal();
+        _clearVoiceSpanTracking();
+        if (cfg.earcons) {
+          unawaited(WavRecorder.playEarcon('exit'));
+        }
+        unawaited(
+          VoiceSettingsStore.instance.save(
+            cfg.copyWith(conversationMode: false),
+          ),
+        );
+        notifications?.notify(
+          IdeSeverity.info,
+          isZh ? '已退出连续语音对话模式' : 'Exited Voice Conversation Mode',
+        );
+        return true;
+      case VoiceCommand.clearInput:
+        _clearVoiceSpanTracking();
+        _controller
+          ..breakUndo()
+          ..clear()
+          ..breakUndo();
+        notifications?.notify(
+          IdeSeverity.info,
+          isZh ? '已清空输入框' : 'Cleared composer input',
+        );
+        return true;
+      case VoiceCommand.stopGeneration:
+        _restoreVoiceSpanOriginal();
+        _clearVoiceSpanTracking();
+        if (_showsStop) {
+          stopTurn(context, widget.session);
+        }
+        notifications?.notify(
+          IdeSeverity.info,
+          _showsStop
+              ? (isZh ? '已停止生成' : 'Stopped generation')
+              : (isZh ? '当前没有正在进行的回答' : 'Nothing currently generating'),
+        );
+        return true;
+      case VoiceCommand.undoInput:
+        final hadReplaced =
+            _voiceSpanStart != null &&
+            _voiceSpanEnd != null &&
+            _voiceSpanEnd! > _voiceSpanStart!;
+        _restoreVoiceSpanOriginal();
+        _clearVoiceSpanTracking();
+        if (!hadReplaced) {
+          _controller.undo();
+        }
+        notifications?.notify(
+          IdeSeverity.info,
+          isZh ? '已撤销语音输入' : 'Undid voice input',
+        );
+        return true;
+    }
+  }
+
+  Future<void> _finalizeVoiceTranscript(
+    String rawText, {
+    bool forceSend = false,
+  }) async {
+    final stt = VoiceSttService.instance;
+    final cfg = VoiceSettingsStore.instance.config;
+    final rawCmd = VoiceSttService.matchVoiceCommand(rawText);
+    if (rawCmd != null && _handleVoiceCommand(rawCmd, cfg)) {
+      return;
+    }
+
+    final rawInserted = _updateVoiceSpan(rawText, finalizeUndo: true);
+    _focusNode.requestFocus();
+    if (cfg.sttAiCorrect) {
+      final spanStart = _voiceSpanStart;
+      final spanEnd = _voiceSpanEnd;
+      final corrected = await stt.correctWithAi(
+        rawText,
+        owner: this,
+        lastReply: widget.session.lastTurnReply,
+        extraGlossary: _buildWorkspaceGlossary(),
+        model: widget.session.selected(KernelChoiceKind.model),
+        location: widget.session.kernelContext.cwd,
+      );
+      if (!mounted) return;
+      if (corrected.isNotEmpty) {
+        // Also check short post-corrected utterances so homophone-fixed
+        // voice commands (e.g. "结束对华" -> "结束对话") execute cleanly.
+        if (corrected.length <= 24) {
+          final postCmd = VoiceSttService.matchVoiceCommand(corrected);
+          if (postCmd != null &&
+              spanStart != null &&
+              spanEnd != null &&
+              spanEnd <= _controller.length &&
+              _controller.text.substring(spanStart, spanEnd) == rawInserted) {
+            _voiceSpanStart = spanStart;
+            _voiceSpanEnd = spanEnd;
+            if (_handleVoiceCommand(postCmd, cfg)) {
+              return;
+            }
+          }
+        }
+        if (corrected != rawText.trim() &&
+            spanStart != null &&
+            spanEnd != null &&
+            spanEnd <= _controller.length &&
+            _controller.text.substring(spanStart, spanEnd) == rawInserted) {
+          _voiceSpanStart = spanStart;
+          _voiceSpanEnd = spanEnd;
+          _updateVoiceSpan(corrected, finalizeUndo: true);
+          _focusNode.requestFocus();
+        }
+      }
+    }
+    _clearVoiceSpanTracking();
+    if ((cfg.effectiveAutoSend || forceSend) && !_showsStop && _canSend) {
+      _submit();
+    }
+  }
+
+  Future<void> _retryLastVoiceRecording() async {
+    final stt = VoiceSttService.instance;
+    final notifications = IdeNotificationsScope.maybeOf(context);
+    if (stt.isBusy || !stt.canRetryLastRecording) return;
+    _beginVoiceSpan();
+    final result = await stt.retryLastRecording(owner: this);
+    if (!mounted) return;
+    if (result.hasText) {
+      await _finalizeVoiceTranscript(result.text);
+    } else {
+      _restoreVoiceSpanOriginal();
+      _clearVoiceSpanTracking();
+      if (result.error != null) {
+        notifications?.notify(IdeSeverity.error, result.error!);
+      }
+    }
   }
 
   void _handleVoiceStreamChanged() {
@@ -1830,60 +2017,19 @@ class ChatComposerState extends State<ChatComposer>
     _voiceReplacedOriginal = '';
   }
 
-  Future<void> _toggleVoiceInput({bool forceSend = false}) async {
+  Future<void> _toggleVoiceInput({
+    bool forceSend = false,
+    bool autoOpened = false,
+  }) async {
     final stt = VoiceSttService.instance;
     final notifications = IdeNotificationsScope.maybeOf(context);
+    final isZh = Localizations.localeOf(context).languageCode == 'zh';
     if (stt.isStarting || stt.isTranscribing || stt.isCorrecting) return;
     if (stt.isListening && identical(stt.activeOwner, this)) {
       final result = await stt.stop();
       if (!mounted) return;
       if (result.hasText) {
-        final cfg = VoiceSettingsStore.instance.config;
-        if (cfg.conversationMode &&
-            VoiceSttService.isStopConversationCommand(result.text)) {
-          _restoreVoiceSpanOriginal();
-          _clearVoiceSpanTracking();
-          unawaited(
-            VoiceSettingsStore.instance.save(
-              cfg.copyWith(conversationMode: false),
-            ),
-          );
-          final isZh = Localizations.localeOf(context).languageCode == 'zh';
-          notifications?.notify(
-            IdeSeverity.info,
-            isZh ? '已退出连续语音对话模式' : 'Exited Voice Conversation Mode',
-          );
-          return;
-        }
-        final rawInserted = _updateVoiceSpan(result.text, finalizeUndo: true);
-        _focusNode.requestFocus();
-        if (cfg.sttAiCorrect) {
-          final spanStart = _voiceSpanStart;
-          final spanEnd = _voiceSpanEnd;
-          final corrected = await stt.correctWithAi(
-            result.text,
-            owner: this,
-            lastReply: widget.session.lastTurnReply,
-            model: widget.session.selected(KernelChoiceKind.model),
-            location: widget.session.kernelContext.cwd,
-          );
-          if (!mounted) return;
-          if (corrected.isNotEmpty &&
-              corrected != result.text.trim() &&
-              spanStart != null &&
-              spanEnd != null &&
-              spanEnd <= _controller.length &&
-              _controller.text.substring(spanStart, spanEnd) == rawInserted) {
-            _voiceSpanStart = spanStart;
-            _voiceSpanEnd = spanEnd;
-            _updateVoiceSpan(corrected, finalizeUndo: true);
-            _focusNode.requestFocus();
-          }
-        }
-        _clearVoiceSpanTracking();
-        if ((cfg.effectiveAutoSend || forceSend) && !_showsStop && _canSend) {
-          _submit();
-        }
+        await _finalizeVoiceTranscript(result.text, forceSend: forceSend);
       } else {
         _restoreVoiceSpanOriginal();
         _clearVoiceSpanTracking();
@@ -1894,14 +2040,42 @@ class ChatComposerState extends State<ChatComposer>
       return;
     }
 
+    final cfg = VoiceSettingsStore.instance.config;
+    if (cfg.sttEngine == VoiceSttEngine.localAi && !LocalSenseVoice.isInstalled) {
+      if (!autoOpened) {
+        notifications?.notify(
+          IdeSeverity.info,
+          isZh
+              ? '尚未安装本地 SenseVoice 语音组件，已为你打开「设置 → 语音」可一键在线下载'
+              : 'Local SenseVoice voice pack not installed yet — opening Voice Settings',
+        );
+        SettingsOpener.maybeOf(context)?.call(SettingsSection.voice);
+      }
+      return;
+    }
+
     _beginVoiceSpan();
     final ok = await stt.start(
       owner: this,
+      autoOpened: autoOpened,
       onAutoStop: () {
         if (mounted &&
             VoiceSttService.instance.isListening &&
             identical(VoiceSttService.instance.activeOwner, this)) {
           unawaited(_toggleVoiceInput());
+        }
+      },
+      onNoSpeechTimeout: () {
+        if (mounted &&
+            VoiceSttService.instance.isListening &&
+            identical(VoiceSttService.instance.activeOwner, this)) {
+          unawaited(_cancelVoiceInput());
+          IdeNotificationsScope.maybeOf(context)?.notify(
+            IdeSeverity.info,
+            isZh
+                ? '长时间未检测到说话，已自动暂停收麦（随时可按快捷键或点麦克风继续）'
+                : 'No speech detected — paused auto-listening',
+          );
         }
       },
     );
@@ -2312,10 +2486,12 @@ class ChatComposerState extends State<ChatComposer>
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            const _VoiceSpeakingBar(),
             _VoiceListeningBar(
               owner: this,
               onStop: () => unawaited(_toggleVoiceInput()),
               onCancel: () => unawaited(_cancelVoiceInput()),
+              onRetry: () => unawaited(_retryLastVoiceRecording()),
             ),
             ComposerImages(
               images: _pool,
@@ -3273,18 +3449,198 @@ class _VoiceWaveform extends StatelessWidget {
   }
 }
 
-/// Compact inline bar inside the top of the composer card while listening or
-/// transcribing, displaying live waveform, elapsed time, and quick controls.
+/// Compact mini playback bar inside the top of the composer card while AI TTS
+/// is speaking, offering one-click Pause/Resume, quick speed toggle, and Stop.
+class _VoiceSpeakingBar extends StatelessWidget {
+  const _VoiceSpeakingBar();
+
+  static const _quickRates = <double>[1.0, 1.25, 1.5];
+
+  static double _nextQuickRate(double current) {
+    for (final rate in _quickRates) {
+      if (rate > current + 0.04) return rate;
+    }
+    return _quickRates.first;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isZh = Localizations.localeOf(context).languageCode == 'zh';
+    final dark = themeColors.dark;
+    return ListenableBuilder(
+      listenable: Listenable.merge([
+        VoiceTtsService.instance,
+        VoiceSettingsStore.instance,
+      ]),
+      builder: (context, _) {
+        final tts = VoiceTtsService.instance;
+        if (!tts.isSpeaking) {
+          return const SizedBox.shrink();
+        }
+        final cfg = VoiceSettingsStore.instance.config;
+        final accent = AppColors.accent;
+        final paused = tts.isPaused;
+        final rateText = '${cfg.ttsRate.toStringAsFixed(cfg.ttsRate % 1 == 0 ? 1 : 2).replaceFirst(RegExp(r'0$'), '')}x';
+
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: accent.withValues(alpha: dark ? 0.12 : 0.08),
+            border: Border(
+              bottom: BorderSide(
+                color: accent.withValues(alpha: dark ? 0.24 : 0.18),
+                width: 0.75,
+              ),
+            ),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                paused ? Codicons.debugPause : Codicons.unmute,
+                size: 13,
+                color: accent,
+              ),
+              const SizedBox(width: 7),
+              Text(
+                paused
+                    ? (isZh ? '已暂停朗读' : 'Paused')
+                    : (isZh ? '正在朗读' : 'Speaking'),
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600,
+                  color: accent,
+                ),
+              ),
+              if (tts.currentSnippet.isNotEmpty) ...[
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    tts.currentSnippet,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      color: AppColors.textMuted,
+                    ),
+                  ),
+                ),
+              ] else
+                const Spacer(),
+              const SizedBox(width: 8),
+              MouseRegion(
+                cursor: SystemMouseCursors.click,
+                child: GestureDetector(
+                  onTap: () => unawaited(
+                    tts.setRate(_nextQuickRate(cfg.ttsRate)),
+                  ),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 7,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: accent.withValues(alpha: 0.14),
+                      borderRadius: BorderRadius.circular(9),
+                    ),
+                    child: Text(
+                      rateText,
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        color: accent,
+                        fontFeatures: const [FontFeature.tabularFigures()],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              if (tts.canPause) ...[
+                const SizedBox(width: 6),
+                MouseRegion(
+                  cursor: SystemMouseCursors.click,
+                  child: GestureDetector(
+                    onTap: () => unawaited(tts.togglePause()),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 7,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: accent.withValues(alpha: 0.14),
+                        borderRadius: BorderRadius.circular(9),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            paused ? Codicons.debugContinue : Codicons.debugPause,
+                            size: 11,
+                            color: accent,
+                          ),
+                          const SizedBox(width: 3),
+                          Text(
+                            paused
+                                ? (isZh ? '继续' : 'Resume')
+                                : (isZh ? '暂停' : 'Pause'),
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                              color: accent,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+              const SizedBox(width: 6),
+              MouseRegion(
+                cursor: SystemMouseCursors.click,
+                child: GestureDetector(
+                  onTap: () => unawaited(tts.stop()),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: accent,
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      isZh ? '停止 (Esc)' : 'Stop (Esc)',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Compact inline bar inside the top of the composer card while listening,
+/// transcribing, AI-correcting, or offering one-click retry on failed audio.
 class _VoiceListeningBar extends StatelessWidget {
   const _VoiceListeningBar({
     required this.owner,
     required this.onStop,
     required this.onCancel,
+    required this.onRetry,
   });
 
   final Object owner;
   final VoidCallback onStop;
   final VoidCallback onCancel;
+  final VoidCallback onRetry;
 
   static String _formatElapsed(Duration d) {
     final mins = d.inMinutes.toString().padLeft(2, '0');
@@ -3303,173 +3659,261 @@ class _VoiceListeningBar extends StatelessWidget {
       ]),
       builder: (context, _) {
         final stt = VoiceSttService.instance;
-        if (!identical(stt.activeOwner, owner) || !stt.isBusy) {
+        final isMineBusy = identical(stt.activeOwner, owner) && stt.isBusy;
+        if (!isMineBusy) {
+          if (!stt.isBusy && stt.canRetryLastRecording && stt.lastError != null) {
+            return Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: AppColors.caution.withValues(alpha: dark ? 0.14 : 0.09),
+                border: Border(
+                  bottom: BorderSide(
+                    color: AppColors.caution.withValues(alpha: 0.25),
+                    width: 0.75,
+                  ),
+                ),
+              ),
+              child: Row(
+                children: [
+                  Icon(Codicons.warning, size: 13, color: AppColors.caution),
+                  const SizedBox(width: 7),
+                  Expanded(
+                    child: Text(
+                      isZh
+                          ? '上次语音转写失败（音频已保留，不会丢失）'
+                          : 'Last transcription failed (audio retained)',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        color: AppColors.text,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  MouseRegion(
+                    cursor: SystemMouseCursors.click,
+                    child: GestureDetector(
+                      onTap: onRetry,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: AppColors.caution,
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Text(
+                          isZh ? '重试转写' : 'Retry',
+                          style: const TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  MouseRegion(
+                    cursor: SystemMouseCursors.click,
+                    child: GestureDetector(
+                      onTap: () => unawaited(stt.clearFailedRecordings()),
+                      child: Icon(
+                        Codicons.close,
+                        size: 13,
+                        color: AppColors.textMuted,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }
           return const SizedBox.shrink();
         }
         final cfg = VoiceSettingsStore.instance.config;
         final listening = stt.isListening;
         final liveText = stt.liveTranscript;
+        final vadProgress = listening ? stt.vadCountdownProgress : 0.0;
         const recRed = Color(0xFFE5484D);
 
-        return Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-          decoration: BoxDecoration(
-            color: (listening ? recRed : AppColors.accent).withValues(
-              alpha: dark ? 0.12 : 0.08,
-            ),
-            border: Border(
-              bottom: BorderSide(
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
                 color: (listening ? recRed : AppColors.accent).withValues(
-                  alpha: dark ? 0.24 : 0.18,
+                  alpha: dark ? 0.12 : 0.08,
                 ),
-                width: 0.75,
+                border: Border(
+                  bottom: BorderSide(
+                    color: (listening ? recRed : AppColors.accent).withValues(
+                      alpha: dark ? 0.24 : 0.18,
+                    ),
+                    width: vadProgress > 0.01 ? 0 : 0.75,
+                  ),
+                ),
+              ),
+              child: Row(
+                children: [
+                  if (listening)
+                    _VoiceWaveform(levels: stt.levelHistory, color: recRed)
+                  else if (stt.isCorrecting)
+                    IdeSpinning(
+                      Icon(Codicons.sparkle, size: 12, color: AppColors.accent),
+                    )
+                  else
+                    IdeSpinning(
+                      Icon(Codicons.loading, size: 12, color: AppColors.accent),
+                    ),
+                  const SizedBox(width: 8),
+                  Text(
+                    listening
+                        ? '${isZh ? '正在聆听' : 'Listening'} ${_formatElapsed(stt.elapsed)}'
+                        : stt.isStarting
+                        ? (isZh ? '正在启动麦克风…' : 'Starting mic…')
+                        : stt.isCorrecting
+                        ? (isZh ? 'AI 正在智能纠错…' : 'AI proofreading…')
+                        : (isZh ? '正在转写语音…' : 'Transcribing…'),
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w600,
+                      color: listening ? recRed : AppColors.accent,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                  if (liveText.isNotEmpty && !cfg.sttStreaming) ...[
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        liveText,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: AppColors.text,
+                        ),
+                      ),
+                    ),
+                  ] else ...[
+                    if (listening) ...[
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          cfg.conversationMode
+                              ? (isZh
+                                    ? '对话模式 · 停顿自动发 · Esc 取消'
+                                    : 'Conversation mode · pauses auto-send · Esc cancels')
+                              : cfg.effectiveVadAutoStop
+                              ? (isZh
+                                    ? '边说边出字 · 停顿自动停 · Enter 发送'
+                                    : 'Live streaming · auto-stops on pause · Enter sends')
+                              : (isZh
+                                    ? '边说边出字 · Enter 完成发送 · Esc 取消'
+                                    : 'Live streaming · Enter sends · Esc cancels'),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            color: AppColors.textMuted,
+                          ),
+                        ),
+                      ),
+                    ] else
+                      const Spacer(),
+                  ],
+                  if (stt.isCorrecting) ...[
+                    const SizedBox(width: 8),
+                    MouseRegion(
+                      cursor: SystemMouseCursors.click,
+                      child: GestureDetector(
+                        onTap: () => stt.skipAiCorrection(),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: AppColors.accent.withValues(alpha: 0.16),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Text(
+                            isZh ? '跳过 (Esc)' : 'Skip (Esc)',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                              color: AppColors.accent,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                  if (listening) ...[
+                    const SizedBox(width: 8),
+                    MouseRegion(
+                      cursor: SystemMouseCursors.click,
+                      child: GestureDetector(
+                        onTap: onCancel,
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 2,
+                          ),
+                          child: Text(
+                            isZh ? '取消' : 'Cancel',
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              color: AppColors.textMuted,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    MouseRegion(
+                      cursor: SystemMouseCursors.click,
+                      child: GestureDetector(
+                        onTap: onStop,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: recRed,
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Text(
+                            isZh ? '完成' : 'Done',
+                            style: const TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w600,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
               ),
             ),
-          ),
-          child: Row(
-            children: [
-              if (listening)
-                _VoiceWaveform(levels: stt.levelHistory, color: recRed)
-              else if (stt.isCorrecting)
-                IdeSpinning(
-                  Icon(Codicons.sparkle, size: 12, color: AppColors.accent),
-                )
-              else
-                IdeSpinning(
-                  Icon(Codicons.loading, size: 12, color: AppColors.accent),
-                ),
-              const SizedBox(width: 8),
-              Text(
-                listening
-                    ? '${isZh ? '正在聆听' : 'Listening'} ${_formatElapsed(stt.elapsed)}'
-                    : stt.isStarting
-                    ? (isZh ? '正在启动麦克风…' : 'Starting mic…')
-                    : stt.isCorrecting
-                    ? (isZh ? 'AI 正在智能纠错…' : 'AI proofreading…')
-                    : (isZh ? '正在转写语音…' : 'Transcribing…'),
-                style: TextStyle(
-                  fontSize: 11.5,
-                  fontWeight: FontWeight.w600,
-                  color: listening ? recRed : AppColors.accent,
-                  fontFeatures: const [FontFeature.tabularFigures()],
+            if (vadProgress > 0.01)
+              SizedBox(
+                height: 2,
+                child: LinearProgressIndicator(
+                  value: vadProgress,
+                  minHeight: 2,
+                  backgroundColor: recRed.withValues(alpha: 0.12),
+                  valueColor: const AlwaysStoppedAnimation<Color>(recRed),
                 ),
               ),
-              if (liveText.isNotEmpty && !cfg.sttStreaming) ...[
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    liveText,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: AppColors.text,
-                    ),
-                  ),
-                ),
-              ] else ...[
-                if (listening) ...[
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      cfg.conversationMode
-                          ? (isZh
-                                ? '对话模式 · 停顿自动发 · Esc 取消'
-                                : 'Conversation mode · pauses auto-send · Esc cancels')
-                          : cfg.effectiveVadAutoStop
-                          ? (isZh
-                                ? '边说边出字 · 停顿自动停 · Enter 发送'
-                                : 'Live streaming · auto-stops on pause · Enter sends')
-                          : (isZh
-                                ? '边说边出字 · Enter 完成发送 · Esc 取消'
-                                : 'Live streaming · Enter sends · Esc cancels'),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        color: AppColors.textMuted,
-                      ),
-                    ),
-                  ),
-                ] else
-                  const Spacer(),
-              ],
-              if (stt.isCorrecting) ...[
-                const SizedBox(width: 8),
-                MouseRegion(
-                  cursor: SystemMouseCursors.click,
-                  child: GestureDetector(
-                    onTap: () => stt.skipAiCorrection(),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 2,
-                      ),
-                      decoration: BoxDecoration(
-                        color: AppColors.accent.withValues(alpha: 0.16),
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: Text(
-                        isZh ? '跳过 (Esc)' : 'Skip (Esc)',
-                        style: TextStyle(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w600,
-                          color: AppColors.accent,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-              if (listening) ...[
-                const SizedBox(width: 8),
-                MouseRegion(
-                  cursor: SystemMouseCursors.click,
-                  child: GestureDetector(
-                    onTap: onCancel,
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 6,
-                        vertical: 2,
-                      ),
-                      child: Text(
-                        isZh ? '取消' : 'Cancel',
-                        style: TextStyle(
-                          fontSize: 11.5,
-                          color: AppColors.textMuted,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 4),
-                MouseRegion(
-                  cursor: SystemMouseCursors.click,
-                  child: GestureDetector(
-                    onTap: onStop,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 2,
-                      ),
-                      decoration: BoxDecoration(
-                        color: recRed,
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: Text(
-                        isZh ? '完成' : 'Done',
-                        style: const TextStyle(
-                          fontSize: 11.5,
-                          fontWeight: FontWeight.w600,
-                          color: Colors.white,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ],
-          ),
+          ],
         );
       },
     );

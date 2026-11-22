@@ -67,6 +67,8 @@ class VoiceConfig {
     this.sttVadAutoStop = false,
     this.sttVadSilenceMs = defaultVadSilenceMs,
     this.sttGlossary = '',
+    this.sttInputDeviceId = -1,
+    this.earcons = true,
     this.sttAutoSend = false,
     this.sttApiBaseUrl = defaultApiBaseUrl,
     this.sttModel = defaultSttModel,
@@ -99,6 +101,8 @@ class VoiceConfig {
   static const sttVadAutoStopKey = 'voice.stt.vadAutoStop';
   static const sttVadSilenceMsKey = 'voice.stt.vadSilenceMs';
   static const sttGlossaryKey = 'voice.stt.glossary';
+  static const sttInputDeviceIdKey = 'voice.stt.inputDeviceId';
+  static const earconsKey = 'voice.earcons';
   static const sttAutoSendKey = 'voice.stt.autoSend';
   static const sttApiBaseUrlKey = 'voice.stt.apiBaseUrl';
   static const sttModelKey = 'voice.stt.model';
@@ -168,6 +172,8 @@ class VoiceConfig {
   final bool sttVadAutoStop;
   final int sttVadSilenceMs;
   final String sttGlossary;
+  final int sttInputDeviceId;
+  final bool earcons;
   final bool sttAutoSend;
   final String sttApiBaseUrl;
   final String sttModel;
@@ -212,6 +218,11 @@ class VoiceConfig {
       sttGlossary: read(sttGlossaryKey) is String
           ? (read(sttGlossaryKey) as String).trim()
           : '',
+      sttInputDeviceId: switch (read(sttInputDeviceIdKey)) {
+        final num n => n.toInt(),
+        _ => -1,
+      },
+      earcons: read(earconsKey) != false,
       sttAutoSend: read(sttAutoSendKey) == true,
       sttApiBaseUrl: _nonEmptyString(
         read(sttApiBaseUrlKey),
@@ -254,6 +265,8 @@ class VoiceConfig {
     bool? sttVadAutoStop,
     int? sttVadSilenceMs,
     String? sttGlossary,
+    int? sttInputDeviceId,
+    bool? earcons,
     bool? sttAutoSend,
     String? sttApiBaseUrl,
     String? sttModel,
@@ -277,6 +290,8 @@ class VoiceConfig {
     sttVadAutoStop: sttVadAutoStop ?? this.sttVadAutoStop,
     sttVadSilenceMs: sttVadSilenceMs ?? this.sttVadSilenceMs,
     sttGlossary: sttGlossary ?? this.sttGlossary,
+    sttInputDeviceId: sttInputDeviceId ?? this.sttInputDeviceId,
+    earcons: earcons ?? this.earcons,
     sttAutoSend: sttAutoSend ?? this.sttAutoSend,
     sttApiBaseUrl: sttApiBaseUrl ?? this.sttApiBaseUrl,
     sttModel: sttModel ?? this.sttModel,
@@ -310,6 +325,9 @@ class VoiceConfig {
     sttVadSilenceMsKey:
         sttVadSilenceMs == defaults.sttVadSilenceMs ? null : sttVadSilenceMs,
     sttGlossaryKey: sttGlossary == defaults.sttGlossary ? null : sttGlossary,
+    sttInputDeviceIdKey:
+        sttInputDeviceId == defaults.sttInputDeviceId ? null : sttInputDeviceId,
+    earconsKey: earcons == defaults.earcons ? null : earcons,
     sttAutoSendKey: sttAutoSend == defaults.sttAutoSend ? null : sttAutoSend,
     sttApiBaseUrlKey:
         sttApiBaseUrl == defaults.sttApiBaseUrl ? null : sttApiBaseUrl,
@@ -343,6 +361,8 @@ class VoiceConfig {
       other.sttVadAutoStop == sttVadAutoStop &&
       other.sttVadSilenceMs == sttVadSilenceMs &&
       other.sttGlossary == sttGlossary &&
+      other.sttInputDeviceId == sttInputDeviceId &&
+      other.earcons == earcons &&
       other.sttAutoSend == sttAutoSend &&
       other.sttApiBaseUrl == sttApiBaseUrl &&
       other.sttModel == sttModel &&
@@ -368,6 +388,8 @@ class VoiceConfig {
     sttVadAutoStop,
     sttVadSilenceMs,
     sttGlossary,
+    sttInputDeviceId,
+    earcons,
     sttAutoSend,
     sttApiBaseUrl,
     sttModel,
