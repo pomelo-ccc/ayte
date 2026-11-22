@@ -280,6 +280,13 @@ class VoiceModelInstaller extends ChangeNotifier {
         if (entity.path != managedUv) {
           await entity.copy(managedUv);
         }
+        if (!Platform.isWindows) {
+          try {
+            await Process.run('chmod', ['+x', managedUv]);
+          } on Object {
+            // Best-effort permission bit restore on macOS/Linux.
+          }
+        }
         return managedUv;
       }
     }

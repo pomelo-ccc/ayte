@@ -83,6 +83,8 @@
 	     entry under Privacy & Security → Automation. -->
 	<key>NSAppleEventsUsageDescription</key>
 	<string>A program run in Ayte wants to control another app.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Ayte uses your microphone for voice input and hands-free voice conversation.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>$(PRODUCT_COPYRIGHT)</string>
 	<key>NSMainNibFile</key>

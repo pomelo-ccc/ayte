@@ -539,7 +539,7 @@ class VoiceSttService extends ChangeNotifier {
   Future<void> _startSystemStt(VoiceConfig config) async {
     if (!Platform.isWindows) {
       throw StateError(
-        '系统内置离线语音识别当前仅支持 Windows；macOS/Linux 请在「设置 → 语音」切换为自定义 OpenAI 兼容语音 API（Whisper）。',
+        '系统内置离线语音识别（SAPI）当前仅支持 Windows；macOS/Linux 请使用本地 SenseVoice AI（推荐，可一键在线安装）或自定义 OpenAI 兼容语音 API。',
       );
     }
 

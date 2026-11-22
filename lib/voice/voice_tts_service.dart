@@ -286,7 +286,8 @@ if __name__ == "__main__":
         // Ignore already-exited process.
       }
     }
-    if (Platform.isWindows && (_usingNativeAudio || _nativePlayDone != null)) {
+    if ((Platform.isWindows || Platform.isMacOS) &&
+        (_usingNativeAudio || _nativePlayDone != null)) {
       try {
         await _channel.invokeMethod<bool>('stopAudio');
       } on Object {
@@ -848,15 +849,15 @@ try {
   }
 
   Future<void> _playAudioFile(String filePath, {required int gen}) async {
-    if (Platform.isWindows) {
-      final playedNative = await _tryPlayWindowsNative(filePath, gen: gen);
+    if (Platform.isWindows || Platform.isMacOS) {
+      final playedNative = await _tryPlayNative(filePath, gen: gen);
       if (playedNative) return;
       if (gen != _generation) return;
-      await _playWindowsPowerShellFallback(filePath, gen: gen);
-      return;
-    }
-    if (Platform.isMacOS) {
-      await _runProcess('/usr/bin/afplay', [filePath], gen: gen);
+      if (Platform.isWindows) {
+        await _playWindowsPowerShellFallback(filePath, gen: gen);
+      } else {
+        await _runProcess('/usr/bin/afplay', [filePath], gen: gen);
+      }
       return;
     }
     if (Platform.isLinux) {
@@ -875,7 +876,7 @@ try {
     }
   }
 
-  Future<bool> _tryPlayWindowsNative(
+  Future<bool> _tryPlayNative(
     String filePath, {
     required int gen,
   }) async {

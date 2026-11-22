@@ -44,11 +44,15 @@ class WavRecorder {
   bool get isRecording => _recording;
   String? get activeFilePath => _recording ? _outputPath : null;
 
-  /// Lists available microphone input devices on Windows (empty on other OSes).
+  static bool get _supportsNativeChannel =>
+      Platform.isWindows || Platform.isMacOS;
+
+  /// Lists available microphone input devices on Windows and macOS.
   static Future<List<VoiceInputDevice>> listInputDevices({
     MethodChannel? channel,
   }) async {
-    if (Platform.environment['FLUTTER_TEST'] == 'true' || !Platform.isWindows) {
+    if (Platform.environment['FLUTTER_TEST'] == 'true' ||
+        !_supportsNativeChannel) {
       return const [];
     }
     try {
@@ -71,9 +75,11 @@ class WavRecorder {
     }
   }
 
-  /// Plays a gentle synthesized UI earcon (`start`, `stop`, `exit`) on Windows.
+  /// Plays a gentle synthesized UI earcon (`start`, `stop`, `exit`) on Windows
+  /// and macOS.
   static Future<void> playEarcon(String kind, {MethodChannel? channel}) async {
-    if (Platform.environment['FLUTTER_TEST'] == 'true' || !Platform.isWindows) {
+    if (Platform.environment['FLUTTER_TEST'] == 'true' ||
+        !_supportsNativeChannel) {
       return;
     }
     try {
@@ -84,7 +90,8 @@ class WavRecorder {
   }
 
   /// Reads real-time microphone RMS level (0.0..1.0), VAD silence duration,
-  /// and total captured duration from Windows native C++ `waveIn` recording.
+  /// and total captured duration from the native audio channel (Windows
+  /// `waveIn` / macOS `AVAudioEngine`).
   Future<({double level, int silenceMs, int totalMs, bool heardSpeech})?>
   readMetrics() async {
     if (!_recording || !_usingNativeWindows) return null;
@@ -114,17 +121,19 @@ class WavRecorder {
     _usingNativeWindows = false;
 
     if (Platform.isWindows) {
-      final startedNative = await _tryStartWindowsNative(
-        wavPath,
-        deviceId: deviceId,
-      );
+      final startedNative = await _tryStartNative(wavPath, deviceId: deviceId);
       if (startedNative) {
         _usingNativeWindows = true;
       } else {
         await _startWindowsPowerShell(wavPath);
       }
     } else if (Platform.isMacOS) {
-      await _startUnix(wavPath, macos: true);
+      final startedNative = await _tryStartNative(wavPath, deviceId: deviceId);
+      if (startedNative) {
+        _usingNativeWindows = true;
+      } else {
+        await _startUnix(wavPath, macos: true);
+      }
     } else if (Platform.isLinux) {
       await _startUnix(wavPath, macos: false);
     } else {
@@ -240,7 +249,7 @@ class WavRecorder {
     }
   }
 
-  Future<bool> _tryStartWindowsNative(
+  Future<bool> _tryStartNative(
     String wavPath, {
     int deviceId = -1,
   }) async {

@@ -19,7 +19,7 @@ enum VoiceSttEngine {
   openaiCompatible;
 
   static VoiceSttEngine get platformDefault =>
-      !kIsWeb && Platform.isWindows ? localAi : system;
+      !kIsWeb && (Platform.isWindows || Platform.isMacOS) ? localAi : system;
 
   static VoiceSttEngine parse(Object? raw) => switch (raw) {
     'localAi' => localAi,
@@ -42,7 +42,7 @@ enum VoiceTtsEngine {
   openaiCompatible;
 
   static VoiceTtsEngine get platformDefault =>
-      !kIsWeb && Platform.isWindows ? edgeNeural : system;
+      !kIsWeb && (Platform.isWindows || Platform.isMacOS) ? edgeNeural : system;
 
   static VoiceTtsEngine parse(Object? raw) => switch (raw) {
     'edgeNeural' => edgeNeural,

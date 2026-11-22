@@ -1,5 +1,8 @@
+import AudioToolbox
+import AVFoundation
 import Carbon
 import Cocoa
+import CoreAudio
 import FlutterMacOS
 import Vision
 
@@ -428,6 +431,7 @@ final class StashChannel {
 
   private let channel: FlutterMethodChannel
   private let voiceChannel: FlutterMethodChannel
+  private let voiceAudio = VoiceAudioController()
 
   init(messenger: FlutterBinaryMessenger) {
     channel = FlutterMethodChannel(name: "baocode/stash", binaryMessenger: messenger)
@@ -437,6 +441,9 @@ final class StashChannel {
     voiceChannel = FlutterMethodChannel(name: "baocode/voice", binaryMessenger: messenger)
     voiceChannel.setMethodCallHandler { [weak self] call, result in
       self?.handleVoice(call, result: result) ?? result(nil)
+    }
+    voiceAudio.onPlaybackDone = { [weak self] playId in
+      self?.voiceChannel.invokeMethod("playbackDone", arguments: playId)
     }
     StashHotkey.shared.onPress = { [weak self] in self?.pressed() }
     StashHotkey.shared.onVoicePress = { [weak self] in self?.voicePressed() }
@@ -454,6 +461,61 @@ final class StashChannel {
     switch call.method {
     case "setHotkey":
       result(StashHotkey.shared.registerVoice(call.arguments as? String ?? ""))
+    case "startRecording":
+      var path = ""
+      var deviceId = -1
+      if let rawPath = call.arguments as? String {
+        path = rawPath
+      } else if let map = call.arguments as? [String: Any] {
+        path = map["path"] as? String ?? ""
+        if let idNum = map["deviceId"] as? NSNumber {
+          deviceId = idNum.intValue
+        }
+      }
+      voiceAudio.startRecording(path: path, deviceId: deviceId) { err in
+        if let err {
+          result(FlutterError(code: "MAC_RECORD_START", message: err, details: nil))
+        } else {
+          result(true)
+        }
+      }
+    case "stopRecording":
+      if let err = voiceAudio.stopRecording() {
+        result(FlutterError(code: "MAC_RECORD_STOP", message: err, details: nil))
+      } else {
+        result(true)
+      }
+    case "cancelRecording":
+      voiceAudio.cancelRecording()
+      result(true)
+    case "recordingMetrics":
+      result(voiceAudio.recordingMetrics())
+    case "listInputDevices":
+      result(voiceAudio.listInputDevices())
+    case "playAudio":
+      var path = ""
+      var playId = 0
+      if let map = call.arguments as? [String: Any] {
+        path = map["path"] as? String ?? ""
+        if let idNum = map["id"] as? NSNumber {
+          playId = idNum.intValue
+        }
+      }
+      if let err = voiceAudio.playAudio(path: path, playId: playId) {
+        result(FlutterError(code: "MAC_AUDIO_PLAY", message: err, details: nil))
+      } else {
+        result(true)
+      }
+    case "pauseAudio":
+      result(voiceAudio.pauseAudio())
+    case "resumeAudio":
+      result(voiceAudio.resumeAudio())
+    case "stopAudio":
+      voiceAudio.stopAudio()
+      result(true)
+    case "playEarcon":
+      voiceAudio.playEarcon(kind: call.arguments as? String ?? "start")
+      result(true)
     default:
       result(FlutterMethodNotImplemented)
     }
@@ -511,5 +573,462 @@ final class StashChannel {
       }
       DispatchQueue.main.async { result(text) }
     }
+  }
+}
+
+// MARK: - Native macOS Voice Audio (AVAudioEngine + AVAudioPlayer + CoreAudio)
+
+/// Native macOS audio recorder (16kHz 16-bit mono streaming PCM WAV with
+/// adaptive ambient noise floor VAD & selectable CoreAudio microphone),
+/// low-latency MP3/WAV playback with Pause/Resume/Stop, and synthesized
+/// UI earcons — providing full feature parity with Windows `stash_channel.cpp`.
+final class VoiceAudioController: NSObject, AVAudioPlayerDelegate {
+  var onPlaybackDone: ((Int) -> Void)?
+
+  private static let sampleRate: Double = 16000.0
+  private static let sampleRateUInt32: UInt32 = 16000
+
+  private let lock = NSLock()
+  private var engine: AVAudioEngine?
+  private var fileHandle: FileHandle?
+  private var recording = false
+  private var dataBytes: UInt32 = 0
+  private var level: Double = 0.0
+  private var silenceMs: UInt32 = 0
+  private var totalMs: UInt32 = 0
+  private var heardSpeech = false
+  private var noiseFloorRms: Double = 0.006
+  private var calibratedMs: UInt32 = 0
+
+  private var audioPlayer: AVAudioPlayer?
+  private var earconPlayer: AVAudioPlayer?
+  private var activePlayId: Int = 0
+
+  deinit {
+    cancelRecording()
+    stopAudio()
+  }
+
+  // MARK: Microphone device enumeration (CoreAudio)
+
+  func listInputDevices() -> [[String: Any]] {
+    var devicesAddr = AudioObjectPropertyAddress(
+      mSelector: kAudioHardwarePropertyDevices,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: AudioObjectPropertyElement(0))
+    var dataSize: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(
+      AudioObjectID(kAudioObjectSystemObject),
+      &devicesAddr, 0, nil, &dataSize) == noErr,
+      dataSize > 0
+    else { return [] }
+
+    let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
+    var deviceIDs = [AudioDeviceID](repeating: 0, count: count)
+    guard AudioObjectGetPropertyData(
+      AudioObjectID(kAudioObjectSystemObject),
+      &devicesAddr, 0, nil, &dataSize, &deviceIDs) == noErr
+    else { return [] }
+
+    var devices: [[String: Any]] = []
+    for deviceID in deviceIDs {
+      guard Self.inputChannelCount(for: deviceID) > 0,
+            let name = Self.deviceName(for: deviceID),
+            !name.isEmpty
+      else { continue }
+      devices.append([
+        "id": Int(deviceID),
+        "name": name,
+      ])
+    }
+    return devices
+  }
+
+  private static func inputChannelCount(for deviceID: AudioDeviceID) -> UInt32 {
+    var addr = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyStreamConfiguration,
+      mScope: kAudioDevicePropertyScopeInput,
+      mElement: AudioObjectPropertyElement(0))
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(deviceID, &addr, 0, nil, &size) == noErr,
+          size > 0
+    else { return 0 }
+
+    let rawPtr = UnsafeMutableRawPointer.allocate(
+      byteCount: Int(size),
+      alignment: MemoryLayout<AudioBufferList>.alignment)
+    defer { rawPtr.deallocate() }
+
+    guard AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, rawPtr) == noErr
+    else { return 0 }
+
+    let buffers = UnsafeMutableAudioBufferListPointer(
+      rawPtr.bindMemory(to: AudioBufferList.self, capacity: 1))
+    var total: UInt32 = 0
+    for buf in buffers {
+      total &+= buf.mNumberChannels
+    }
+    return total
+  }
+
+  private static func deviceName(for deviceID: AudioDeviceID) -> String? {
+    var cfName: Unmanaged<CFString>?
+    var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    var addr = AudioObjectPropertyAddress(
+      mSelector: kAudioObjectPropertyName,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: AudioObjectPropertyElement(0))
+    guard AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &cfName) == noErr,
+          let name = cfName?.takeRetainedValue() as String?
+    else { return nil }
+    return name.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  // MARK: Streaming 16kHz PCM WAV Recording + Adaptive VAD
+
+  func startRecording(path: String, deviceId: Int, completion: @escaping (String?) -> Void) {
+    guard !path.isEmpty else {
+      completion("录音输出路径为空")
+      return
+    }
+    switch AVCaptureDevice.authorizationStatus(for: .audio) {
+    case .authorized:
+      completion(startRecordingAuthorized(path: path, deviceId: deviceId))
+    case .notDetermined:
+      AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+        DispatchQueue.main.async {
+          guard let self else {
+            completion("录音会话已释放")
+            return
+          }
+          if granted {
+            completion(self.startRecordingAuthorized(path: path, deviceId: deviceId))
+          } else {
+            completion("麦克风权限未授权，请在「系统设置 → 隐私与安全性 → 麦克风」允许 Ayte 访问麦克风")
+          }
+        }
+      }
+    case .denied, .restricted:
+      completion("麦克风权限被拒绝，请在「系统设置 → 隐私与安全性 → 麦克风」允许 Ayte 访问麦克风")
+    @unknown default:
+      completion("无法获取麦克风访问权限")
+    }
+  }
+
+  private func startRecordingAuthorized(path: String, deviceId: Int) -> String? {
+    cancelRecording()
+
+    guard FileManager.default.createFile(atPath: path, contents: nil),
+          let handle = FileHandle(forWritingAtPath: path)
+    else {
+      return "无法创建录音文件"
+    }
+    do {
+      try handle.write(contentsOf: Self.buildWavHeader(dataBytes: 0))
+    } catch {
+      try? handle.close()
+      return "写入录音文件头失败: \(error.localizedDescription)"
+    }
+
+    let newEngine = AVAudioEngine()
+    let inputNode = newEngine.inputNode
+    if deviceId >= 0, let audioUnit = inputNode.audioUnit {
+      var devID = AudioDeviceID(deviceId)
+      _ = AudioUnitSetProperty(
+        audioUnit,
+        kAudioOutputUnitProperty_CurrentDevice,
+        kAudioUnitScope_Global,
+        0,
+        &devID,
+        UInt32(MemoryLayout<AudioDeviceID>.size))
+    }
+
+    let hwFormat = inputNode.outputFormat(forBus: 0)
+    guard hwFormat.sampleRate > 0, hwFormat.channelCount > 0 else {
+      try? handle.close()
+      return "未检测到可用的麦克风输入格式"
+    }
+    guard let targetFormat = AVAudioFormat(
+      commonFormat: .pcmFormatInt16,
+      sampleRate: Self.sampleRate,
+      channels: 1,
+      interleaved: true),
+      let converter = AVAudioConverter(from: hwFormat, to: targetFormat)
+    else {
+      try? handle.close()
+      return "无法初始化音频重采样器"
+    }
+
+    lock.lock()
+    engine = newEngine
+    fileHandle = handle
+    recording = true
+    dataBytes = 0
+    level = 0.0
+    silenceMs = 0
+    totalMs = 0
+    heardSpeech = false
+    noiseFloorRms = 0.006
+    calibratedMs = 0
+    lock.unlock()
+
+    let ratio = Self.sampleRate / hwFormat.sampleRate
+    inputNode.installTap(onBus: 0, bufferSize: 2048, format: hwFormat) { [weak self] buffer, _ in
+      guard let self else { return }
+      let outCapacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * ratio)) + 64
+      guard let outBuffer = AVAudioPCMBuffer(
+        pcmFormat: targetFormat,
+        frameCapacity: max(outCapacity, 256))
+      else { return }
+
+      var consumed = false
+      var convError: NSError?
+      let status = converter.convert(to: outBuffer, error: &convError) { _, outStatus in
+        if consumed {
+          outStatus.pointee = .noDataNow
+          return nil
+        }
+        consumed = true
+        outStatus.pointee = .haveData
+        return buffer
+      }
+      guard (status == .haveData || status == .inputRanDry),
+            outBuffer.frameLength > 0,
+            let pcm = outBuffer.int16ChannelData?.pointee
+      else { return }
+
+      let sampleCount = Int(outBuffer.frameLength)
+      let byteCount = sampleCount * 2
+      let chunk = Data(bytes: pcm, count: byteCount)
+
+      var sumSq: Double = 0.0
+      for i in 0..<sampleCount {
+        let norm = Double(pcm[i]) / 32768.0
+        sumSq += norm * norm
+      }
+      let rms = sqrt(sumSq / Double(sampleCount))
+      let chunkMs = UInt32((sampleCount * 1000) / Int(Self.sampleRateUInt32))
+
+      self.lock.lock()
+      defer { self.lock.unlock() }
+      guard self.recording, let fh = self.fileHandle else { return }
+      try? fh.write(contentsOf: chunk)
+      self.dataBytes &+= UInt32(byteCount)
+      self.totalMs &+= chunkMs
+
+      if self.calibratedMs < 260 {
+        self.noiseFloorRms = self.calibratedMs == 0
+          ? rms
+          : (self.noiseFloorRms * 0.5 + rms * 0.5)
+        self.calibratedMs &+= chunkMs
+      }
+      let speechThreshold = max(0.011, min(0.085, self.noiseFloorRms * 2.4))
+      let visualRms = max(0.0, rms - self.noiseFloorRms * 0.7)
+      self.level = min(1.0, visualRms * 6.0)
+
+      if rms >= speechThreshold {
+        self.heardSpeech = true
+        self.silenceMs = 0
+      } else {
+        self.noiseFloorRms = self.noiseFloorRms * 0.92 + rms * 0.08
+        if self.heardSpeech {
+          self.silenceMs &+= chunkMs
+        }
+      }
+    }
+
+    newEngine.prepare()
+    do {
+      try newEngine.start()
+      return nil
+    } catch {
+      cancelRecording()
+      return "启动麦克风录音失败: \(error.localizedDescription)"
+    }
+  }
+
+  func stopRecording() -> String? {
+    lock.lock()
+    if !recording {
+      lock.unlock()
+      return "Not recording"
+    }
+    recording = false
+    let activeEngine = engine
+    engine = nil
+    let activeHandle = fileHandle
+    fileHandle = nil
+    let finalBytes = dataBytes
+    lock.unlock()
+
+    activeEngine?.inputNode.removeTap(onBus: 0)
+    activeEngine?.stop()
+
+    if let fh = activeHandle {
+      do {
+        try fh.seek(toOffset: 0)
+        try fh.write(contentsOf: Self.buildWavHeader(dataBytes: finalBytes))
+        try fh.close()
+      } catch {
+        try? fh.close()
+        return "保存录音文件失败: \(error.localizedDescription)"
+      }
+    }
+    return nil
+  }
+
+  func cancelRecording() {
+    lock.lock()
+    recording = false
+    let activeEngine = engine
+    engine = nil
+    let activeHandle = fileHandle
+    fileHandle = nil
+    lock.unlock()
+
+    activeEngine?.inputNode.removeTap(onBus: 0)
+    activeEngine?.stop()
+    try? activeHandle?.close()
+  }
+
+  func recordingMetrics() -> [String: Any] {
+    lock.lock()
+    defer { lock.unlock() }
+    return [
+      "level": level,
+      "silenceMs": Int(silenceMs),
+      "totalMs": Int(totalMs),
+      "heardSpeech": heardSpeech,
+    ]
+  }
+
+  // MARK: Native Audio Playback (AVAudioPlayer) + Earcons
+
+  func playAudio(path: String, playId: Int) -> String? {
+    stopAudio()
+    guard !path.isEmpty else { return "Empty audio path" }
+    do {
+      let player = try AVAudioPlayer(contentsOf: URL(fileURLWithPath: path))
+      player.delegate = self
+      player.prepareToPlay()
+      guard player.play() else {
+        return "无法播放音频文件"
+      }
+      audioPlayer = player
+      activePlayId = playId
+      return nil
+    } catch {
+      return "播放音频失败: \(error.localizedDescription)"
+    }
+  }
+
+  func pauseAudio() -> Bool {
+    guard let player = audioPlayer, player.isPlaying else { return false }
+    player.pause()
+    return true
+  }
+
+  func resumeAudio() -> Bool {
+    guard let player = audioPlayer, !player.isPlaying else { return false }
+    return player.play()
+  }
+
+  func stopAudio() {
+    if let player = audioPlayer {
+      player.delegate = nil
+      player.stop()
+    }
+    audioPlayer = nil
+  }
+
+  func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+    guard player === audioPlayer else { return }
+    let finishedId = activePlayId
+    audioPlayer = nil
+    DispatchQueue.main.async { [weak self] in
+      self?.onPlaybackDone?(finishedId)
+    }
+  }
+
+  func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+    guard player === audioPlayer else { return }
+    let finishedId = activePlayId
+    audioPlayer = nil
+    DispatchQueue.main.async { [weak self] in
+      self?.onPlaybackDone?(finishedId)
+    }
+  }
+
+  func playEarcon(kind: String) {
+    let wav = Self.buildEarconWav(kind: kind)
+    guard !wav.isEmpty else { return }
+    earconPlayer?.stop()
+    if let player = try? AVAudioPlayer(data: wav) {
+      player.volume = 0.75
+      player.prepareToPlay()
+      _ = player.play()
+      earconPlayer = player
+    }
+  }
+
+  // MARK: PCM WAV & Earcon Helpers
+
+  private static func appendLE<T: FixedWidthInteger>(_ data: inout Data, _ value: T) {
+    var little = value.littleEndian
+    withUnsafeBytes(of: &little) { data.append(contentsOf: $0) }
+  }
+
+  private static func buildWavHeader(dataBytes: UInt32) -> Data {
+    var header = Data(capacity: 44)
+    header.append(contentsOf: [0x52, 0x49, 0x46, 0x46])  // "RIFF"
+    appendLE(&header, UInt32(36) &+ dataBytes)
+    header.append(contentsOf: [0x57, 0x41, 0x56, 0x45])  // "WAVE"
+    header.append(contentsOf: [0x66, 0x6D, 0x74, 0x20])  // "fmt "
+    appendLE(&header, UInt32(16))
+    appendLE(&header, UInt16(1))                         // PCM
+    appendLE(&header, UInt16(1))                         // Mono
+    appendLE(&header, sampleRateUInt32)                  // 16000 Hz
+    appendLE(&header, sampleRateUInt32 * 2)              // ByteRate
+    appendLE(&header, UInt16(2))                         // BlockAlign
+    appendLE(&header, UInt16(16))                        // BitsPerSample
+    header.append(contentsOf: [0x64, 0x61, 0x74, 0x61])  // "data"
+    appendLE(&header, dataBytes)
+    return header
+  }
+
+  private static func buildEarconWav(kind: String) -> Data {
+    let tones: [(freq: Double, ms: Double, amp: Double)]
+    switch kind {
+    case "start":
+      tones = [(660.0, 52.0, 0.14), (880.0, 62.0, 0.14)]
+    case "stop":
+      tones = [(780.0, 48.0, 0.13), (580.0, 62.0, 0.13)]
+    default:
+      tones = [(740.0, 55.0, 0.13), (587.0, 55.0, 0.13), (440.0, 90.0, 0.14)]
+    }
+    var samples: [Int16] = []
+    for tone in tones {
+      let count = Int((tone.ms / 1000.0) * sampleRate)
+      let fade = min(count / 4, 160)
+      for i in 0..<count {
+        var env = 1.0
+        if fade > 0 {
+          if i < fade {
+            env = Double(i) / Double(fade)
+          } else if i + fade > count {
+            env = Double(count - i) / Double(fade)
+          }
+        }
+        let phase = 2.0 * Double.pi * tone.freq * Double(i) / sampleRate
+        let val = sin(phase) * tone.amp * env
+        samples.append(Int16(max(-32767.0, min(32767.0, val * 32767.0))))
+      }
+    }
+    let byteCount = UInt32(samples.count * 2)
+    var wav = buildWavHeader(dataBytes: byteCount)
+    samples.withUnsafeBytes { raw in
+      wav.append(contentsOf: raw)
+    }
+    return wav
   }
 }

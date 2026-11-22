@@ -422,12 +422,12 @@ class _VoiceSettingsPageState extends State<VoiceSettingsPage> {
                     ],
                   ),
                 ),
-                if (AppPlatform.isWindows)
+                if (AppPlatform.isWindows || AppPlatform.isMacOS)
                   SettingsRow(
                     label: isZh ? '麦克风输入设备' : 'Microphone Input Device',
                     description: isZh
                         ? '接有耳机麦、外置 USB 麦克风或虚拟声卡时可在此指定输入源'
-                        : 'Select a specific microphone or keep the Windows default',
+                        : 'Select a specific microphone or keep the system default',
                     trailing: SettingsDropdown(
                       current: inputDeviceLabel,
                       semanticLabel: inputDeviceLabel,
