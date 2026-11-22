@@ -8,10 +8,13 @@
 #include <flutter/method_result.h>
 #include <windows.h>
 
+#include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 
 // `baocode/stash` (see lib/stash/stash_host.dart; the macOS app answers the
@@ -57,13 +60,36 @@ class StashChannel {
   bool Register(const std::string& spec);
   void Unregister();
 
+  void HandleVoiceMethodCall(
+      const flutter::MethodCall<flutter::EncodableValue>& call,
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  bool RegisterVoice(const std::string& spec);
+  void UnregisterVoice();
+  std::string StartVoiceRecording(const std::string& utf8_path);
+  std::string StopVoiceRecording();
+  void CancelVoiceRecording();
+
   // Runs |task| on the platform thread, from any other.
   static void Post(HWND window, std::function<void()> task);
 
   HWND window_;
   bool registered_ = false;
+  bool voice_registered_ = false;
+  bool voice_recording_ = false;
+  std::wstring voice_recording_path_;
+  void* wave_in_ = nullptr;
+  HANDLE wave_event_ = nullptr;
+  HANDLE wave_file_ = INVALID_HANDLE_VALUE;
+  std::atomic<bool> wave_stop_{false};
+  std::atomic<uint32_t> wave_data_bytes_{0};
+  std::atomic<int> wave_level_milli_{0};
+  std::atomic<uint32_t> wave_silence_ms_{0};
+  std::atomic<bool> wave_heard_speech_{false};
+  std::thread wave_thread_;
 
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel_;
+  std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
+      voice_channel_;
 };
 
 #endif  // RUNNER_STASH_CHANNEL_H_

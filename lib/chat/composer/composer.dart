@@ -51,6 +51,10 @@ import '../../ide/file_service.dart'
     show IdeFileService, TransferCancelledException;
 import '../../ide/ide_notifications.dart';
 import '../../ide/transfer_progress.dart';
+import '../../platform/app_platform.dart';
+import '../../voice/voice_hotkey.dart';
+import '../../voice/voice_settings.dart';
+import '../../voice/voice_stt_service.dart';
 import 'remote_drops.dart';
 
 /// An open query: a /command's (a slash starting a word), or a mention's
@@ -370,6 +374,15 @@ class ChatComposerState extends State<ChatComposer>
     _focusNode.addListener(_handleFocusChanged);
     widget.draft?.addListener(_handleDraftChanged);
     ComposerPolishSetting.changes?.addListener(_handleSettingsChanged);
+    VoiceSettingsStore.instance.addListener(_handleSettingsChanged);
+    VoiceSttService.instance.addListener(_handleVoiceStreamChanged);
+    if (widget.onSubmit == null) {
+      VoiceHotkeyService.instance.registerComposer(
+        this,
+        onTrigger: _triggerVoiceFromHotkey,
+        isFocused: () => _focusNode.hasFocus,
+      );
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _focusNode.requestFocus();
@@ -397,6 +410,12 @@ class ChatComposerState extends State<ChatComposer>
   void dispose() {
     widget.draft?.removeListener(_handleDraftChanged);
     ComposerPolishSetting.changes?.removeListener(_handleSettingsChanged);
+    VoiceSettingsStore.instance.removeListener(_handleSettingsChanged);
+    VoiceSttService.instance.removeListener(_handleVoiceStreamChanged);
+    VoiceHotkeyService.instance.unregisterComposer(this);
+    if (identical(VoiceSttService.instance.activeOwner, this)) {
+      unawaited(VoiceSttService.instance.cancel());
+    }
     FloatingRegistry.closePopover(_menuOwner);
     _clickWindow?.cancel();
     _controller.dispose();
@@ -929,6 +948,9 @@ class ChatComposerState extends State<ChatComposer>
     if (!_focusNode.hasFocus) {
       _closeMenu();
     } else {
+      if (widget.onSubmit == null) {
+        VoiceHotkeyService.instance.markActive(this);
+      }
       // Focused, the caret in view: an edit's opens scrolled to its end.
       WidgetsBinding.instance.addPostFrameCallback((_) {
         final selection = _controller.selection;
@@ -1105,6 +1127,11 @@ class ChatComposerState extends State<ChatComposer>
   void _editorChanged() {
     // The placeholder of a drag coming and going: not the user's edit.
     if (_ghosting) return;
+    if (!_voiceUpdatingText &&
+        VoiceSttService.instance.isCorrecting &&
+        identical(VoiceSttService.instance.activeOwner, this)) {
+      VoiceSttService.instance.skipAiCorrection();
+    }
     if (_padTrailingTokens()) return; // Re-entered with the fixed text.
     _images = _referredImages();
     _lag.time('draft', _saveDraft);
@@ -1335,6 +1362,38 @@ class ChatComposerState extends State<ChatComposer>
   KeyEventResult _handleKey(KeyEvent event) {
     if (event is! KeyUpEvent) _lag.begin('key');
     if (event is KeyUpEvent || _isComposing) return KeyEventResult.ignored;
+    if (event is KeyDownEvent) {
+      final stt = VoiceSttService.instance;
+      final isMine = identical(stt.activeOwner, this);
+      final noMods =
+          !HardwareKeyboard.instance.isShiftPressed &&
+          !HardwareKeyboard.instance.isMetaPressed &&
+          !HardwareKeyboard.instance.isControlPressed &&
+          !HardwareKeyboard.instance.isAltPressed;
+      if (isMine && stt.isListening && noMods) {
+        if (event.logicalKey == LogicalKeyboardKey.escape) {
+          unawaited(_cancelVoiceInput());
+          return KeyEventResult.handled;
+        }
+        if (event.logicalKey == LogicalKeyboardKey.enter ||
+            event.logicalKey == LogicalKeyboardKey.numpadEnter) {
+          unawaited(_toggleVoiceInput(forceSend: true));
+          return KeyEventResult.handled;
+        }
+      }
+      if (isMine && stt.isCorrecting && noMods) {
+        if (event.logicalKey == LogicalKeyboardKey.escape) {
+          stt.skipAiCorrection();
+          return KeyEventResult.handled;
+        }
+        if (event.logicalKey == LogicalKeyboardKey.enter ||
+            event.logicalKey == LogicalKeyboardKey.numpadEnter) {
+          stt.skipAiCorrection();
+          if (!_showsStop && _canSend) _submit();
+          return KeyEventResult.handled;
+        }
+      }
+    }
     if (event is KeyDownEvent &&
         event.logicalKey == LogicalKeyboardKey.keyE &&
         HardwareKeyboard.instance.isMetaPressed &&
@@ -1655,6 +1714,215 @@ class ChatComposerState extends State<ChatComposer>
     }
   }
 
+  // --- Voice Input ---------------------------------------------------------
+
+  /// Tracks the active live-dictation span in `_controller` so streaming words
+  /// update in place while speaking, cancel restores any replaced selection,
+  /// and AI correction replaces only what was dictated.
+  int? _voiceSpanStart;
+  int? _voiceSpanEnd;
+  String _voiceSpanText = '';
+  String _voiceReplacedOriginal = '';
+  bool _voiceUpdatingText = false;
+
+  void _triggerVoiceFromHotkey() {
+    if (!mounted) return;
+    _focusNode.requestFocus();
+    unawaited(_toggleVoiceInput());
+  }
+
+  void _handleVoiceStreamChanged() {
+    if (!mounted) return;
+    final stt = VoiceSttService.instance;
+    if (!stt.isListening || !identical(stt.activeOwner, this)) return;
+    if (!VoiceSettingsStore.instance.config.sttStreaming) return;
+    final live = stt.liveTranscript;
+    if (live.isEmpty || live == _voiceSpanText) return;
+    _updateVoiceSpan(live, finalizeUndo: false);
+  }
+
+  void _beginVoiceSpan() {
+    final current = _controller.text;
+    final sel = _controller.selection;
+    final start = sel.isValid
+        ? sel.start.clamp(0, current.length)
+        : current.length;
+    final end = sel.isValid ? sel.end.clamp(0, current.length) : current.length;
+    _voiceSpanStart = start;
+    _voiceSpanEnd = end;
+    _voiceSpanText = '';
+    _voiceReplacedOriginal = start != end ? current.substring(start, end) : '';
+    _voiceUpdatingText = true;
+    try {
+      if (start != end) {
+        _controller
+          ..breakUndo()
+          ..replace(
+            start,
+            end,
+            '',
+            selection: TextSelection.collapsed(offset: start),
+          );
+        _voiceSpanEnd = start;
+      } else {
+        _controller.breakUndo();
+      }
+    } finally {
+      _voiceUpdatingText = false;
+    }
+  }
+
+  /// Replaces the active voice span with [rawText] in place.
+  String _updateVoiceSpan(
+    String rawText, {
+    required bool finalizeUndo,
+    bool preserveExact = false,
+  }) {
+    final spoken = preserveExact ? rawText : rawText.trim();
+    if (!mounted) return '';
+    final current = _controller.text;
+    var start = _voiceSpanStart ?? current.length;
+    var end = _voiceSpanEnd ?? start;
+    start = start.clamp(0, current.length);
+    end = end.clamp(start, current.length);
+    final before = current.substring(0, start);
+    final needsLeadingSpace =
+        !preserveExact &&
+        spoken.isNotEmpty &&
+        before.isNotEmpty &&
+        !before.endsWith(' ') &&
+        !before.endsWith('\n') &&
+        RegExp(r'[A-Za-z0-9]$').hasMatch(before) &&
+        RegExp(r'^[A-Za-z0-9]').hasMatch(spoken);
+    final insertion = needsLeadingSpace ? ' $spoken' : spoken;
+    _voiceUpdatingText = true;
+    try {
+      if (finalizeUndo) _controller.breakUndo();
+      _controller.replace(
+        start,
+        end,
+        insertion,
+        selection: TextSelection.collapsed(offset: start + insertion.length),
+      );
+      if (finalizeUndo) _controller.breakUndo();
+    } finally {
+      _voiceUpdatingText = false;
+    }
+    _voiceSpanStart = start;
+    _voiceSpanEnd = start + insertion.length;
+    _voiceSpanText = spoken;
+    return insertion;
+  }
+
+  void _restoreVoiceSpanOriginal() {
+    if (!mounted || _voiceSpanStart == null || _voiceSpanEnd == null) return;
+    _updateVoiceSpan(
+      _voiceReplacedOriginal,
+      finalizeUndo: true,
+      preserveExact: true,
+    );
+  }
+
+  void _clearVoiceSpanTracking() {
+    _voiceSpanStart = null;
+    _voiceSpanEnd = null;
+    _voiceSpanText = '';
+    _voiceReplacedOriginal = '';
+  }
+
+  Future<void> _toggleVoiceInput({bool forceSend = false}) async {
+    final stt = VoiceSttService.instance;
+    final notifications = IdeNotificationsScope.maybeOf(context);
+    if (stt.isStarting || stt.isTranscribing || stt.isCorrecting) return;
+    if (stt.isListening && identical(stt.activeOwner, this)) {
+      final result = await stt.stop();
+      if (!mounted) return;
+      if (result.hasText) {
+        final cfg = VoiceSettingsStore.instance.config;
+        if (cfg.conversationMode &&
+            VoiceSttService.isStopConversationCommand(result.text)) {
+          _restoreVoiceSpanOriginal();
+          _clearVoiceSpanTracking();
+          unawaited(
+            VoiceSettingsStore.instance.save(
+              cfg.copyWith(conversationMode: false),
+            ),
+          );
+          final isZh = Localizations.localeOf(context).languageCode == 'zh';
+          notifications?.notify(
+            IdeSeverity.info,
+            isZh ? '已退出连续语音对话模式' : 'Exited Voice Conversation Mode',
+          );
+          return;
+        }
+        final rawInserted = _updateVoiceSpan(result.text, finalizeUndo: true);
+        _focusNode.requestFocus();
+        if (cfg.sttAiCorrect) {
+          final spanStart = _voiceSpanStart;
+          final spanEnd = _voiceSpanEnd;
+          final corrected = await stt.correctWithAi(
+            result.text,
+            owner: this,
+            lastReply: widget.session.lastTurnReply,
+            model: widget.session.selected(KernelChoiceKind.model),
+            location: widget.session.kernelContext.cwd,
+          );
+          if (!mounted) return;
+          if (corrected.isNotEmpty &&
+              corrected != result.text.trim() &&
+              spanStart != null &&
+              spanEnd != null &&
+              spanEnd <= _controller.length &&
+              _controller.text.substring(spanStart, spanEnd) == rawInserted) {
+            _voiceSpanStart = spanStart;
+            _voiceSpanEnd = spanEnd;
+            _updateVoiceSpan(corrected, finalizeUndo: true);
+            _focusNode.requestFocus();
+          }
+        }
+        _clearVoiceSpanTracking();
+        if ((cfg.effectiveAutoSend || forceSend) && !_showsStop && _canSend) {
+          _submit();
+        }
+      } else {
+        _restoreVoiceSpanOriginal();
+        _clearVoiceSpanTracking();
+        if (result.error != null) {
+          notifications?.notify(IdeSeverity.error, result.error!);
+        }
+      }
+      return;
+    }
+
+    _beginVoiceSpan();
+    final ok = await stt.start(
+      owner: this,
+      onAutoStop: () {
+        if (mounted &&
+            VoiceSttService.instance.isListening &&
+            identical(VoiceSttService.instance.activeOwner, this)) {
+          unawaited(_toggleVoiceInput());
+        }
+      },
+    );
+    if (!ok && mounted) {
+      _restoreVoiceSpanOriginal();
+      _clearVoiceSpanTracking();
+      final err = stt.lastError;
+      if (err != null && err.isNotEmpty) {
+        notifications?.notify(IdeSeverity.error, err);
+      }
+    }
+  }
+
+  Future<void> _cancelVoiceInput() async {
+    if (identical(VoiceSttService.instance.activeOwner, this)) {
+      await VoiceSttService.instance.cancel();
+      _restoreVoiceSpanOriginal();
+      _clearVoiceSpanTracking();
+    }
+  }
+
   // --- Polish --------------------------------------------------------------
 
   /// The text as the model is given it to polish (see [composerPolishText]).
@@ -1955,6 +2223,7 @@ class ChatComposerState extends State<ChatComposer>
       _emptySuggestions.join('\n'),
       _dismissedSuggestionTurnKey,
       ComposerPolishSetting.current(),
+      VoiceSettingsStore.instance.config.enabled,
       l10n,
       themeColors,
       _hovers,
@@ -2043,6 +2312,11 @@ class ChatComposerState extends State<ChatComposer>
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            _VoiceListeningBar(
+              owner: this,
+              onStop: () => unawaited(_toggleVoiceInput()),
+              onCancel: () => unawaited(_cancelVoiceInput()),
+            ),
             ComposerImages(
               images: _pool,
               onUpdateImage: _updateImage,
@@ -2603,6 +2877,15 @@ class ChatComposerState extends State<ChatComposer>
             ),
             const SizedBox(width: 2),
           ],
+          if (VoiceSettingsStore.instance.config.enabled) ...[
+            _VoiceConversationModeButton(),
+            const SizedBox(width: 2),
+            _VoiceInputButton(
+              owner: this,
+              onTap: () => unawaited(_toggleVoiceInput()),
+            ),
+            const SizedBox(width: 2),
+          ],
           if (model != null) ...[
             AntigravityAccountPicker(modelId: model.selected.id),
             CodeBuddyAccountPicker(modelId: model.selected.id),
@@ -2780,6 +3063,415 @@ class _PolishButton extends StatelessWidget {
           );
         },
       ),
+    );
+  }
+}
+
+/// Microphone button in the composer toolbar for Speech-to-Text dictation.
+class _VoiceInputButton extends StatelessWidget {
+  const _VoiceInputButton({required this.owner, required this.onTap});
+
+  final Object owner;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final isZh = Localizations.localeOf(context).languageCode == 'zh';
+    final dark = themeColors.dark;
+    return ListenableBuilder(
+      listenable: Listenable.merge([
+        VoiceSttService.instance,
+        VoiceSettingsStore.instance,
+      ]),
+      builder: (context, _) {
+        final stt = VoiceSttService.instance;
+        final mine = identical(stt.activeOwner, owner);
+        final listening = mine && stt.isListening;
+        final correcting = mine && stt.isCorrecting;
+        final busy = mine && (stt.isStarting || stt.isTranscribing || correcting);
+        final activeColor = listening ? const Color(0xFFE5484D) : AppColors.accent;
+        final hoverBase = listening
+            ? activeColor
+            : (dark ? Colors.white : Colors.black);
+        final hoverAlpha = listening ? 0.20 : (dark ? 0.14 : 0.09);
+        final hotkeyLabel = VoiceHotkeyService.formatLabel(
+          VoiceSettingsStore.instance.config.sttHotkey,
+          mac: AppPlatform.isMacOS,
+        );
+        final hotkeySuffix = hotkeyLabel.isEmpty ? '' : ' · $hotkeyLabel';
+
+        final tooltip = listening
+            ? (isZh
+                  ? '点击结束语音输入$hotkeySuffix'
+                  : 'Click to stop voice input$hotkeySuffix')
+            : correcting
+            ? (isZh ? 'AI 正在智能纠错…' : 'AI proofreading transcript…')
+            : busy
+            ? (isZh ? '正在识别语音…' : 'Transcribing speech…')
+            : (isZh
+                  ? '语音输入（点击开始说话$hotkeySuffix）'
+                  : 'Voice input (click to dictate$hotkeySuffix)');
+
+        return IdeHover(
+          position: IdeHoverPosition.above,
+          message: tooltip,
+          child: HoverBuilder(
+            cursor: busy
+                ? SystemMouseCursors.basic
+                : SystemMouseCursors.click,
+            builder: (context, hovered) {
+              final iconColor = listening
+                  ? activeColor
+                  : busy
+                  ? AppColors.accent
+                  : (hovered ? AppColors.text : AppColors.textMuted);
+              final icon = Icon(
+                busy
+                    ? Codicons.loading
+                    : listening
+                    ? Codicons.micFilled
+                    : Codicons.mic,
+                size: 14,
+                color: iconColor,
+              );
+              return GestureDetector(
+                onTapDown: (_) {},
+                onTap: busy ? null : onTap,
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 130),
+                  width: 26,
+                  height: 26,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: listening
+                        ? activeColor.withValues(alpha: dark ? 0.22 : 0.14)
+                        : hovered
+                        ? hoverBase.withValues(alpha: hoverAlpha)
+                        : Colors.transparent,
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: listening
+                          ? activeColor.withValues(alpha: 0.55)
+                          : Colors.transparent,
+                      width: 0.9,
+                    ),
+                  ),
+                  child: busy ? IdeSpinning(icon) : icon,
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// One-click toggle in the composer toolbar for hands-free Voice Conversation
+/// Mode (VAD pause auto-stop + AI correction + auto-send + Edge Neural auto-read).
+class _VoiceConversationModeButton extends StatelessWidget {
+  const _VoiceConversationModeButton();
+
+  @override
+  Widget build(BuildContext context) {
+    final isZh = Localizations.localeOf(context).languageCode == 'zh';
+    final dark = themeColors.dark;
+    return ListenableBuilder(
+      listenable: VoiceSettingsStore.instance,
+      builder: (context, _) {
+        final cfg = VoiceSettingsStore.instance.config;
+        final active = cfg.conversationMode;
+        final accent = AppColors.accent;
+        final hoverBase = active ? accent : (dark ? Colors.white : Colors.black);
+        final hoverAlpha = active ? 0.22 : (dark ? 0.14 : 0.09);
+
+        return IdeHover(
+          position: IdeHoverPosition.above,
+          message: active
+              ? (isZh
+                    ? '连续语音对话模式（已开启）：说完停顿自动发送，并自动朗读 AI 回复'
+                    : 'Voice Conversation Mode (ON): auto-stop on pause, auto-send & read replies')
+              : (isZh
+                    ? '开启连续语音对话模式（说完自动发送 + 自动朗读回复）'
+                    : 'Enable Voice Conversation Mode (hands-free talk & listen)'),
+          child: HoverBuilder(
+            cursor: SystemMouseCursors.click,
+            builder: (context, hovered) {
+              return GestureDetector(
+                onTapDown: (_) {},
+                onTap: () => unawaited(
+                  VoiceSettingsStore.instance.save(
+                    cfg.copyWith(conversationMode: !active),
+                  ),
+                ),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 130),
+                  width: 26,
+                  height: 26,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: active
+                        ? accent.withValues(alpha: dark ? 0.22 : 0.14)
+                        : hovered
+                        ? hoverBase.withValues(alpha: hoverAlpha)
+                        : Colors.transparent,
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: active
+                          ? accent.withValues(alpha: 0.55)
+                          : Colors.transparent,
+                      width: 0.9,
+                    ),
+                  ),
+                  child: Icon(
+                    Codicons.voiceMode,
+                    size: 14,
+                    color: active
+                        ? accent
+                        : (hovered ? AppColors.text : AppColors.textMuted),
+                  ),
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Live 5-bar audio level waveform rendered inside the composer voice bar.
+class _VoiceWaveform extends StatelessWidget {
+  const _VoiceWaveform({required this.levels, required this.color});
+
+  final List<double> levels;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 14,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          for (var i = 0; i < levels.length; i++) ...[
+            if (i > 0) const SizedBox(width: 2),
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 90),
+              width: 2.5,
+              height: (3.0 + levels[i] * 11.0).clamp(3.0, 14.0),
+              decoration: BoxDecoration(
+                color: color.withValues(alpha: 0.75 + levels[i] * 0.25),
+                borderRadius: BorderRadius.circular(1.5),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+/// Compact inline bar inside the top of the composer card while listening or
+/// transcribing, displaying live waveform, elapsed time, and quick controls.
+class _VoiceListeningBar extends StatelessWidget {
+  const _VoiceListeningBar({
+    required this.owner,
+    required this.onStop,
+    required this.onCancel,
+  });
+
+  final Object owner;
+  final VoidCallback onStop;
+  final VoidCallback onCancel;
+
+  static String _formatElapsed(Duration d) {
+    final mins = d.inMinutes.toString().padLeft(2, '0');
+    final secs = (d.inSeconds % 60).toString().padLeft(2, '0');
+    return '$mins:$secs';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isZh = Localizations.localeOf(context).languageCode == 'zh';
+    final dark = themeColors.dark;
+    return ListenableBuilder(
+      listenable: Listenable.merge([
+        VoiceSttService.instance,
+        VoiceSettingsStore.instance,
+      ]),
+      builder: (context, _) {
+        final stt = VoiceSttService.instance;
+        if (!identical(stt.activeOwner, owner) || !stt.isBusy) {
+          return const SizedBox.shrink();
+        }
+        final cfg = VoiceSettingsStore.instance.config;
+        final listening = stt.isListening;
+        final liveText = stt.liveTranscript;
+        const recRed = Color(0xFFE5484D);
+
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: (listening ? recRed : AppColors.accent).withValues(
+              alpha: dark ? 0.12 : 0.08,
+            ),
+            border: Border(
+              bottom: BorderSide(
+                color: (listening ? recRed : AppColors.accent).withValues(
+                  alpha: dark ? 0.24 : 0.18,
+                ),
+                width: 0.75,
+              ),
+            ),
+          ),
+          child: Row(
+            children: [
+              if (listening)
+                _VoiceWaveform(levels: stt.levelHistory, color: recRed)
+              else if (stt.isCorrecting)
+                IdeSpinning(
+                  Icon(Codicons.sparkle, size: 12, color: AppColors.accent),
+                )
+              else
+                IdeSpinning(
+                  Icon(Codicons.loading, size: 12, color: AppColors.accent),
+                ),
+              const SizedBox(width: 8),
+              Text(
+                listening
+                    ? '${isZh ? '正在聆听' : 'Listening'} ${_formatElapsed(stt.elapsed)}'
+                    : stt.isStarting
+                    ? (isZh ? '正在启动麦克风…' : 'Starting mic…')
+                    : stt.isCorrecting
+                    ? (isZh ? 'AI 正在智能纠错…' : 'AI proofreading…')
+                    : (isZh ? '正在转写语音…' : 'Transcribing…'),
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600,
+                  color: listening ? recRed : AppColors.accent,
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                ),
+              ),
+              if (liveText.isNotEmpty && !cfg.sttStreaming) ...[
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    liveText,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: AppColors.text,
+                    ),
+                  ),
+                ),
+              ] else ...[
+                if (listening) ...[
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      cfg.conversationMode
+                          ? (isZh
+                                ? '对话模式 · 停顿自动发 · Esc 取消'
+                                : 'Conversation mode · pauses auto-send · Esc cancels')
+                          : cfg.effectiveVadAutoStop
+                          ? (isZh
+                                ? '边说边出字 · 停顿自动停 · Enter 发送'
+                                : 'Live streaming · auto-stops on pause · Enter sends')
+                          : (isZh
+                                ? '边说边出字 · Enter 完成发送 · Esc 取消'
+                                : 'Live streaming · Enter sends · Esc cancels'),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        color: AppColors.textMuted,
+                      ),
+                    ),
+                  ),
+                ] else
+                  const Spacer(),
+              ],
+              if (stt.isCorrecting) ...[
+                const SizedBox(width: 8),
+                MouseRegion(
+                  cursor: SystemMouseCursors.click,
+                  child: GestureDetector(
+                    onTap: () => stt.skipAiCorrection(),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: AppColors.accent.withValues(alpha: 0.16),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Text(
+                        isZh ? '跳过 (Esc)' : 'Skip (Esc)',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: AppColors.accent,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+              if (listening) ...[
+                const SizedBox(width: 8),
+                MouseRegion(
+                  cursor: SystemMouseCursors.click,
+                  child: GestureDetector(
+                    onTap: onCancel,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 2,
+                      ),
+                      child: Text(
+                        isZh ? '取消' : 'Cancel',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          color: AppColors.textMuted,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 4),
+                MouseRegion(
+                  cursor: SystemMouseCursors.click,
+                  child: GestureDetector(
+                    onTap: onStop,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: recRed,
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Text(
+                        isZh ? '完成' : 'Done',
+                        style: const TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        );
+      },
     );
   }
 }

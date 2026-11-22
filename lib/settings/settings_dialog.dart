@@ -41,6 +41,7 @@ enum SettingsSection {
   browser,
   computerUse,
   notifications,
+  voice,
   stash,
   accounts,
   customize,
@@ -66,6 +67,7 @@ enum SettingsCategory {
     SettingsSection.browser,
     SettingsSection.computerUse,
     SettingsSection.notifications,
+    SettingsSection.voice,
     SettingsSection.stash,
     SettingsSection.accounts,
     SettingsSection.customize,
@@ -273,6 +275,7 @@ class SettingsDialogState extends State<SettingsDialog> {
     SettingsSection.browser => Codicons.globe,
     SettingsSection.computerUse => Codicons.vm,
     SettingsSection.notifications => Codicons.bell,
+    SettingsSection.voice => Codicons.mic,
     SettingsSection.stash => Codicons.note,
     SettingsSection.accounts => Codicons.sourceControl,
     SettingsSection.customize => Codicons.plug,
@@ -312,6 +315,7 @@ class SettingsDialogState extends State<SettingsDialog> {
       SettingsSection.browser => l10n.settingsSectionBrowser,
       SettingsSection.computerUse => isZh ? '电脑操作' : 'Computer Use',
       SettingsSection.notifications => l10n.settingsSectionNotifications,
+      SettingsSection.voice => isZh ? '语音' : 'Voice',
       SettingsSection.stash => l10n.settingsSectionStash,
       SettingsSection.accounts => isZh ? 'Git 账户' : 'Git Accounts',
       SettingsSection.customize => l10n.settingsSectionCustomize,
@@ -334,6 +338,8 @@ class SettingsDialogState extends State<SettingsDialog> {
         SettingsSection.browser => context.l10n.settingsBrowserKeywords,
         SettingsSection.computerUse =>
           'computer use desktop window screen cua driver accessibility 电脑操作 桌面 窗口 共享 辅助功能 屏幕录制 快捷键',
+        SettingsSection.voice =>
+          'voice speech microphone mic stt tts whisper audio dictation 语音 麦克风 语音输入 语音播报 朗读 听写 语速 音色',
         SettingsSection.customize => context.l10n.settingsCustomizeKeywords,
         SettingsSection.antigravityAccounts =>
           'google antigravity account oauth quota 配额 切号 账号管理',

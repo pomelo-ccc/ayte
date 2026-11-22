@@ -12,6 +12,7 @@ import '../../notifications/attention_settings.dart';
 import '../../notifications/notification_sound.dart';
 import '../../platform/app_platform.dart';
 import '../../theme/codicons.dart';
+import '../../voice/voice_settings.dart';
 import '../user_settings.dart';
 import 'settings_dropdown.dart';
 import 'settings_widgets.dart';
@@ -204,19 +205,35 @@ class _NotificationsSettingsPageState extends State<NotificationsSettingsPage> {
                 ],
               ),
             ),
-            ValueListenableBuilder<bool>(
-              valueListenable: AttentionVoiceSetting.enabled,
-              builder: (context, voiceOn, _) {
+            ListenableBuilder(
+              listenable: Listenable.merge([
+                AttentionVoiceSetting.enabled,
+                VoiceSettingsStore.instance,
+              ]),
+              builder: (context, _) {
                 final isZh =
                     Localizations.localeOf(context).languageCode == 'zh';
+                final voiceOn =
+                    AttentionVoiceSetting.enabled.value ||
+                    VoiceSettingsStore.instance.config.completionAnnouncement;
                 return SettingsSwitchRow(
                   label: isZh ? '任务完成语音播报' : 'Spoken Completion Announcement',
                   description: isZh
-                      ? '当后台任务完成或需要你确认时，使用系统语音进行简短播报提醒'
-                      : 'Speak a short system voice announcement when a task finishes or needs your input',
+                      ? '当后台任务完成或需要你确认时，使用系统或自定义语音进行简短播报提醒（可在「设置 → 语音」中切换引擎与音色）'
+                      : 'Speak a short announcement when a task finishes or needs your input (configure engine in Settings → Voice)',
                   value: voiceOn,
                   enabled: enabled,
-                  onChanged: (v) => AttentionVoiceSetting.enabled.value = v,
+                  onChanged: (v) {
+                    AttentionVoiceSetting.enabled.value = v;
+                    unawaited(
+                      VoiceSettingsStore.instance.save(
+                        VoiceSettingsStore.instance.config.copyWith(
+                          completionAnnouncement: v,
+                        ),
+                        settings: widget.settings,
+                      ),
+                    );
+                  },
                 );
               },
             ),

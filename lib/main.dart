@@ -97,7 +97,11 @@ import 'models/model_runtime.dart';
 import 'models/model_welcome.dart';
 import 'notifications/notch_dropzone.dart';
 import 'network/network_proxy.dart';
+import 'notifications/attention_service.dart' show AttentionVoiceSetting;
 import 'notifications/attention_settings.dart';
+import 'voice/local_sensevoice.dart';
+import 'voice/voice_hotkey.dart';
+import 'voice/voice_settings.dart';
 import 'platform/memory_budget.dart';
 import 'platform/native_md_clipboard.dart';
 import 'platform/app_binding.dart';
@@ -671,6 +675,23 @@ void followSettingsFiles(SettingsFiles files) {
   EmbeddedBrowserController.instance.follow(files.settings);
   // Settings → Computer Use: Desktop window sharing & cua-driver settings.
   ComputerUseController.instance.follow(files.settings);
+  // Settings → Voice: Speech-to-Text & Text-to-Speech settings.
+  VoiceSettingsStore.instance.follow(
+    files.settings,
+    onCompletionAnnouncementChanged: (v) =>
+        AttentionVoiceSetting.enabled.value = v,
+  );
+  VoiceHotkeyService.instance.follow(VoiceSettingsStore.instance);
+  // Pre-warm local SenseVoice model shortly after startup so the very first
+  // voice prompt starts streaming immediately with zero cold-start delay.
+  if (AppPlatform.isWindows) {
+    Timer(const Duration(seconds: 2), () {
+      final cfg = VoiceSettingsStore.instance.config;
+      if (cfg.enabled && cfg.sttEngine == VoiceSttEngine.localAi) {
+        LocalSenseVoice.instance.warmUp();
+      }
+    });
+  }
   // ACP agents, grouped tags, worktree tasks, cron automations, canvas & IPC.
   AcpAgentService.instance.follow(files.settings);
   unawaited(TagStore.instance.load());

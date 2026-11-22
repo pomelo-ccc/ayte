@@ -10,6 +10,8 @@ import '../../l10n/l10n.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/codicons.dart';
 import '../../theme/workbench_theme.dart' show themeColors;
+import '../../voice/voice_settings.dart';
+import '../../voice/voice_tts_service.dart';
 import '../chat_feed.dart';
 import '../chat_models.dart';
 import '../chat_session.dart';
@@ -148,6 +150,11 @@ class _TurnFooterState extends State<TurnFooter> {
       final session = feed is ChatSession ? feed : null;
       final actions = <Widget>[
         if (answer != null) _CopyButton(text: answer),
+        if (answer != null)
+          _SpeakButton(
+            text: answer,
+            speakId: Object.hash(answer, widget.sentAt, widget.worked).toString(),
+          ),
         if (answer != null && widget.onTogglePin != null)
           _PinButton(
             pinned: widget.pinned,
@@ -701,6 +708,71 @@ class _PinButton extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+class _SpeakButton extends StatelessWidget {
+  const _SpeakButton({required this.text, required this.speakId});
+
+  final String text;
+  final String speakId;
+
+  @override
+  Widget build(BuildContext context) {
+    final isZh = Localizations.localeOf(context).languageCode == 'zh';
+    return ListenableBuilder(
+      listenable: Listenable.merge([
+        VoiceSettingsStore.instance,
+        VoiceTtsService.instance,
+      ]),
+      builder: (context, _) {
+        if (!VoiceSettingsStore.instance.config.enabled) {
+          return const SizedBox.shrink();
+        }
+        final speaking = VoiceTtsService.instance.isSpeakingId(speakId);
+        final accent = AppColors.accent;
+        final colors = themeColors;
+        return IdeHover(
+          message: speaking
+              ? (isZh ? '停止朗读' : 'Stop reading')
+              : (isZh ? '语音朗读回复' : 'Read reply aloud'),
+          child: HoverBuilder(
+            cursor: SystemMouseCursors.click,
+            builder: (context, hovered) => GestureDetector(
+              onTap: () => unawaited(
+                VoiceTtsService.instance.toggle(
+                  text,
+                  id: speakId,
+                  isZh: isZh,
+                ),
+              ),
+              behavior: HitTestBehavior.opaque,
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 120),
+                width: 22,
+                height: 22,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: speaking
+                      ? accent.withValues(alpha: 0.14)
+                      : hovered
+                      ? colors['toolbar.hoverBackground']
+                      : Colors.transparent,
+                  borderRadius: BorderRadius.circular(5),
+                ),
+                child: Icon(
+                  speaking ? Codicons.debugStop : Codicons.unmute,
+                  size: 13,
+                  color: speaking
+                      ? accent
+                      : (hovered ? AppColors.text : AppColors.textFaint),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }

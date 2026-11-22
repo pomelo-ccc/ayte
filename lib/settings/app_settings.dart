@@ -49,6 +49,7 @@ import 'pages/ssh_page.dart';
 import 'pages/stash_hotkey_field.dart';
 import 'pages/stash_page.dart';
 import 'pages/updates_page.dart';
+import 'pages/voice_page.dart';
 import 'settings_dialog.dart';
 import 'user_settings.dart';
 
@@ -212,6 +213,8 @@ class AppSettings {
         return ComputerUseSettingsPage(settings: files?.settings);
       case SettingsSection.notifications:
         return NotificationsSettingsPage(settings: files?.settings);
+      case SettingsSection.voice:
+        return VoiceSettingsPage(settings: files?.settings);
       case SettingsSection.stash:
         return StashSettingsPage(settings: files?.settings);
       case SettingsSection.accounts:

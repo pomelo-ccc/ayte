@@ -6,6 +6,9 @@ import 'package:flutter/widgets.dart';
 import '../chat/chat_models.dart';
 import '../kernel/kernel_types.dart';
 import '../l10n/l10n.dart';
+import '../voice/voice_settings.dart';
+import '../voice/voice_text_cleaner.dart';
+import '../voice/voice_tts_service.dart';
 import '../workspace/workspace.dart';
 import 'attention_host.dart';
 import 'attention_settings.dart';
@@ -206,7 +209,29 @@ class AttentionService {
               identical(workspace.current, thread)));
 
   void _notify(AgentThread thread, AttentionEvent event, {bool sound = true}) {
-    if (AttentionVoiceSetting.enabled.value && sound) {
+    final voiceConfig = VoiceSettingsStore.instance.config;
+    var autoReadSpoken = false;
+    if (event == AttentionEvent.finished &&
+        sound &&
+        voiceConfig.enabled &&
+        voiceConfig.effectiveAutoRead &&
+        !_lastTurnHadError(thread)) {
+      final reply = _lastReply(thread);
+      if (reply != null && reply.trim().isNotEmpty) {
+        autoReadSpoken = true;
+        unawaited(
+          VoiceTtsService.instance.speak(
+            reply,
+            isZh: VoiceTextCleaner.containsCjk(reply),
+            autoRead: true,
+          ),
+        );
+      }
+    }
+    if (!autoReadSpoken &&
+        (AttentionVoiceSetting.enabled.value ||
+            voiceConfig.completionAnnouncement) &&
+        sound) {
       unawaited(_speakSummary(thread, event));
     }
     final settings = this.settings();
@@ -265,11 +290,8 @@ class AttentionService {
     return false;
   }
 
-  static Process? _activeSpeech;
-
   Future<void> _speakSummary(AgentThread thread, AttentionEvent event) async {
-    if (!Platform.isMacOS ||
-        Platform.environment['FLUTTER_TEST'] == 'true') {
+    if (Platform.environment['FLUTTER_TEST'] == 'true') {
       return;
     }
     final l10n = this.l10n();
@@ -279,39 +301,16 @@ class AttentionService {
       final detail = _request(thread.session.pendingInteraction, l10n);
       spoken = detail == null
           ? '$title 需要您的确认'
-          : '$title 需要确认：${_cleanForSpeech(detail)}';
+          : '$title 需要确认：${VoiceTextCleaner.cleanForSummary(detail, maxChars: 48)}';
     } else if (_lastTurnHadError(thread)) {
       spoken = '$title 执行遇到报错，请检查或切换备用渠道';
     } else {
       final reply = _lastReply(thread);
       spoken = reply == null
           ? '$title 已完成任务'
-          : '$title 已完成：${_cleanForSpeech(reply)}';
+          : '$title 已完成：${VoiceTextCleaner.cleanForSummary(reply, maxChars: 48)}';
     }
-    try {
-      _activeSpeech?.kill();
-      _activeSpeech = await Process.start('/usr/bin/say', [
-        '-r',
-        '210',
-        spoken,
-      ]);
-    } on Object {
-      // Ignore if `/usr/bin/say` fails.
-    }
-  }
-
-  static String _cleanForSpeech(String text) {
-    var s = text
-        .replaceAll(RegExp(r'```[\s\S]*?```'), '')
-        .replaceAll(RegExp(r'`[^`]+`'), '')
-        .replaceAll(RegExp(r'https?://\S+'), '')
-        .replaceAll(RegExp(r'[#*|>_\[\]~]'), ' ')
-        .replaceAll(RegExp(r'\s+'), ' ')
-        .trim();
-    if (s.length > 48) {
-      s = s.substring(0, 48);
-    }
-    return s;
+    await VoiceTtsService.instance.speak(spoken, raw: true, isZh: true);
   }
 
   /// One sound for news that comes together (several agents at once).

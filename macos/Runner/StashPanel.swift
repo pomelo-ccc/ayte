@@ -308,10 +308,14 @@ final class StashHotkey {
   static let shared = StashHotkey()
 
   private var hotKey: EventHotKeyRef?
+  private var voiceHotKey: EventHotKeyRef?
   private var handler: EventHandlerRef?
 
-  /// Called on the main thread as it is pressed.
+  /// Called on the main thread as the stash shortcut is pressed.
   var onPress: (() -> Void)?
+
+  /// Called on the main thread as the voice shortcut is pressed.
+  var onVoicePress: (() -> Void)?
 
   /// Takes [spec] (`ctrl+shift+space`, `cmd+alt+n`…) in place of the one
   /// it had; none for an empty one. Whether the system gave it (another
@@ -333,13 +337,46 @@ final class StashHotkey {
     hotKey = nil
   }
 
+  func registerVoice(_ spec: String) -> Bool {
+    unregisterVoice()
+    guard let (code, modifiers) = Self.parse(spec) else { return spec.isEmpty }
+    installHandler()
+    let id = EventHotKeyID(signature: OSType(0x4241_4F53), id: 2)  // 'BAOS' #2
+    var ref: EventHotKeyRef?
+    let status = RegisterEventHotKey(code, modifiers, id, GetEventDispatcherTarget(), 0, &ref)
+    guard status == noErr else { return false }
+    voiceHotKey = ref
+    return true
+  }
+
+  func unregisterVoice() {
+    if let voiceHotKey { UnregisterEventHotKey(voiceHotKey) }
+    voiceHotKey = nil
+  }
+
   private func installHandler() {
     guard handler == nil else { return }
     var type = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
     InstallEventHandler(
       GetEventDispatcherTarget(),
-      { _, _, _ -> OSStatus in
-        DispatchQueue.main.async { StashHotkey.shared.onPress?() }
+      { _, event, _ -> OSStatus in
+        var hotKeyID = EventHotKeyID()
+        let status = GetEventParameter(
+          event,
+          EventParamName(kEventParamDirectObject),
+          EventParamType(typeEventHotKeyID),
+          nil,
+          MemoryLayout<EventHotKeyID>.size,
+          nil,
+          &hotKeyID)
+        let id = status == noErr ? hotKeyID.id : 1
+        DispatchQueue.main.async {
+          if id == 2 {
+            StashHotkey.shared.onVoicePress?()
+          } else {
+            StashHotkey.shared.onPress?()
+          }
+        }
         return noErr
       },
       1, &type, nil, &handler)
@@ -390,13 +427,36 @@ final class StashChannel {
   static var shared: StashChannel?
 
   private let channel: FlutterMethodChannel
+  private let voiceChannel: FlutterMethodChannel
 
   init(messenger: FlutterBinaryMessenger) {
     channel = FlutterMethodChannel(name: "baocode/stash", binaryMessenger: messenger)
     channel.setMethodCallHandler { [weak self] call, result in
       self?.handle(call, result: result) ?? result(nil)
     }
+    voiceChannel = FlutterMethodChannel(name: "baocode/voice", binaryMessenger: messenger)
+    voiceChannel.setMethodCallHandler { [weak self] call, result in
+      self?.handleVoice(call, result: result) ?? result(nil)
+    }
     StashHotkey.shared.onPress = { [weak self] in self?.pressed() }
+    StashHotkey.shared.onVoicePress = { [weak self] in self?.voicePressed() }
+  }
+
+  private func voicePressed() {
+    NSApp.activate(ignoringOtherApps: true)
+    if let mainWindow = NSApp.windows.first(where: { $0 is BaoWindow }) {
+      mainWindow.makeKeyAndOrderFront(nil)
+    }
+    voiceChannel.invokeMethod("pressed", arguments: nil)
+  }
+
+  private func handleVoice(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    switch call.method {
+    case "setHotkey":
+      result(StashHotkey.shared.registerVoice(call.arguments as? String ?? ""))
+    default:
+      result(FlutterMethodNotImplemented)
+    }
   }
 
   private func pressed() {
