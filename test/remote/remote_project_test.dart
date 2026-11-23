@@ -482,7 +482,7 @@ void main() {
 
     setUp(() {
       // The CLI there, asked for.
-      ClaudeCore.current = () => ClaudeCore.cli;
+      ClaudeCore.current = () => ClaudeCore.antigravity;
       addTearDown(() => ClaudeCore.current = () => ClaudeCore.fallback);
       home = Directory.systemTemp.createTempSync('baocode-remote-home-');
       config = Directory(p.join(home.path, '.claude'))..createSync();

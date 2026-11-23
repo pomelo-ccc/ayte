@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:path/path.dart' as p;
 
 import 'package:bao_editor/monaco/flutter/diff_editor.dart';
 import 'package:bao_editor/monaco/flutter/diff_editor_model.dart';
@@ -67,16 +68,24 @@ class IdeAgentEdit {
   /// the conversation is still pending, in the order its changes list
   /// them; null when there is none but this one.
   String? nextPending() {
+    final paths = session.paths;
     final pending = [
       for (final change in _review.changes)
         if (change.kind != FileChangeKind.deleted &&
-            (change.path == path || _review.baseOf(change.path) != null))
+            (paths.equals(change.path, path) ||
+                _review.baseOf(change.path) != null))
           change.path,
     ];
-    final at = pending.indexOf(path);
+    final at = pending.indexWhere((p) => paths.equals(p, path));
+    if (at < 0) {
+      for (final candidate in pending) {
+        if (!paths.equals(candidate, path)) return candidate;
+      }
+      return null;
+    }
     for (var i = 1; i <= pending.length; i++) {
       final next = pending[(at + i) % pending.length];
-      if (next != path) return next;
+      if (!paths.equals(next, path)) return next;
     }
     return null;
   }
@@ -158,10 +167,17 @@ class IdeAgentEdits extends ChangeNotifier {
 
   final Map<String, IdeAgentHunks> _hunks = {};
 
+  p.Context get _paths => _sessions.firstOrNull?.paths ?? p.context;
+
+  String _hunkKey(String path) =>
+      path.trim().isEmpty ? '' : _paths.canonicalize(path);
+
   /// Where the editor of the file at [path] is among its change's parts:
   /// the same for the editor and the bar over it, whichever comes first.
-  IdeAgentHunks hunksOf(String path) =>
-      _hunks.putIfAbsent(path, () => IdeAgentHunks(open: _openPending));
+  IdeAgentHunks hunksOf(String path) => _hunks.putIfAbsent(
+    _hunkKey(path),
+    () => IdeAgentHunks(open: _openPending),
+  );
 
   /// Opens a file in the IDE's editor (see [IdeAgentHunks.open]).
   ValueChanged<String>? open;

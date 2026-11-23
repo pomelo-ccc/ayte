@@ -6,6 +6,7 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
+import '../claude_code/claude_environment.dart';
 import 'antigravity_account_models.dart';
 import 'antigravity_oauth.dart';
 import 'antigravity_quota.dart';
@@ -27,8 +28,14 @@ class AntigravityAccounts extends ChangeNotifier {
   onActiveAccountSwitched;
 
   final String? _overrideDir;
+  String? _resolvedDataDir;
+  String? _loadedDir;
+  String? _latestTargetDir;
+  int _loadEpoch = 0;
   bool _initialized = false;
+  bool _disposed = false;
   Future<void>? _initFuture;
+  Zone? _initZone;
   Timer? _refreshTimer;
   Timer? _postTurnRefreshDebounce;
 
@@ -64,70 +71,177 @@ class AntigravityAccounts extends ChangeNotifier {
 
   String get dataDirectoryPath {
     if (_overrideDir case final dir? when dir.isNotEmpty) return dir;
-    final home =
-        Platform.environment['HOME'] ??
-        Platform.environment['USERPROFILE'] ??
-        '';
+    if (_resolvedDataDir case final dir? when dir.isNotEmpty) return dir;
+    final home = _resolveHome(
+      Platform.environment,
+      fallbackToPlatform: false,
+    );
     return p.join(home, '.ayte', 'antigravity_accounts');
+  }
+
+  static String? _nonEmptyEnv(String? value) =>
+      (value != null && value.trim().isNotEmpty) ? value.trim() : null;
+
+  static String? _lookupEnvVar(
+    Map<String, String> env,
+    String name, {
+    required bool win,
+  }) {
+    final direct = _nonEmptyEnv(env[name]);
+    if (direct != null) return direct;
+    if (win) {
+      final lower = name.toLowerCase();
+      for (final entry in env.entries) {
+        if (entry.key.toLowerCase() == lower) {
+          final value = _nonEmptyEnv(entry.value);
+          if (value != null) return value;
+        }
+      }
+      for (final entry in env.entries) {
+        if (entry.key.toLowerCase() == lower) {
+          return '';
+        }
+      }
+    } else if (env.containsKey(name)) {
+      return _nonEmptyEnv(env[name]) ?? '';
+    }
+    return null;
+  }
+
+  static String _resolveHome(
+    Map<String, String> env, {
+    bool fallbackToPlatform = true,
+  }) {
+    final win = Platform.isWindows;
+    final envHome = _lookupEnvVar(env, 'HOME', win: win);
+    if (envHome != null && envHome.isNotEmpty) return envHome;
+    final envUserProfile = _lookupEnvVar(env, 'USERPROFILE', win: win);
+    if (envUserProfile != null && envUserProfile.isNotEmpty) {
+      return envUserProfile;
+    }
+    if (!fallbackToPlatform || envHome != null || envUserProfile != null) {
+      return '';
+    }
+    final platHome = _lookupEnvVar(Platform.environment, 'HOME', win: win);
+    if (platHome != null && platHome.isNotEmpty) return platHome;
+    final platProfile = _lookupEnvVar(
+      Platform.environment,
+      'USERPROFILE',
+      win: win,
+    );
+    if (platProfile != null && platProfile.isNotEmpty) return platProfile;
+    return '';
+  }
+
+  Future<({String dataDir, String home})> _resolveDataDirectoryPath() async {
+    if (_overrideDir case final dir? when dir.isNotEmpty) {
+      final home = _resolveHome(
+        Platform.environment,
+        fallbackToPlatform: false,
+      );
+      return (dataDir: dir, home: home);
+    }
+    final env = await ClaudeEnvironment.of();
+    final home = _resolveHome(env);
+    final resolved = p.join(home, '.ayte', 'antigravity_accounts');
+    _resolvedDataDir = resolved;
+    return (dataDir: resolved, home: home);
   }
 
   void setQuotaWindow(AntigravityQuotaWindow window) {
     if (_quotaWindow == window) return;
     _quotaWindow = window;
-    notifyListeners();
+    _safeNotify();
   }
 
   /// Loads accounts from `~/.ayte/antigravity_accounts/`, migrating legacy
   /// `~/.antigravity_tools/` data losslessly if Ayte's store is empty.
   Future<void> ensureInitialized() {
-    if (_initialized) return Future.value();
-    return _initFuture ??= _doInitialize();
+    if (_disposed) return Future.value();
+    if (_initFuture case final inFlight?
+        when identical(_initZone, Zone.current)) {
+      return inFlight;
+    }
+    if (_initialized && _overrideDir != null) return Future.value();
+    final run = _ensureInitializedAsync();
+    _initFuture = run;
+    _initZone = Zone.current;
+    return run.whenComplete(() {
+      if (identical(_initFuture, run)) {
+        _initFuture = null;
+        _initZone = null;
+      }
+    });
   }
 
-  Future<void> _doInitialize() async {
-    try {
-      final dir = Directory(dataDirectoryPath);
-      await dir.create(recursive: true);
-      final accountsSubdir = Directory(p.join(dir.path, 'accounts'));
-      if (!accountsSubdir.existsSync() ||
-          accountsSubdir
-              .listSync()
-              .whereType<File>()
-              .where((f) => f.path.endsWith('.json'))
-              .isEmpty) {
-        await _migrateFromLegacyToolsIfPresent(dir);
-      }
-      await _loadFromDisk(dir);
-      await _reconcileActiveWithKeyring();
-      _startBackgroundRefreshTimer();
-      unawaited(refreshAllQuotas(silent: true));
-    } finally {
-      _initialized = true;
+  Future<void> _ensureInitializedAsync() async {
+    if (_disposed) return;
+    final (:dataDir, :home) = await _resolveDataDirectoryPath();
+    if (_disposed) return;
+    if (_initialized && _loadedDir == dataDir) return;
+    await _doInitialize(dataDir, resolvedHome: home);
+  }
+
+  Future<void> _doInitialize(
+    String targetDir, {
+    required String resolvedHome,
+  }) async {
+    if (_disposed) return;
+    _latestTargetDir = targetDir;
+    final epoch = ++_loadEpoch;
+    final dir = Directory(targetDir);
+    await dir.create(recursive: true);
+    if (_disposed) return;
+    if (_initialized && _loadedDir == targetDir && epoch != _loadEpoch) return;
+    if (_latestTargetDir != targetDir && epoch != _loadEpoch) return;
+    final accountsSubdir = Directory(p.join(dir.path, 'accounts'));
+    if (!accountsSubdir.existsSync() ||
+        accountsSubdir
+            .listSync()
+            .whereType<File>()
+            .where((f) => f.path.endsWith('.json'))
+            .isEmpty) {
+      await _migrateFromLegacyToolsIfPresent(dir, resolvedHome: resolvedHome);
     }
-    notifyListeners();
+    if (_disposed) return;
+    if (_initialized && _loadedDir == targetDir && epoch != _loadEpoch) return;
+    if (_latestTargetDir != targetDir && epoch != _loadEpoch) return;
+    final committed = await _loadFromDisk(dir, expectedEpoch: epoch);
+    if (_disposed || !committed) return;
+    if (!Platform.environment.containsKey('FLUTTER_TEST')) {
+      await _reconcileActiveWithKeyring();
+      if (_disposed || _latestTargetDir != targetDir) return;
+    }
+    _startBackgroundRefreshTimer();
+    if (_accounts.isNotEmpty &&
+        !Platform.environment.containsKey('FLUTTER_TEST')) {
+      unawaited(refreshAllQuotas(silent: true));
+    }
+    _safeNotify();
   }
 
   /// Losslessly copies accounts, index, quota history, and usage spans from
   /// `~/.antigravity_tools` into `~/.ayte/antigravity_accounts`.
   Future<int> migrateFromLegacyDirectory(Directory legacyDir) async {
-    if (!legacyDir.existsSync()) return 0;
+    if (_disposed || !legacyDir.existsSync()) return 0;
     final targetDir = Directory(dataDirectoryPath);
     await targetDir.create(recursive: true);
     final count = await _copyLegacyFiles(legacyDir, targetDir);
-    if (count > 0) {
-      await _loadFromDisk(targetDir);
-      notifyListeners();
+    if (count > 0 && !_disposed) {
+      _latestTargetDir = targetDir.path;
+      final epoch = ++_loadEpoch;
+      await _loadFromDisk(targetDir, expectedEpoch: epoch);
+      if (!_disposed) _safeNotify();
     }
     return count;
   }
 
-  Future<void> _migrateFromLegacyToolsIfPresent(Directory targetDir) async {
-    final home =
-        Platform.environment['HOME'] ??
-        Platform.environment['USERPROFILE'] ??
-        '';
-    if (home.isEmpty) return;
-    final legacyDir = Directory(p.join(home, '.antigravity_tools'));
+  Future<void> _migrateFromLegacyToolsIfPresent(
+    Directory targetDir, {
+    required String resolvedHome,
+  }) async {
+    if (resolvedHome.isEmpty) return;
+    final legacyDir = Directory(p.join(resolvedHome, '.antigravity_tools'));
     if (!legacyDir.existsSync()) return;
     await _copyLegacyFiles(legacyDir, targetDir);
   }
@@ -172,16 +286,23 @@ class AntigravityAccounts extends ChangeNotifier {
     return copiedAccounts;
   }
 
-  Future<void> _loadFromDisk(Directory dir) async {
-    _accounts.clear();
+  static Future<String> _readStringLossy(File file) async {
+    final bytes = await file.readAsBytes();
+    return _stripBom(const Utf8Decoder(allowMalformed: true).convert(bytes));
+  }
+
+  Future<bool> _loadFromDisk(Directory dir, {int? expectedEpoch}) async {
+    final epoch = expectedEpoch ?? ++_loadEpoch;
     final accountsDir = Directory(p.join(dir.path, 'accounts'));
     final byId = <String, AntigravityAccount>{};
 
     if (accountsDir.existsSync()) {
       for (final entity in accountsDir.listSync()) {
+        if (_disposed) return false;
         if (entity is! File || !entity.path.endsWith('.json')) continue;
         try {
-          final raw = _stripBom(await entity.readAsString());
+          final raw = await _readStringLossy(entity);
+          if (_disposed) return false;
           final decoded = jsonDecode(raw);
           if (decoded is Map) {
             final acc = AntigravityAccount.fromJson(
@@ -199,12 +320,14 @@ class AntigravityAccounts extends ChangeNotifier {
 
     final indexFile = File(p.join(dir.path, 'accounts.json'));
     final orderedIds = <String>[];
+    String? loadedCurrentId;
     if (indexFile.existsSync()) {
       try {
-        final raw = _stripBom(await indexFile.readAsString());
+        final raw = await _readStringLossy(indexFile);
+        if (_disposed) return false;
         final decoded = jsonDecode(raw);
         if (decoded is Map) {
-          _currentAccountId = decoded['current_account_id'] as String?;
+          loadedCurrentId = decoded['current_account_id'] as String?;
           if (decoded['accounts'] case final List list) {
             for (final item in list) {
               if (item is Map && item['id'] is String) {
@@ -218,9 +341,12 @@ class AntigravityAccounts extends ChangeNotifier {
       }
     }
 
+    final loadedAccounts = <AntigravityAccount>[];
+    final seenIds = <String>{};
     for (final id in orderedIds) {
+      if (!seenIds.add(id)) continue;
       if (byId.remove(id) case final acc?) {
-        _accounts.add(acc);
+        loadedAccounts.add(acc);
       }
     }
     final remaining = byId.values.toList()
@@ -228,19 +354,25 @@ class AntigravityAccounts extends ChangeNotifier {
         final cmp = b.lastUsed.compareTo(a.lastUsed);
         return cmp != 0 ? cmp : a.email.compareTo(b.email);
       });
-    _accounts.addAll(remaining);
-
-    if (_currentAccountId == null ||
-        !_accounts.any((a) => a.id == _currentAccountId)) {
-      _currentAccountId = _accounts.firstOrNull?.id;
+    for (final acc in remaining) {
+      if (seenIds.add(acc.id)) {
+        loadedAccounts.add(acc);
+      }
     }
 
+    final resolvedCurrentId = (loadedCurrentId != null &&
+            loadedAccounts.any((a) => a.id == loadedCurrentId))
+        ? loadedCurrentId
+        : loadedAccounts.firstOrNull?.id;
+
+    AntigravityAutoSwitchConfig? loadedAutoSwitch;
     final autoFile = File(p.join(dir.path, 'auto_switch.json'));
     if (autoFile.existsSync()) {
       try {
-        final decoded = jsonDecode(_stripBom(await autoFile.readAsString()));
+        final decoded = jsonDecode(await _readStringLossy(autoFile));
+        if (_disposed) return false;
         if (decoded is Map) {
-          _autoSwitch = AntigravityAutoSwitchConfig.fromJson(
+          loadedAutoSwitch = AntigravityAutoSwitchConfig.fromJson(
             decoded.cast<String, Object?>(),
           );
         }
@@ -249,9 +381,28 @@ class AntigravityAccounts extends ChangeNotifier {
       }
     }
 
-    if (remaining.isNotEmpty || !indexFile.existsSync()) {
-      await _saveIndex();
+    if (_disposed) return false;
+    final isLatest = epoch == _loadEpoch;
+    final needsFirstCommitForDir =
+        _latestTargetDir == dir.path && (!_initialized || _loadedDir != dir.path);
+    if (!isLatest && !needsFirstCommitForDir) {
+      return false;
     }
+
+    _accounts
+      ..clear()
+      ..addAll(loadedAccounts);
+    _currentAccountId = resolvedCurrentId;
+    if (loadedAutoSwitch != null) {
+      _autoSwitch = loadedAutoSwitch;
+    }
+    _loadedDir = dir.path;
+    _initialized = true;
+
+    if (remaining.isNotEmpty || !indexFile.existsSync()) {
+      await _saveIndex(dirPath: dir.path);
+    }
+    return true;
   }
 
   /// Ensures `_currentAccountId` reflects the live Keychain/`agy` token if one
@@ -271,9 +422,19 @@ class AntigravityAccounts extends ChangeNotifier {
     }
   }
 
+  void _safeNotify() {
+    if (!_disposed) notifyListeners();
+  }
+
   void _startBackgroundRefreshTimer() {
     _refreshTimer?.cancel();
+    _refreshTimer = null;
+    if (_disposed || _accounts.isEmpty) return;
+    if (Platform.environment.containsKey('FLUTTER_TEST')) {
+      return;
+    }
     _refreshTimer = Timer.periodic(const Duration(minutes: 3), (_) {
+      if (_disposed) return;
       _backgroundTick++;
       if (_backgroundTick % 3 == 0) {
         unawaited(refreshAllQuotas(silent: true));
@@ -289,12 +450,28 @@ class AntigravityAccounts extends ChangeNotifier {
     Duration delay = const Duration(seconds: 2),
   }) {
     _postTurnRefreshDebounce?.cancel();
+    _postTurnRefreshDebounce = null;
+    if (_disposed || _accounts.isEmpty) return;
+    if (Platform.environment.containsKey('FLUTTER_TEST')) {
+      return;
+    }
     _postTurnRefreshDebounce = Timer(delay, () {
+      if (_disposed) return;
       final activeId = _currentAccountId ?? _accounts.firstOrNull?.id;
       if (activeId != null) {
         unawaited(refreshQuota(activeId));
       }
     });
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _refreshTimer?.cancel();
+    _refreshTimer = null;
+    _postTurnRefreshDebounce?.cancel();
+    _postTurnRefreshDebounce = null;
+    super.dispose();
   }
 
   Future<void> _saveAccount(AntigravityAccount account) async {
@@ -303,8 +480,8 @@ class AntigravityAccounts extends ChangeNotifier {
     await AntigravityCredentialSwitcher.writeAtomicSecure(path, encoded);
   }
 
-  Future<void> _saveIndex() async {
-    final path = p.join(dataDirectoryPath, 'accounts.json');
+  Future<void> _saveIndex({String? dirPath}) async {
+    final path = p.join(dirPath ?? dataDirectoryPath, 'accounts.json');
     final payload = {
       'version': '2.0',
       'accounts': [for (final a in _accounts) a.toIndexSummaryJson()],
@@ -363,7 +540,7 @@ class AntigravityAccounts extends ChangeNotifier {
       throw Exception('未找到指定账号 ($accountId)');
     }
     _switchingId = accountId;
-    notifyListeners();
+    _safeNotify();
     try {
       var acc = _accounts[idx];
       final freshToken = await AntigravityOAuth.ensureFreshToken(acc.token);
@@ -383,6 +560,7 @@ class AntigravityAccounts extends ChangeNotifier {
         syncExternalClients: _autoSwitch.syncExternalClients,
       );
 
+      _loadEpoch++;
       _accounts[idx] = acc;
       _currentAccountId = acc.id;
       await _saveAccount(acc);
@@ -398,7 +576,7 @@ class AntigravityAccounts extends ChangeNotifier {
       return acc;
     } finally {
       _switchingId = null;
-      notifyListeners();
+      _safeNotify();
     }
   }
 
@@ -407,19 +585,22 @@ class AntigravityAccounts extends ChangeNotifier {
     String accountId, {
     bool rethrowOnError = false,
   }) async {
+    if (_disposed) return null;
     await ensureInitialized();
-    if (_refreshingIds.contains(accountId)) return null;
+    if (_disposed || _refreshingIds.contains(accountId)) return null;
     final idx = _accounts.indexWhere((a) => a.id == accountId);
     if (idx < 0) return null;
 
     _refreshingIds.add(accountId);
-    notifyListeners();
+    _safeNotify();
     try {
       final updated = await AntigravityQuotaFetcher.refreshAccountQuota(
         _accounts[idx],
       );
+      if (_disposed) return null;
       final currentIdx = _accounts.indexWhere((a) => a.id == accountId);
       if (currentIdx >= 0) {
+        _loadEpoch++;
         _accounts[currentIdx] = updated;
         await _saveAccount(updated);
         await _saveIndex();
@@ -437,17 +618,18 @@ class AntigravityAccounts extends ChangeNotifier {
       return null;
     } finally {
       _refreshingIds.remove(accountId);
-      notifyListeners();
+      _safeNotify();
     }
   }
 
   /// Refreshes quotas for all non-disabled accounts, prioritizing the active
   /// account first so the Usage pill & popover update immediately.
   Future<void> refreshAllQuotas({bool silent = false}) async {
+    if (_disposed) return;
     await ensureInitialized();
-    if (_refreshingAll) return;
+    if (_disposed || _refreshingAll) return;
     _refreshingAll = true;
-    if (!silent) notifyListeners();
+    if (!silent) _safeNotify();
     try {
       final activeId = _currentAccountId;
       final targets = <String>[
@@ -464,11 +646,12 @@ class AntigravityAccounts extends ChangeNotifier {
             a.id,
       ];
       for (final id in targets) {
+        if (_disposed) break;
         await refreshQuota(id);
       }
     } finally {
       _refreshingAll = false;
-      notifyListeners();
+      _safeNotify();
     }
   }
 
@@ -488,6 +671,7 @@ class AntigravityAccounts extends ChangeNotifier {
     );
 
     AntigravityAccount account;
+    _loadEpoch++;
     if (existingIdx >= 0) {
       final prev = _accounts[existingIdx];
       account = prev.copyWith(
@@ -526,7 +710,7 @@ class AntigravityAccounts extends ChangeNotifier {
     }
     await _saveAccount(account);
     await _saveIndex();
-    notifyListeners();
+    _safeNotify();
 
     try {
       final withQuota = await refreshQuota(account.id);
@@ -640,7 +824,7 @@ class AntigravityAccounts extends ChangeNotifier {
       }
     }
     await _reconcileActiveWithKeyring();
-    notifyListeners();
+    _safeNotify();
     return (imported: imported, duplicates: duplicates, details: details);
   }
 
@@ -674,12 +858,13 @@ class AntigravityAccounts extends ChangeNotifier {
     final capped = (trimmed != null && trimmed.length > 15)
         ? trimmed.substring(0, 15)
         : trimmed;
+    _loadEpoch++;
     final updated = _accounts[idx].copyWith(
       customLabel: (capped == null || capped.isEmpty) ? null : capped,
     );
     _accounts[idx] = updated;
     await _saveAccount(updated);
-    notifyListeners();
+    _safeNotify();
   }
 
   Future<void> setDisabled(String accountId, bool disabled) async {
@@ -687,6 +872,7 @@ class AntigravityAccounts extends ChangeNotifier {
     final idx = _accounts.indexWhere((a) => a.id == accountId);
     if (idx < 0) return;
     final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    _loadEpoch++;
     final updated = _accounts[idx].copyWith(
       disabled: disabled,
       disabledAt: disabled ? nowSec : null,
@@ -695,13 +881,14 @@ class AntigravityAccounts extends ChangeNotifier {
     _accounts[idx] = updated;
     await _saveAccount(updated);
     await _saveIndex();
-    notifyListeners();
+    _safeNotify();
   }
 
   Future<void> deleteAccount(String accountId) async {
     await ensureInitialized();
     final idx = _accounts.indexWhere((a) => a.id == accountId);
     if (idx < 0) return;
+    _loadEpoch++;
     _accounts.removeAt(idx);
     final file = File(p.join(dataDirectoryPath, 'accounts', '$accountId.json'));
     if (file.existsSync()) {
@@ -715,18 +902,19 @@ class AntigravityAccounts extends ChangeNotifier {
       _currentAccountId = _accounts.firstOrNull?.id;
     }
     await _saveIndex();
-    notifyListeners();
+    _safeNotify();
   }
 
   Future<void> updateAutoSwitch(AntigravityAutoSwitchConfig next) async {
     await ensureInitialized();
+    _loadEpoch++;
     _autoSwitch = next;
     final path = p.join(dataDirectoryPath, 'auto_switch.json');
     await AntigravityCredentialSwitcher.writeAtomicSecure(
       path,
       const JsonEncoder.withIndent('  ').convert(next.toJson()),
     );
-    notifyListeners();
+    _safeNotify();
   }
 
   /// When [autoSwitch.enabled] is true and the active account hits quota

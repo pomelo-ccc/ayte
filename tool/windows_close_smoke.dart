@@ -8,7 +8,7 @@ import 'package:baocode/l10n/l10n.dart';
 import 'package:baocode/main.dart';
 import 'package:baocode/ide/terminal/pty.dart';
 import 'package:baocode/ide/terminal/pty_io.dart';
-import 'package:baocode/kernel/claude_code/process_transport_io.dart';
+import 'package:baocode/ide/lsp/lsp_process.dart';
 import 'package:baocode/platform/data_dir.dart';
 import 'package:baocode/window/app_windows.dart';
 import 'package:baocode/window/window_host.dart';
@@ -59,17 +59,22 @@ Future<void> main() async {
         ),
       );
       terminal.output.listen((_) {});
-      final process = await Process.start(
-        shell,
-        arguments,
-        workingDirectory: folder.path,
+      // Local stand-in for a running pipe child process (LSP): real pipes,
+      // no model requests.
+      final agentProcess = await startLspProcess(
+        LspLaunch(
+          serverId: 'window-smoke-agent',
+          executable: shell,
+          arguments: arguments,
+          workingDirectory: folder.path,
+          environment: Platform.environment,
+        ),
       );
-      // Local stand-in for a running Agent: real pipes, no model requests.
-      // ignore: invalid_use_of_visible_for_testing_member
-      ProcessTransport.forProcess(process);
+      agentProcess.stdout.listen((_) {});
+      agentProcess.stderr.listen((_) {});
       stdout.writeln(
         'WINDOW_SMOKE INSTALLER READY '
-        'terminal=${terminal.pid} agent=${process.pid}',
+        'terminal=${terminal.pid} agent=${agentProcess.pid}',
       );
       return;
     }

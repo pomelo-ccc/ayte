@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 
 import '../kernel_types.dart';
+import 'codex_catalog.dart';
 
 /// A model reported by local Codex CLI (`~/.codex/` catalog or `codex app-server`
 /// `model/list`).
@@ -68,17 +69,15 @@ abstract final class CodexModels {
     String? defaultModel,
     String? defaultEffort,
   })
-  loadLocalCatalog({String? codexHome}) {
+  loadLocalCatalog({
+    String? codexHome,
+    @visibleForTesting Map<String, String>? environment,
+  }) {
     try {
-      final home =
-          codexHome ??
-          Platform.environment['CODEX_HOME'] ??
-          p.join(
-            Platform.environment['HOME'] ??
-                Platform.environment['USERPROFILE'] ??
-                '',
-            '.codex',
-          );
+      final home = CodexCatalog.resolveHomeFromEnv(
+        environment ?? Platform.environment,
+        codexHome: codexHome,
+      );
       if (home.isEmpty || !Directory(home).existsSync()) {
         return (models: fallback, defaultModel: null, defaultEffort: null);
       }

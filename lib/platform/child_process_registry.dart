@@ -47,9 +47,16 @@ class ChildProcessRegistry {
   /// Entries of other apps still running, kept as they were.
   final List<Map<String, Object?>> _others = [];
   Future<void> _writes = Future.value();
+  bool _reapDone = false;
+  int _pendingOps = 0;
+  bool _writesDone = true;
+
+  bool get isIdle =>
+      _reaped == null || (_reapDone && _pendingOps == 0 && _writesDone);
 
   /// Completes once what a previous run left is ended; started on first use.
-  Future<void> get reaped => _reaped ??= _reap();
+  Future<void> get reaped =>
+      _reaped ??= _reap().whenComplete(() => _reapDone = true);
   Future<void>? _reaped;
 
   Future<void> _reap() async {
@@ -88,50 +95,71 @@ class ChildProcessRegistry {
 
   /// Records [child]; its command line is looked up unless given.
   Future<void> add(int child, {String? command}) async {
-    await reaped;
-    if (command == null && !Platform.isWindows) {
-      try {
-        command = (await lookup(child))?.command;
-      } on Object {
-        // Recorded without one: only [recognizes] can end it later.
+    _pendingOps++;
+    try {
+      await reaped;
+      if (command == null && !Platform.isWindows) {
+        try {
+          command = (await lookup(child))?.command;
+        } on Object {
+          // Recorded without one: only [recognizes] can end it later.
+        }
       }
+      _children[child] = command;
+      await _save();
+    } finally {
+      _pendingOps--;
     }
-    _children[child] = command;
-    await _save();
   }
 
   Future<void> remove(int child) async {
-    await reaped;
-    if (_children.containsKey(child)) {
-      _children.remove(child);
-      await _save();
+    _pendingOps++;
+    try {
+      await reaped;
+      if (_children.containsKey(child)) {
+        _children.remove(child);
+        await _save();
+      }
+    } finally {
+      _pendingOps--;
     }
   }
 
-  Future<void> _save() => _writes = _writes.then((_) async {
-    try {
-      await file.parent.create(recursive: true);
-      // Written aside, then renamed over: a reader (the next run, reaping)
-      // never sees half a file.
-      await writeFileAtomically(
-        file,
-        jsonEncode([
-          ..._others,
-          for (final MapEntry(key: child, value: command) in _children.entries)
-            {'pid': child, 'parent': ownPid, 'command': ?command},
-        ]),
-      );
-    } on FileSystemException {
-      // Best effort: at worst a leftover is not found next time.
-    }
-  });
+  Future<void> _save() {
+    _writesDone = false;
+    late final Future<void> next;
+    next = _writes = _writes.then((_) async {
+      try {
+        await file.parent.create(recursive: true);
+        // Written aside, then renamed over: a reader (the next run, reaping)
+        // never sees half a file.
+        await writeFileAtomically(
+          file,
+          jsonEncode([
+            ..._others,
+            for (final MapEntry(key: child, value: command) in _children.entries)
+              {'pid': child, 'parent': ownPid, 'command': ?command},
+          ]),
+        );
+      } on FileSystemException {
+        // Best effort: at worst a leftover is not found next time.
+      } finally {
+        if (identical(_writes, next)) {
+          _writesDone = true;
+        }
+      }
+    });
+    return next;
+  }
 
   /// Completes once every change made so far is written: awaited as the
   /// app quits, so that it does not end mid-write (leaving the file aside
   /// behind, and the list out of date).
   Future<void> flush() async {
     final reaped = _reaped;
-    if (reaped == null) return; // Never used: nothing to write.
+    if (reaped == null || (_reapDone && _pendingOps == 0 && _writesDone)) {
+      return; // Never used or already idle: nothing to write.
+    }
     await reaped;
     // A removal under way (past its own wait for [reaped]) is chained on
     // first.

@@ -268,9 +268,11 @@ abstract final class AntigravityModels {
   /// `@antigravity-cli/<id>`, family IDs like `gemini-4-carbon`, and legacy
   /// variant IDs like `gemini-4-carbon-medium`).
   static AntigravityModel? of(String? model) {
+    if (model == null || model.isEmpty) return null;
+    final prefixed = model.startsWith('@$antigravityBuiltinProviderId/');
     final bare = stripPrefix(model);
     if (bare.isEmpty) return null;
-    if (bare == 'default') return _current.first;
+    if (bare == 'default') return prefixed ? _current.first : null;
     for (final m in _current) {
       if (m.id == bare || m.effectiveCliModel == bare) return m;
     }
@@ -472,63 +474,142 @@ abstract final class LocalAntigravity {
   static bool? _installed;
   static Map<String, String>? _shellEnv;
 
+  static String? _lookupEnvVar(
+    Map<String, String> env,
+    String name, {
+    required bool win,
+  }) {
+    if (env[name] case final v? when v.isNotEmpty) return v;
+    if (win) {
+      final lower = name.toLowerCase();
+      for (final entry in env.entries) {
+        if (entry.key.toLowerCase() == lower && entry.value.isNotEmpty) {
+          return entry.value;
+        }
+      }
+      for (final entry in env.entries) {
+        if (entry.key.toLowerCase() == lower) {
+          return entry.value;
+        }
+      }
+    } else if (env.containsKey(name)) {
+      return env[name];
+    }
+    return null;
+  }
+
+  static String _resolveHome(
+    Map<String, String> env, {
+    required bool win,
+  }) {
+    final baseHome = _lookupEnvVar(env, 'HOME', win: win);
+    if (baseHome != null && baseHome.isNotEmpty) return baseHome;
+    final baseUserProfile = _lookupEnvVar(env, 'USERPROFILE', win: win);
+    if (baseUserProfile != null && baseUserProfile.isNotEmpty) {
+      return baseUserProfile;
+    }
+    if (baseHome != null || baseUserProfile != null) {
+      return '';
+    }
+    final hostHome = _lookupEnvVar(Platform.environment, 'HOME', win: win);
+    if (hostHome != null && hostHome.isNotEmpty) return hostHome;
+    return _lookupEnvVar(Platform.environment, 'USERPROFILE', win: win) ?? '';
+  }
+
+  static String _readPathVar(
+    Map<String, String> env, {
+    required bool win,
+  }) =>
+      _lookupEnvVar(env, 'PATH', win: win) ??
+      _lookupEnvVar(Platform.environment, 'PATH', win: win) ??
+      '';
+
   static String _expandHome(String path, Map<String, String> env) {
     if (path == '~' || path.startsWith('~/') || path.startsWith(r'~\')) {
-      final home =
-          env['HOME'] ??
-          env['USERPROFILE'] ??
-          Platform.environment['HOME'] ??
-          '';
+      final home = _resolveHome(env, win: Platform.isWindows);
       return '$home${path.substring(1)}';
     }
     return path;
   }
 
-  /// Candidate binary locations for `agy`, in priority order.
-  static List<String> _candidates(Map<String, String> env) {
-    final home =
-        env['HOME'] ??
-        env['USERPROFILE'] ??
-        Platform.environment['HOME'] ??
-        '';
-    final exe = Platform.isWindows ? 'agy.exe' : 'agy';
-    final paths = <String>[
-      if (home.isNotEmpty) ...[
-        p.join(home, '.gemini', 'bin', exe),
-        p.join(home, '.local', 'bin', exe),
-        p.join(home, '.antigravity', 'antigravity', 'bin', exe),
-      ],
-      if (Platform.isMacOS) ...[
-        '/Applications/Gemini.app/Contents/Helpers/agy',
-        '/Applications/Antigravity.app/Contents/Resources/app/bin/agy',
-        '/opt/homebrew/bin/agy',
-        '/usr/local/bin/agy',
-      ],
-      if (Platform.isLinux) ...[
-        '/usr/local/bin/agy',
-        '/usr/bin/agy',
-      ],
-    ];
-    final pathVar = env['PATH'] ?? Platform.environment['PATH'] ?? '';
-    final sep = Platform.isWindows ? ';' : ':';
+  @visibleForTesting
+  static List<String> candidatesForTesting(
+    Map<String, String> env, {
+    bool? forceWindows,
+    bool? forceMacOS,
+    bool? forceLinux,
+  }) => _candidates(
+    env,
+    forceWindows: forceWindows,
+    forceMacOS: forceMacOS,
+    forceLinux: forceLinux,
+  );
+
+  @visibleForTesting
+  static String? findExecutableForTesting(
+    Map<String, String> env, {
+    bool? forceWindows,
+  }) => _findExecutable(env, forceWindows: forceWindows);
+
+  /// Candidate binary locations for `agy`, in priority order (explicit `PATH`
+  /// entries first, followed by standard installation directories).
+  static List<String> _candidates(
+    Map<String, String> env, {
+    bool? forceWindows,
+    bool? forceMacOS,
+    bool? forceLinux,
+  }) {
+    final win = forceWindows ?? Platform.isWindows;
+    final mac = forceMacOS ?? (!win && Platform.isMacOS);
+    final linux = forceLinux ?? (!win && !mac && Platform.isLinux);
+    final home = _resolveHome(env, win: win);
+    final exe = win ? 'agy.exe' : 'agy';
+    final paths = <String>[];
+    final seen = <String>{};
+    void addCandidate(String candidate) {
+      final key = win ? candidate.toLowerCase() : candidate;
+      if (seen.add(key)) {
+        paths.add(candidate);
+      }
+    }
+
+    final pathVar = _readPathVar(env, win: win);
+    final sep = win ? ';' : ':';
     for (final dir in pathVar.split(sep)) {
       final trimmed = dir.trim();
       if (trimmed.isEmpty) continue;
-      final candidate = p.join(trimmed, exe);
-      if (!paths.contains(candidate)) {
-        paths.add(candidate);
-      }
+      addCandidate(win ? p.windows.join(trimmed, exe) : p.join(trimmed, exe));
+    }
+
+    if (home.isNotEmpty) {
+      final join = win ? p.windows.join : p.join;
+      addCandidate(join(home, '.gemini', 'bin', exe));
+      addCandidate(join(home, '.local', 'bin', exe));
+      addCandidate(join(home, '.antigravity', 'antigravity', 'bin', exe));
+    }
+    if (mac) {
+      addCandidate('/Applications/Gemini.app/Contents/Helpers/agy');
+      addCandidate('/Applications/Antigravity.app/Contents/Resources/app/bin/agy');
+      addCandidate('/opt/homebrew/bin/agy');
+      addCandidate('/usr/local/bin/agy');
+    }
+    if (linux) {
+      addCandidate('/usr/local/bin/agy');
+      addCandidate('/usr/bin/agy');
     }
     return paths;
   }
 
-  static String? _findExecutable(Map<String, String> env) {
+  static String? _findExecutable(
+    Map<String, String> env, {
+    bool? forceWindows,
+  }) {
     final configured = AntigravityPathSetting.current();
     if (configured != null) {
       final expanded = _expandHome(configured, env);
       return File(expanded).existsSync() ? expanded : null;
     }
-    for (final candidate in _candidates(env)) {
+    for (final candidate in _candidates(env, forceWindows: forceWindows)) {
       if (File(candidate).existsSync()) return candidate;
     }
     return null;
@@ -588,7 +669,7 @@ abstract final class LocalAntigravity {
   /// Status of `agy` on this machine for Settings → General.
   static Future<LocalClaudeStatus?> status() async {
     if (kIsWeb) return null;
-    final env = _shellEnv ?? await ClaudeEnvironment.of();
+    final env = await ClaudeEnvironment.of();
     _shellEnv = env;
     final configured = AntigravityPathSetting.current();
     if (configured != null) {
@@ -636,7 +717,7 @@ abstract final class LocalAntigravity {
   /// [ClaudeUnavailable] if not found.
   static Future<({String executable, Map<String, String> environment})>
   locate() async {
-    final env = _shellEnv ?? await ClaudeEnvironment.of();
+    final env = await ClaudeEnvironment.of();
     _shellEnv = env;
     final configured = AntigravityPathSetting.current();
     if (configured != null) {

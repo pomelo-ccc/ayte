@@ -152,10 +152,12 @@ void main() {
     addTearDown(() => BaoBash.current = null);
   });
 
-  for (final core in [ClaudeCore.builtin, ClaudeCore.cli]) {
+  for (final core in [ClaudeCore.builtin, ClaudeCore.antigravity]) {
     test('${core.name}: an agent\'s commands run with BaoCode Bash', () async {
       if (skip != null) return markTestSkipped(skip);
+      final previousCore = ClaudeCore.current;
       ClaudeCore.current = () => core;
+      addTearDown(() => ClaudeCore.current = previousCore);
       final kernel = KernelRegistry.claudeCode.create(
         KernelContext(
           cwd: cwd,

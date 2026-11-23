@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 
+import '../../acp/ayte_ipc_server.dart';
 import '../../bash_exe/bao_bash.dart';
 import '../../bash_exe/bao_bash_view.dart';
 import '../../ide/explorer_excludes.dart';
@@ -306,6 +307,7 @@ class GeneralSettingsPage extends StatelessWidget {
                   ],
                 ),
               ),
+            if (!kIsWeb) const SettingsCard(children: [_AyteCliSetting()]),
             SettingsCard(
               children: [
                 SettingsRow(
@@ -917,6 +919,124 @@ class _AntigravityPathSettingState extends State<_AntigravityPathSetting> {
         semanticLabel: 'Antigravity CLI ${l10n.claudePathSetting}',
         width: 260,
         onSubmitted: widget.onChanged,
+      ),
+    );
+  }
+}
+
+/// `ayte-cli` installation status, local IPC server port/state, and
+/// Install / Reinstall / Uninstall actions.
+class _AyteCliSetting extends StatefulWidget {
+  const _AyteCliSetting();
+
+  @override
+  State<_AyteCliSetting> createState() => _AyteCliSettingState();
+}
+
+class _AyteCliSettingState extends State<_AyteCliSetting> {
+  bool _busy = false;
+  String? _feedback;
+  bool _isError = false;
+
+  AyteIpcServer get _ipc => AyteIpcServer.instance;
+
+  @override
+  void initState() {
+    super.initState();
+    _ipc.addListener(_onIpcChanged);
+  }
+
+  @override
+  void dispose() {
+    _ipc.removeListener(_onIpcChanged);
+    super.dispose();
+  }
+
+  void _onIpcChanged() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _install(bool isZh) async {
+    setState(() {
+      _busy = true;
+      _feedback = null;
+      _isError = false;
+    });
+    final ok = await _ipc.installCli();
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      _isError = !ok;
+      _feedback = ok
+          ? (isZh ? '已安装 ayte-cli' : 'ayte-cli installed')
+          : (isZh ? '安装 ayte-cli 失败' : 'Failed to install ayte-cli');
+    });
+  }
+
+  Future<void> _uninstall(bool isZh) async {
+    setState(() {
+      _busy = true;
+      _feedback = null;
+      _isError = false;
+    });
+    await _ipc.uninstallCli();
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      _isError = false;
+      _feedback = isZh ? '已卸载 ayte-cli' : 'ayte-cli uninstalled';
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isZh = Localizations.localeOf(context).languageCode == 'zh';
+    final installed = _ipc.isCliInstalled;
+    final running = _ipc.running;
+    final port = _ipc.port;
+    final cliStatusText = installed
+        ? (isZh ? 'CLI 状态：已安装' : 'CLI status: Installed')
+        : (isZh ? 'CLI 状态：未安装' : 'CLI status: Not installed');
+    final ipcStatusText = running
+        ? (isZh
+              ? 'IPC 服务：运行中 (127.0.0.1:${port ?? '-'})'
+              : 'IPC server: Running (127.0.0.1:${port ?? '-'})')
+        : (isZh ? 'IPC 服务：未启动' : 'IPC server: Stopped');
+
+    return SettingsRow(
+      label: isZh ? 'ayte-cli 命令行接口' : 'ayte-cli Command',
+      description: isZh
+          ? '在终端或 CI 脚本中驱动 Ayte（路径：${_ipc.cliInstallPath}）'
+          : 'Drive Ayte from terminal or CI scripts (${_ipc.cliInstallPath})',
+      below: [
+        Text(cliStatusText, style: SettingsText.description),
+        SelectableText(ipcStatusText, style: SettingsText.path),
+        if (_feedback != null)
+          SelectableText(
+            _feedback!,
+            style: _isError
+                ? SettingsText.description.copyWith(
+                    color: themeColors['errorForeground'],
+                  )
+                : SettingsText.description,
+          ),
+      ],
+      trailing: SettingsButtons(
+        children: [
+          IdeButton(
+            label: installed
+                ? (isZh ? '重新安装' : 'Reinstall')
+                : (isZh ? '安装' : 'Install'),
+            onPressed: _busy ? null : () => unawaited(_install(isZh)),
+          ),
+          IdeButton(
+            label: isZh ? '卸载' : 'Uninstall',
+            secondary: true,
+            onPressed: _busy || !installed
+                ? null
+                : () => unawaited(_uninstall(isZh)),
+          ),
+        ],
       ),
     );
   }

@@ -679,7 +679,8 @@ class WorkspaceBridge {
           case final paths:
             session.keepChanges([
               for (final change in session.fileChanges)
-                if (paths.contains(change.path)) change,
+                if (paths.contains(_canonicalPath(session, change.path)))
+                  change,
             ]);
         }
         return null;
@@ -691,7 +692,8 @@ class WorkspaceBridge {
           case final paths:
             session.undoChanges?.call([
               for (final change in session.fileChanges)
-                if (paths.contains(change.path)) change,
+                if (paths.contains(_canonicalPath(session, change.path)))
+                  change,
             ]);
         }
         return null;
@@ -1375,17 +1377,22 @@ class WorkspaceBridge {
     return [for (final list in lists) ...list];
   }
 
-  /// The changes' paths [params] names, absolute as [session] has them;
-  /// null for all of them.
+  /// The changes' paths [params] names, canonicalized as [session] resolves
+  /// them; null for all of them.
   static Set<String>? _paths(Map<String, Object?> params, ChatSession session) {
     final paths = params['paths'];
     if (paths is! List) return null;
     return {
       for (final path in paths.whereType<String>())
-        session.paths.isAbsolute(path) || session.root == null
-            ? path
-            : session.paths.join(session.root!, path),
+        if (_canonicalPath(session, path) case final key when key.isNotEmpty)
+          key,
     };
+  }
+
+  static String _canonicalPath(ChatSession session, String path) {
+    if (path.trim().isEmpty) return '';
+    final resolved = session.resolvePath(path);
+    return resolved.isEmpty ? '' : session.paths.canonicalize(resolved);
   }
 
   static void _choose(ChatSession session, String kind, String id) {

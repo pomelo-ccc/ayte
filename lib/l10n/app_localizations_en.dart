@@ -3919,6 +3919,20 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
+  String get trayRunningHeader => 'Running';
+
+  @override
+  String trayUnreadCount(int count) {
+    return '$count finished';
+  }
+
+  @override
+  String get trayIdle => 'All caught up';
+
+  @override
+  String get trayIdleHint => 'Agents keep working here in the background.';
+
+  @override
   String get trayQuit => 'Quit Ayte';
 
   @override

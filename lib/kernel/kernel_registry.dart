@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 
 import 'agent_kernel.dart';
+import 'antigravity/antigravity_catalog.dart';
 import 'antigravity/antigravity_cli.dart' show antigravityBuiltinProviderId;
 import 'claude_code/claude_code_kernel.dart';
 import 'codebuddy/codebuddy_cli.dart' show codebuddyBuiltinProviderId;
+import 'codex/codex_catalog.dart';
 import 'codex/codex_kernel.dart';
 import 'codex/codex_process_transport.dart';
 import '../remote/remote_claude.dart';
@@ -32,7 +34,7 @@ abstract final class KernelRegistry {
       usageOffBy: () => claudeUsageOffByAt(context.cwd),
       rejectTooOld: rejectTooOldClaude,
     ),
-    catalog: const ClaudeCatalog(),
+    catalog: const AntigravityCatalog(),
   );
 
   static final KernelDescriptor codebuddy = KernelDescriptor(
@@ -81,8 +83,10 @@ abstract final class KernelRegistry {
     create: (context) => CodexKernel(
       codex,
       ProcessCodexTransport(cwd: context.cwd),
+      context: context,
       loadLocalCatalog: true,
     ),
+    catalog: const CodexCatalog(),
   );
 
   static List<KernelDescriptor> _all = [

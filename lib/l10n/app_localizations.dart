@@ -6578,6 +6578,30 @@ abstract class AppLocalizations {
   /// **'{count} running'**
   String trayRunning(int count);
 
+  /// Tray popover section header over currently running agents.
+  ///
+  /// In en, this message translates to:
+  /// **'Running'**
+  String get trayRunningHeader;
+
+  /// Tray summary: how many agents finished unread.
+  ///
+  /// In en, this message translates to:
+  /// **'{count} finished'**
+  String trayUnreadCount(int count);
+
+  /// Tray popover status when no agents are waiting, running, or unread.
+  ///
+  /// In en, this message translates to:
+  /// **'All caught up'**
+  String get trayIdle;
+
+  /// Tray popover empty state helper text.
+  ///
+  /// In en, this message translates to:
+  /// **'Agents keep working here in the background.'**
+  String get trayIdleHint;
+
   /// No description provided for @trayQuit.
   ///
   /// In en, this message translates to:

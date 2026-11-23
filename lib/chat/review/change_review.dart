@@ -11,7 +11,10 @@ import 'unpatch.dart';
 
 /// A file the agent changed: what it was before, and what the agent left.
 class _Entry {
-  _Entry(this.base) : after = base, current = base;
+  _Entry(this.path, this.base) : after = base, current = base;
+
+  /// First-seen normalized absolute path (in `root` where in `realRoot`).
+  final String path;
 
   /// What it was before the agent's first edit, with what changed in it
   /// since that was not the agent's: undone, the file goes back to it.
@@ -38,9 +41,9 @@ class _Entry {
     'conflict': conflict,
   };
 
-  static _Entry fromJson(Map<String, Object?> json) {
+  static _Entry fromJson(Map<String, Object?> json, {required String path}) {
     final after = ReviewBlob.fromJson(json['after']);
-    return _Entry(ReviewBlob.fromJson(json['base']))
+    return _Entry(path, ReviewBlob.fromJson(json['base']))
       ..after = after
       ..current = after
       ..conflict = json['conflict'] == true;
@@ -53,8 +56,9 @@ bool _same(ReviewBlob? a, ReviewBlob? b) =>
 /// What one turn of the agent's did to a file: what it was before the
 /// turn's first edit of it, and what the turn left.
 class _Step {
-  _Step(this.before) : after = before;
+  _Step(this.path, this.before) : after = before;
 
+  final String path;
   ReviewBlob? before;
   ReviewBlob? after;
 
@@ -63,8 +67,8 @@ class _Step {
     'after': after?.toJson(),
   };
 
-  static _Step fromJson(Map<String, Object?> json) =>
-      _Step(ReviewBlob.fromJson(json['before']))
+  static _Step fromJson(Map<String, Object?> json, {required String path}) =>
+      _Step(path, ReviewBlob.fromJson(json['before']))
         ..after = ReviewBlob.fromJson(json['after']);
 }
 
@@ -201,10 +205,10 @@ class ChangeReview extends ChangeNotifier {
 
   /// [key]'s file is [blob] as [turn] is about to change it: kept as what
   /// it was before the turn, the first time.
-  void _stepBefore(String? turn, String key, ReviewBlob? blob) {
+  void _stepBefore(String? turn, String key, String path, ReviewBlob? blob) {
     if (turn == null) return;
     final files = _turns[turn] ??= {};
-    files.putIfAbsent(key, () => _Step(blob));
+    files.putIfAbsent(key, () => _Step(path, blob));
     while (_turns.length > maxTurns) {
       _turns.remove(_turns.keys.first);
     }
@@ -279,14 +283,16 @@ class ChangeReview extends ChangeNotifier {
   /// wrote it is not the agent's. [turn] is the user message whose turn
   /// it is, for [rewind].
   Future<void> before(String path, {String? turn}) {
-    final key = _key(path);
+    final resolved = _displayPath(path);
+    if (resolved.isEmpty) return Future.value();
+    final key = _canonical(resolved);
     return _enqueue(() async {
       final entry = _entries[key];
       if (entry == null) {
         try {
-          final now = await _store.take(key);
-          _entries[key] = _Entry(now)..writing = 1;
-          _stepBefore(turn, key, now);
+          final now = await _store.take(resolved);
+          _entries[key] = _Entry(resolved, now)..writing = 1;
+          _stepBefore(turn, key, resolved, now);
         } on Exception {
           // Not to be kept (too large): listed once reported, not undone.
         }
@@ -296,19 +302,19 @@ class ChangeReview extends ChangeNotifier {
       final busy = entry.writing > 0;
       entry.writing++;
       if (!busy) {
-        final now = await _store.current(key);
+        final now = await _store.current(entry.path);
         entry.current = now;
-        if (!_same(now, entry.after)) await _rebase(entry, key);
+        if (!_same(now, entry.after)) await _rebase(entry);
       }
-      _stepBefore(turn, key, entry.after);
+      _stepBefore(turn, key, entry.path, entry.after);
     });
   }
 
   /// What changed in [entry]'s file since the agent left it (another
   /// agent, the user) put into what it is held against: the agent's change
   /// stays its own.
-  Future<void> _rebase(_Entry entry, String key) async {
-    final now = await _store.take(key);
+  Future<void> _rebase(_Entry entry) async {
+    final now = await _store.take(entry.path);
     final base = entry.base;
     final after = entry.after;
     if (now == null || after == null) {
@@ -332,6 +338,7 @@ class ChangeReview extends ChangeNotifier {
   /// change (and [turn]'s).
   Future<void> after(String path, {String? turn}) {
     final key = _key(path);
+    if (key.isEmpty) return Future.value();
     return _enqueue(() async {
       final entry = _entries[key];
       if (entry == null) return;
@@ -345,7 +352,7 @@ class ChangeReview extends ChangeNotifier {
   /// [entry]'s file as it is now is what the agent left (in [turn], else
   /// the last turn that changed it).
   Future<void> _taken(_Entry entry, String key, {String? turn}) async {
-    final now = await _store.take(key);
+    final now = await _store.take(entry.path);
     entry
       ..after = now
       ..current = now
@@ -357,14 +364,16 @@ class ChangeReview extends ChangeNotifier {
   /// once the edit is made, by a kernel that does not tell [before] (or
   /// tells this as well).
   void report(FileChange change, {FileOriginal? original}) {
-    final key = _key(change.path);
+    final resolved = _displayPath(change.path);
+    if (resolved.isEmpty) return;
+    final key = _canonical(resolved);
     unawaited(
       _enqueue(() async {
         if (_entries[key] case final entry?) {
           // Its last edit done: what it left, once more.
           if (entry.writing == 0) await _taken(entry, key);
         } else {
-          await _adopt(key, change, original);
+          await _adopt(key, resolved, change, original);
         }
         await _refresh();
         await _persist();
@@ -376,21 +385,23 @@ class ChangeReview extends ChangeNotifier {
   /// the agent told, else listed to be kept.
   Future<void> _adopt(
     String key,
+    String path,
     FileChange change,
     FileOriginal? original,
   ) async {
-    final known = original == null ? null : await _baseOf(key, original);
+    final known = original == null ? null : await _baseOf(path, original);
     if (known == null) {
+      final prior = _unseen[key];
       _unseen[key] = FileChange(
-        path: key,
-        added: (_unseen[key]?.added ?? 0) + change.added,
-        removed: (_unseen[key]?.removed ?? 0) + change.removed,
+        path: prior?.path ?? path,
+        added: (prior?.added ?? 0) + change.added,
+        removed: (prior?.removed ?? 0) + change.removed,
         tracked: false,
       );
       return;
     }
-    final now = await _store.take(key);
-    _entries[key] = _Entry(known.base)
+    final now = await _store.take(path);
+    _entries[key] = _Entry(path, known.base)
       ..after = now
       ..current = now;
   }
@@ -429,13 +440,13 @@ class ChangeReview extends ChangeNotifier {
   /// the agent's, and edits it began and did not tell the end of (denied,
   /// stopped) are over.
   Future<void> look() => _enqueue(() async {
-    for (final MapEntry(key: path, value: entry) in _entries.entries) {
+    for (final MapEntry(:key, value: entry) in _entries.entries) {
       if (entry.writing > 0) {
         entry.writing = 0;
-        await _taken(entry, path);
+        await _taken(entry, key);
         continue;
       }
-      final now = await _store.current(path);
+      final now = await _store.current(entry.path);
       if (_same(now, entry.current)) continue;
       entry
         ..current = now
@@ -443,8 +454,8 @@ class ChangeReview extends ChangeNotifier {
     }
     // Those it cannot undo that are gone since (a script the agent wrote
     // and deleted): nothing is left of them to keep.
-    for (final path in [..._unseen.keys]) {
-      if (await _store.current(path) == null) _unseen.remove(path);
+    for (final MapEntry(:key, value: change) in [..._unseen.entries]) {
+      if (await _store.current(change.path) == null) _unseen.remove(key);
     }
     await _refresh();
     await _persist();
@@ -467,8 +478,9 @@ class ChangeReview extends ChangeNotifier {
   Future<void> _refresh() async {
     _entries.removeWhere((_, entry) => !entry.pending && entry.writing == 0);
     final listed = <FileChange>[];
-    for (final path in _entries.keys.toList()..sort()) {
-      final entry = _entries[path]!;
+    final entries = _entries.values.toList()
+      ..sort((a, b) => a.path.compareTo(b.path));
+    for (final entry in entries) {
       if (!entry.pending) continue;
       ({int added, int removed})? counts;
       var counted = false;
@@ -480,7 +492,7 @@ class ChangeReview extends ChangeNotifier {
       }
       listed.add(
         FileChange(
-          path: path,
+          path: entry.path,
           added: counts?.added ?? 0,
           removed: counts?.removed ?? 0,
           binary: counted && counts == null,
@@ -525,12 +537,12 @@ class ChangeReview extends ChangeNotifier {
   Future<void> undo(Iterable<String> paths) {
     final wanted = [for (final path in paths) _key(path)];
     return _enqueue(() async {
-      for (final path in wanted) {
-        final entry = _entries[path];
+      for (final key in wanted) {
+        final entry = _entries[key];
         if (entry == null || !entry.pending) continue;
         try {
-          if (await _undo(path, entry)) {
-            _entries.remove(path);
+          if (await _undo(entry.path, entry)) {
+            _entries.remove(key);
           } else {
             entry.conflict = true;
           }
@@ -544,8 +556,8 @@ class ChangeReview extends ChangeNotifier {
   }
 
   Future<void> undoAll() => undo([
-    for (final MapEntry(key: path, value: entry) in _entries.entries)
-      if (entry.pending) path,
+    for (final entry in _entries.values)
+      if (entry.pending) entry.path,
   ]);
 
   /// Whether [path] is back as it was.
@@ -585,7 +597,7 @@ class ChangeReview extends ChangeNotifier {
     unawaited(
       _enqueue(() async {
         final files = <RewindFile>[];
-        for (final (path, steps) in _stepsOf(turns)) {
+        for (final (_, path, steps) in _stepsOf(turns)) {
           if (await _rewound(path, steps) case (final file, _)?) {
             files.add(file);
           }
@@ -608,7 +620,7 @@ class ChangeReview extends ChangeNotifier {
     unawaited(
       _enqueue(() async {
         final files = <RewindFile>[];
-        for (final (path, steps) in _stepsOf(turns)) {
+        for (final (key, path, steps) in _stepsOf(turns)) {
           final rewound = await _rewound(path, steps);
           if (rewound == null) continue;
           final (file, blob) = rewound;
@@ -616,7 +628,7 @@ class ChangeReview extends ChangeNotifier {
           if (file.outcome == RewindOutcome.conflict) continue;
           await _store.restore(path, blob, root: root);
           // What the agent has left of its change, if anything.
-          if (_entries[path] case final entry?) await _taken(entry, path);
+          if (_entries[key] case final entry?) await _taken(entry, key);
         }
         _forget(turns);
         await _refresh();
@@ -644,17 +656,18 @@ class ChangeReview extends ChangeNotifier {
 
   /// Each file [turns] changed, with what each of them did to it in the
   /// order they came.
-  Iterable<(String, List<_Step>)> _stepsOf(Set<String> turns) {
+  Iterable<(String, String, List<_Step>)> _stepsOf(Set<String> turns) {
     final steps = <String, List<_Step>>{};
     for (final MapEntry(key: turn, value: files) in _turns.entries) {
       if (!turns.contains(turn)) continue;
-      for (final MapEntry(key: path, value: step) in files.entries) {
-        (steps[path] ??= []).add(step);
+      for (final MapEntry(key: key, value: step) in files.entries) {
+        (steps[key] ??= []).add(step);
       }
     }
     return [
-      for (final path in steps.keys.toList()..sort()) (path, steps[path]!),
-    ];
+      for (final MapEntry(:key, value: list) in steps.entries)
+        (key, list.first.path, list),
+    ]..sort((a, b) => a.$2.compareTo(b.$2));
   }
 
   /// [path] without what [steps] did, the last first: what it would be,
@@ -750,7 +763,7 @@ class ChangeReview extends ChangeNotifier {
           // The file as it is now (saved since, it may be what is kept):
           // the change goes when nothing of it is left.
           entry
-            ..current = await _store.current(key)
+            ..current = await _store.current(entry.path)
             ..conflict = false;
         } on Object catch (error, stack) {
           return completer.completeError(error, stack);
@@ -810,8 +823,7 @@ class ChangeReview extends ChangeNotifier {
         : jsonEncode({
             'version': 5,
             'entries': {
-              for (final MapEntry(key: path, value: entry) in kept.entries)
-                path: entry.toJson(),
+              for (final entry in kept.values) entry.path: entry.toJson(),
             },
             'unseen': [
               for (final change in _unseen.values)
@@ -826,9 +838,7 @@ class ChangeReview extends ChangeNotifier {
                 {
                   'turn': turn,
                   'files': {
-                    for (final MapEntry(key: path, value: step)
-                        in files.entries)
-                      path: step.toJson(),
+                    for (final step in files.values) step.path: step.toJson(),
                   },
                 },
             ],
@@ -863,23 +873,41 @@ class ChangeReview extends ChangeNotifier {
         return;
       }
       if (json['entries'] case final Map<String, Object?> entries) {
-        for (final MapEntry(key: path, value: entry) in entries.entries) {
+        for (final MapEntry(key: rawPath, value: entry) in entries.entries) {
           if (entry is Map<String, Object?>) {
-            _entries[path] = _Entry.fromJson(entry);
+            final path = _displayPath(rawPath);
+            if (path.isEmpty) continue;
+            final key = _canonical(path);
+            final parsed = _Entry.fromJson(entry, path: path);
+            final prior = _entries[key];
+            if (prior == null) {
+              _entries[key] = parsed;
+            } else if (parsed.pending) {
+              _entries[key] = _Entry(prior.path, parsed.base ?? prior.base)
+                ..after = parsed.after ?? prior.after
+                ..current = parsed.current ?? prior.current
+                ..conflict = parsed.conflict || prior.conflict;
+            } else if (!prior.pending) {
+              _entries[key] = parsed;
+            }
           }
         }
       }
       if (json['unseen'] case final List<Object?> unseen) {
         for (final change in unseen) {
           if (change case {
-            'path': final String path,
+            'path': final String rawPath,
             'added': final int added,
             'removed': final int removed,
           }) {
-            _unseen[path] = FileChange(
-              path: path,
-              added: added,
-              removed: removed,
+            final path = _displayPath(rawPath);
+            if (path.isEmpty) continue;
+            final key = _canonical(path);
+            final prior = _unseen[key];
+            _unseen[key] = FileChange(
+              path: prior?.path ?? path,
+              added: (prior?.added ?? 0) + added,
+              removed: (prior?.removed ?? 0) + removed,
               tracked: false,
             );
           }
@@ -892,8 +920,13 @@ class ChangeReview extends ChangeNotifier {
             'files': final Map<String, Object?> files,
           }) {
             _turns[id] = {
-              for (final MapEntry(key: path, value: step) in files.entries)
-                if (step is Map<String, Object?>) path: _Step.fromJson(step),
+              for (final MapEntry(key: rawPath, value: step) in files.entries)
+                if (step is Map<String, Object?> &&
+                    _displayPath(rawPath).isNotEmpty)
+                  _key(rawPath): _Step.fromJson(
+                    step,
+                    path: _displayPath(rawPath),
+                  ),
             };
           }
         }
@@ -911,8 +944,9 @@ class ChangeReview extends ChangeNotifier {
   // --- Paths ------------------------------------------------------------------
 
   /// [path] (absolute, or relative to [root]) absolute, normalized, and in
-  /// [root] where it is in [realRoot].
-  String _key(String path) {
+  /// [root] where it is in [realRoot], preserving first-seen casing.
+  String _displayPath(String path) {
+    if (path.trim().isEmpty) return '';
     final absolute = _paths.normalize(
       _paths.isAbsolute(path)
           ? path
@@ -927,6 +961,12 @@ class ChangeReview extends ChangeNotifier {
       _paths.join(root, _paths.relative(absolute, from: real)),
     );
   }
+
+  String _canonical(String displayPath) =>
+      displayPath.isEmpty ? '' : _paths.canonicalize(displayPath);
+
+  /// Canonical lookup key for [path] (case-folded on Windows via [_paths]).
+  String _key(String path) => _canonical(_displayPath(path));
 
   /// Drops what it kept between runs, once what is under way is done: the
   /// conversation is gone.

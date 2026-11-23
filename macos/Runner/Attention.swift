@@ -5,9 +5,12 @@ import UserNotifications
 
 /// What tells the user an agent wants them while they look elsewhere (see
 /// lib/notifications/): the system's notifications, a sound, the Dock
-/// icon's badge and bounce, and the menu bar icon, whose menu brings the
+/// icon's badge and bounce, and the menu bar icon, whose popover brings the
 /// window — or an agent — back. Over `baocode/attention`.
-final class Attention: NSObject, UNUserNotificationCenterDelegate, NSSoundDelegate {
+final class Attention:
+  NSObject, UNUserNotificationCenterDelegate, NSSoundDelegate,
+  NSPopoverDelegate, NSMenuDelegate
+{
   /// The window's, for the app delegate to ask (see hidesOnClose).
   private(set) static weak var shared: Attention?
 
@@ -16,6 +19,16 @@ final class Attention: NSObject, UNUserNotificationCenterDelegate, NSSoundDelega
 
   /// The menu bar icon, while there is one (the `tray.enabled` setting).
   private var statusItem: NSStatusItem?
+
+  /// The custom card popover attached to the menu bar icon.
+  private var popover: NSPopover?
+  private var popoverController: TrayPopoverViewController?
+
+  /// Dismisses the popover when clicking outside while another app is active.
+  private var outsideClickMonitor: Any?
+
+  /// Temporary right-click menu shown on control-click / right-click.
+  private var contextMenu: NSMenu?
 
   /// Keep each sound alive until its own playback finishes.
   private var playingSounds: [NSSound] = []
@@ -32,6 +45,10 @@ final class Attention: NSObject, UNUserNotificationCenterDelegate, NSSoundDelega
     }
     UNUserNotificationCenter.current().delegate = self
     Attention.shared = self
+  }
+
+  deinit {
+    removeOutsideClickMonitor()
   }
 
   /// The close button hides the window while the menu bar icon can bring it
@@ -183,68 +200,206 @@ final class Attention: NSObject, UNUserNotificationCenterDelegate, NSSoundDelega
 
   // MARK: Menu bar
 
-  /// The menu bar icon and its menu, as the Flutter side describes them;
-  /// nil for none.
+  /// The menu bar icon and its popover state, as the Flutter side describes
+  /// them; nil removes the status item.
   private func setTray(_ state: [String: Any]?) {
     guard let state else {
+      closePopover()
+      contextMenu = nil
+      statusItem?.menu = nil
+      popover = nil
+      popoverController = nil
       if let statusItem { NSStatusBar.system.removeStatusItem(statusItem) }
       statusItem = nil
+      trayState = nil
       return
     }
-    let item = statusItem ?? NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-    statusItem = item
+    let item: NSStatusItem
+    if let existing = statusItem {
+      item = existing
+    } else {
+      item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+      if let button = item.button {
+        button.target = self
+        button.action = #selector(statusItemClicked(_:))
+        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        button.imagePosition = .imageLeading
+        button.imageHugsTitle = true
+        button.setAccessibilityTitle("Ayte")
+      }
+      statusItem = item
+    }
     trayState = state
     let dot = state["dot"] as? Bool ?? false
-    item.button?.image = Self.trayImage(dot: dot)
-    item.button?.toolTip = state["tooltip"] as? String
-    item.menu = menu(state)
+    let waitingCount = (state["waiting"] as? [[String: Any]])?.count ?? 0
+    let runningCount = (state["running"] as? [[String: Any]])?.count ?? 0
+
+    if let button = item.button {
+      button.image = Self.trayImage(
+        waitingCount: waitingCount,
+        runningCount: runningCount,
+        hasAttention: dot)
+      button.toolTip = state["tooltip"] as? String
+      if waitingCount > 0 {
+        let attrs: [NSAttributedString.Key: Any] = [
+          .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold),
+          .baselineOffset: 0.5,
+        ]
+        button.attributedTitle = NSAttributedString(
+          string: " \(waitingCount)", attributes: attrs)
+      } else {
+        button.title = ""
+      }
+    }
+
+    if popover?.isShown == true {
+      updatePopoverContent()
+    }
   }
 
   /// What Flutter last said of the menu bar icon.
   private var trayState: [String: Any]?
 
-  /// The menu again: the app's windows changed (see AppWindows).
+  /// Refreshes the open popover when the app's windows change (see AppWindows).
   func refreshTray() {
-    guard let statusItem, let trayState else { return }
-    statusItem.menu = menu(trayState)
+    guard statusItem != nil, trayState != nil else { return }
+    if popover?.isShown == true {
+      updatePopoverContent()
+    }
   }
 
-  private func menu(_ state: [String: Any]) -> NSMenu {
+  @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
+    let event = NSApp.currentEvent
+    let isRightClick = event?.type == .rightMouseUp
+      || (event?.type == .leftMouseUp && event?.modifierFlags.contains(.control) == true)
+    if isRightClick {
+      closePopover()
+      showContextMenu(for: sender)
+      return
+    }
+    togglePopover(relativeTo: sender)
+  }
+
+  private func togglePopover(relativeTo button: NSStatusBarButton) {
+    if let popover, popover.isShown {
+      closePopover()
+      return
+    }
+    let popover = ensurePopover()
+    updatePopoverContent()
+    popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+    popover.contentViewController?.view.window?.makeKey()
+    installOutsideClickMonitor()
+  }
+
+  private func ensurePopover() -> NSPopover {
+    if let popover { return popover }
+    let controller = TrayPopoverViewController(actions: TrayPopoverActions(
+      showApp: { [weak self] in
+        self?.closePopover()
+        self?.open(nil)
+      },
+      newChat: { [weak self] in
+        self?.startNewChat()
+      },
+      openSettings: { [weak self] in
+        self?.openSettings()
+      },
+      openAgent: { [weak self] id in
+        self?.closePopover()
+        self?.open(id)
+      },
+      focusWindow: { [weak self] viewId in
+        self?.closePopover()
+        AppWindows.shared?.focusWindow(viewId: viewId)
+      },
+      newWindow: { [weak self] in
+        self?.closePopover()
+        AppWindows.shared?.openNewWindow()
+      },
+      quit: { [weak self] in
+        self?.closePopover()
+        self?.quitChosen()
+      },
+      close: { [weak self] in
+        self?.closePopover()
+      }
+    ))
+    let pop = NSPopover()
+    pop.behavior = .transient
+    pop.animates = true
+    pop.delegate = self
+    pop.contentViewController = controller
+    controller.onPreferredSizeChanged = { [weak pop] size in
+      pop?.contentSize = size
+    }
+    self.popoverController = controller
+    self.popover = pop
+    return pop
+  }
+
+  private func updatePopoverContent() {
+    guard let trayState, let controller = popoverController else { return }
+    let snapshot = TrayPopoverSnapshot(state: trayState, appWindows: AppWindows.shared)
+    controller.update(snapshot: snapshot)
+    popover?.contentSize = controller.preferredContentSize
+  }
+
+  private func closePopover() {
+    removeOutsideClickMonitor()
+    if let popover, popover.isShown {
+      popover.performClose(nil)
+    }
+  }
+
+  func popoverDidClose(_ notification: Notification) {
+    removeOutsideClickMonitor()
+  }
+
+  private func installOutsideClickMonitor() {
+    removeOutsideClickMonitor()
+    outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(
+      matching: [.leftMouseDown, .rightMouseDown]
+    ) { [weak self] _ in
+      self?.closePopover()
+    }
+  }
+
+  private func removeOutsideClickMonitor() {
+    if let monitor = outsideClickMonitor {
+      NSEvent.removeMonitor(monitor)
+      outsideClickMonitor = nil
+    }
+  }
+
+  /// Compact native menu shown on right-click / Control-click of the status icon.
+  private func showContextMenu(for button: NSStatusBarButton) {
+    guard let state = trayState, let statusItem else { return }
     let labels = state["labels"] as? [String: String] ?? [:]
     let menu = NSMenu()
     menu.autoenablesItems = false
-    menu.addItem(action(labels["show"] ?? "Show", #selector(showChosen)))
-    // The app's windows, to switch to, and New Window.
-    if let windows = AppWindows.shared {
-      let items = windows.menuItems(
-        target: windows,
-        choose: #selector(AppWindows.windowChosen(_:)),
-        newWindow: #selector(AppWindows.newWindowChosen(_:)))
-      if !items.isEmpty { menu.addItem(.separator()) }
-      for item in items { menu.addItem(item) }
-    }
-    let waiting = state["waiting"] as? [[String: Any]] ?? []
-    if !waiting.isEmpty {
-      menu.addItem(.separator())
-      let header = NSMenuItem(title: labels["waiting"] ?? "", action: nil, keyEquivalent: "")
-      header.isEnabled = false
-      menu.addItem(header)
-      for agent in waiting {
-        let item = action(agent["title"] as? String ?? "", #selector(agentChosen(_:)))
-        item.representedObject = agent["id"]
-        item.indentationLevel = 1
-        menu.addItem(item)
-      }
-    }
-    if let running = labels["running"] {
-      menu.addItem(.separator())
-      let item = NSMenuItem(title: running, action: nil, keyEquivalent: "")
-      item.isEnabled = false
-      menu.addItem(item)
+    menu.delegate = self
+    menu.addItem(action(labels["show"] ?? "Show Ayte", #selector(showChosen)))
+    menu.addItem(action(labels["newChat"] ?? "New Chat", #selector(newChatChosen)))
+    if let windows = AppWindows.shared, windows.started {
+      menu.addItem(action(windows.newWindowTitle, #selector(newWindowChosen)))
     }
     menu.addItem(.separator())
-    menu.addItem(action(labels["quit"] ?? "Quit", #selector(quitChosen)))
-    return menu
+    menu.addItem(action(labels["settings"] ?? "Open Settings", #selector(settingsChosen)))
+    menu.addItem(.separator())
+    menu.addItem(action(labels["quit"] ?? "Quit Ayte", #selector(quitChosen)))
+    contextMenu = menu
+    statusItem.menu = menu
+    button.performClick(nil)
+  }
+
+  func menuDidClose(_ menu: NSMenu) {
+    if statusItem?.menu === menu {
+      statusItem?.menu = nil
+    }
+    if contextMenu === menu {
+      contextMenu = nil
+    }
   }
 
   private func action(_ title: String, _ selector: Selector) -> NSMenuItem {
@@ -255,8 +410,30 @@ final class Attention: NSObject, UNUserNotificationCenterDelegate, NSSoundDelega
 
   @objc private func showChosen() { open(nil) }
 
-  @objc private func agentChosen(_ sender: NSMenuItem) {
-    open(sender.representedObject as? String)
+  @objc private func newChatChosen() { startNewChat() }
+
+  @objc private func newWindowChosen() {
+    closePopover()
+    AppWindows.shared?.openNewWindow()
+  }
+
+  @objc private func settingsChosen() { openSettings() }
+
+  private func startNewChat() {
+    closePopover()
+    showWindow()
+    (window as? BaoWindow)?.menuCommand("workbench.action.chat.newChat")
+  }
+
+  private func openSettings() {
+    closePopover()
+    if let windows = AppWindows.shared, windows.started {
+      windows.bringFront()
+    } else {
+      showWindow()
+    }
+    ((NSApp.keyWindow as? BaoWindow) ?? (window as? BaoWindow))?.menuCommand(
+      "workbench.action.openSettings")
   }
 
   /// Quits as ⌘Q does: the app asks first, in its window (the one in
@@ -270,52 +447,185 @@ final class Attention: NSObject, UNUserNotificationCenterDelegate, NSSoundDelega
     NSApp.terminate(nil)
   }
 
-  /// The logo in the menu bar, a template the system draws light or dark
-  /// as the bar is: the 56×42 pixel face of bao.svg, 16pt wide, its cells
-  /// on whole pixels; with [dot], a dot at its top right, cut out of it.
-  static func trayImage(dot: Bool) -> NSImage {
+  /// Full-color Ayte App Icon aligned with the app's bundled AppIcon squircle,
+  /// rendered crisply at 1x/2x/3x scales (used in both the menu bar and popover).
+  static func appBrandIcon(size: NSSize, inset: CGFloat = 0) -> NSImage {
+    let image = NSImage(size: size)
+    let source: NSImage? = NSApp?.applicationIconImage ?? NSImage(named: NSImage.applicationIconName)
+    for scale in [1, 2, 3] {
+      let pixelsW = Int(round(size.width * CGFloat(scale)))
+      let pixelsH = Int(round(size.height * CGFloat(scale)))
+      guard pixelsW > 0, pixelsH > 0,
+            let rep = NSBitmapImageRep(
+              bitmapDataPlanes: nil, pixelsWide: pixelsW, pixelsHigh: pixelsH,
+              bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+              colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+      else { continue }
+      NSGraphicsContext.saveGraphicsState()
+      if let ctx = NSGraphicsContext(bitmapImageRep: rep) {
+        NSGraphicsContext.current = ctx
+        ctx.imageInterpolation = .high
+        let pxInset = inset * CGFloat(scale)
+        let targetRect = NSRect(
+          x: pxInset, y: pxInset,
+          width: CGFloat(pixelsW) - pxInset * 2,
+          height: CGFloat(pixelsH) - pxInset * 2)
+        drawBrandIcon(source: source, in: ctx.cgContext, rect: targetRect)
+      }
+      NSGraphicsContext.restoreGraphicsState()
+      rep.size = size
+      image.addRepresentation(rep)
+    }
+    image.isTemplate = false
+    return image
+  }
+
+  /// Menu bar icon aligned with Ayte's full-color app icon, with a crisp
+  /// corner status indicator when agents wait on input, finish unread, or run.
+  static func trayImage(
+    waitingCount: Int = 0,
+    runningCount: Int = 0,
+    hasAttention: Bool = false
+  ) -> NSImage {
     let size = NSSize(width: 18, height: 18)
     let image = NSImage(size: size)
+    let source: NSImage? = NSApp?.applicationIconImage ?? NSImage(named: NSImage.applicationIconName)
     for scale in [1, 2, 3] {
+      let pixels = 18 * scale
       guard let rep = NSBitmapImageRep(
-        bitmapDataPlanes: nil, pixelsWide: 18 * scale, pixelsHigh: 18 * scale,
+        bitmapDataPlanes: nil, pixelsWide: pixels, pixelsHigh: pixels,
         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
         colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
       else { continue }
       NSGraphicsContext.saveGraphicsState()
-      NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-      if let context = NSGraphicsContext.current?.cgContext {
-        drawTray(in: context, pixels: CGFloat(18 * scale), dot: dot)
+      if let ctx = NSGraphicsContext(bitmapImageRep: rep) {
+        NSGraphicsContext.current = ctx
+        ctx.imageInterpolation = .high
+        let unit = CGFloat(scale)
+        let targetRect = NSRect(
+          x: 0.5 * unit, y: 0.5 * unit,
+          width: 17.0 * unit, height: 17.0 * unit)
+        drawBrandIcon(source: source, in: ctx.cgContext, rect: targetRect)
+
+        // Priority status badge: waiting/unread (top-right coral red) > running (bottom-right emerald).
+        let cg = ctx.cgContext
+        if waitingCount > 0 || hasAttention {
+          let center = CGPoint(x: CGFloat(pixels) - 3.1 * unit, y: CGFloat(pixels) - 3.1 * unit)
+          drawStatusDot(
+            in: cg,
+            center: center,
+            cutoutRadius: 3.1 * unit,
+            dotRadius: 2.35 * unit,
+            color: NSColor(srgbRed: 1.0, green: 0.23, blue: 0.19, alpha: 1.0))
+        } else if runningCount > 0 {
+          let center = CGPoint(x: CGFloat(pixels) - 3.1 * unit, y: 3.1 * unit)
+          drawStatusDot(
+            in: cg,
+            center: center,
+            cutoutRadius: 3.0 * unit,
+            dotRadius: 2.25 * unit,
+            color: NSColor(srgbRed: 0.13, green: 0.77, blue: 0.37, alpha: 1.0))
+        }
       }
       NSGraphicsContext.restoreGraphicsState()
-      // In points only once drawn: a context made for a rep of a size
-      // draws in its points, not its pixels.
       rep.size = size
       image.addRepresentation(rep)
     }
-    image.isTemplate = true
+    image.isTemplate = false
     return image
   }
 
-  /// Draws the Ayte 'a' + spark tray icon (matching assets/branding/logo.svg)
-  /// into a square of [pixels] (18pt of them), from its top left.
-  private static func drawTray(in context: CGContext, pixels: CGFloat, dot: Bool) {
-    let unit = pixels / 18
-    // Flipped, as the SVG coordinates are from top-left.
-    context.translateBy(x: 0, y: pixels)
-    context.scaleBy(x: 1, y: -1)
-    context.setFillColor(NSColor.black.cgColor)
+  private static func drawStatusDot(
+    in context: CGContext,
+    center: CGPoint,
+    cutoutRadius: CGFloat,
+    dotRadius: CGFloat,
+    color: NSColor
+  ) {
+    context.saveGState()
+    context.setBlendMode(.clear)
+    context.fillEllipse(in: CGRect(
+      x: center.x - cutoutRadius, y: center.y - cutoutRadius,
+      width: cutoutRadius * 2, height: cutoutRadius * 2))
+    context.setBlendMode(.normal)
+    context.setFillColor(color.cgColor)
+    context.fillEllipse(in: CGRect(
+      x: center.x - dotRadius, y: center.y - dotRadius,
+      width: dotRadius * 2, height: dotRadius * 2))
+    context.restoreGState()
+  }
 
-    let pad = unit
-    let span = 16 * unit
+  /// Draws the bundled AppIcon cropped tightly to the standard macOS 824/1024
+  /// squircle grid, falling back to a full-color CoreGraphics vector version.
+  private static func drawBrandIcon(
+    source: NSImage?, in context: CGContext, rect: NSRect
+  ) {
+    if let source, source.size.width > 0, source.size.height > 0 {
+      let insetX = source.size.width * 0.09
+      let insetY = source.size.height * 0.09
+      let srcRect = NSRect(
+        x: insetX,
+        y: insetY,
+        width: source.size.width - insetX * 2,
+        height: source.size.height - insetY * 2)
+      source.draw(
+        in: rect,
+        from: srcRect,
+        operation: .sourceOver,
+        fraction: 1.0,
+        respectFlipped: true,
+        hints: [.interpolation: NSNumber(value: NSImageInterpolation.high.rawValue)])
+      return
+    }
+    drawFallbackBrandIcon(in: context, rect: rect)
+  }
+
+  /// Vector fallback matching the porcelain squircle + gradient 'a' + golden spark.
+  private static func drawFallbackBrandIcon(in context: CGContext, rect: NSRect) {
+    context.saveGState()
+    context.translateBy(x: rect.minX, y: rect.maxY)
+    context.scaleBy(x: 1, y: -1)
+    let side = min(rect.width, rect.height)
+    let tileRect = CGRect(x: 0, y: 0, width: side, height: side)
+    let corner = side * 0.225
+    let tilePath = CGPath(
+      roundedRect: tileRect.insetBy(dx: side * 0.015, dy: side * 0.015),
+      cornerWidth: corner, cornerHeight: corner, transform: nil)
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+
+    // Warm porcelain tile.
+    context.saveGState()
+    context.addPath(tilePath)
+    context.clip()
+    if let bg = CGGradient(
+      colorsSpace: colorSpace,
+      colors: [
+        NSColor(srgbRed: 1.0, green: 0.996, blue: 0.98, alpha: 1.0).cgColor,
+        NSColor(srgbRed: 0.965, green: 0.955, blue: 0.925, alpha: 1.0).cgColor,
+      ] as CFArray,
+      locations: [0.0, 1.0])
+    {
+      context.drawLinearGradient(
+        bg, start: CGPoint(x: 0, y: 0), end: CGPoint(x: 0, y: side), options: [])
+    }
+    context.restoreGState()
+
+    context.addPath(tilePath)
+    context.setStrokeColor(NSColor(srgbRed: 0, green: 0, blue: 0, alpha: 0.14).cgColor)
+    context.setLineWidth(max(1.0, side * 0.03))
+    context.strokePath()
+
+    // Coordinate map matching assets/branding/logo.svg inside the porcelain tile.
+    let pad = side * 0.14
+    let span = side - pad * 2
     func u(_ x: CGFloat) -> CGFloat { pad + (x - 249) / 512 * span }
     func v(_ y: CGFloat) -> CGFloat { pad + (y - 234) / 512 * span }
     func r(_ d: CGFloat) -> CGFloat { d / 512 * span }
 
-    // Ring of the 'a' glyph (even-odd cutout).
+    // Gradient ring of 'a'.
     let ringCenter = CGPoint(x: u(466), y: v(538))
     let outerR = r(198)
-    let innerR = r(108)
+    let innerR = r(112)
     let ring = CGMutablePath()
     ring.addEllipse(in: CGRect(
       x: ringCenter.x - outerR, y: ringCenter.y - outerR,
@@ -323,34 +633,80 @@ final class Attention: NSObject, UNUserNotificationCenterDelegate, NSSoundDelega
     ring.addEllipse(in: CGRect(
       x: ringCenter.x - innerR, y: ringCenter.y - innerR,
       width: innerR * 2, height: innerR * 2))
+    context.saveGState()
     context.addPath(ring)
-    context.fillPath(using: .evenOdd)
-
-    // Vertical rounded stem on the right of the ring.
-    let stemRect = CGRect(
-      x: u(580), y: v(340),
-      width: r(88), height: r(396))
-    let stemRadius = min(stemRect.width, stemRect.height) / 2
-    context.addPath(CGPath(
-      roundedRect: stemRect, cornerWidth: stemRadius, cornerHeight: stemRadius, transform: nil))
-    context.fillPath()
-
-    // Top-right spark dot (expanded with cutout halo when [dot] signals attention).
-    let sparkCenter = CGPoint(x: u(704), y: v(282))
-    if dot {
-      context.setBlendMode(.clear)
-      context.fillEllipse(in: CGRect(
-        x: sparkCenter.x - 3.4 * unit, y: sparkCenter.y - 3.4 * unit,
-        width: 6.8 * unit, height: 6.8 * unit))
-      context.setBlendMode(.normal)
-      context.fillEllipse(in: CGRect(
-        x: sparkCenter.x - 2.4 * unit, y: sparkCenter.y - 2.4 * unit,
-        width: 4.8 * unit, height: 4.8 * unit))
-    } else {
-      let sparkR = r(44)
-      context.fillEllipse(in: CGRect(
-        x: sparkCenter.x - sparkR, y: sparkCenter.y - sparkR,
-        width: sparkR * 2, height: sparkR * 2))
+    context.clip(using: .evenOdd)
+    if let ringGrad = CGGradient(
+      colorsSpace: colorSpace,
+      colors: [
+        NSColor(srgbRed: 0.22, green: 0.74, blue: 0.97, alpha: 1.0).cgColor,
+        NSColor(srgbRed: 0.39, green: 0.40, blue: 0.95, alpha: 1.0).cgColor,
+        NSColor(srgbRed: 0.93, green: 0.28, blue: 0.60, alpha: 1.0).cgColor,
+      ] as CFArray,
+      locations: [0.0, 0.55, 1.0])
+    {
+      context.drawLinearGradient(
+        ringGrad,
+        start: CGPoint(x: u(290), y: v(344)),
+        end: CGPoint(x: u(640), y: v(724)),
+        options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
     }
+    context.restoreGState()
+
+    // Gradient vertical stem.
+    let stemRect = CGRect(x: u(580), y: v(340), width: r(84), height: r(396))
+    let stemRadius = min(stemRect.width, stemRect.height) / 2
+    let stemPath = CGPath(
+      roundedRect: stemRect, cornerWidth: stemRadius, cornerHeight: stemRadius, transform: nil)
+    context.saveGState()
+    context.addPath(stemPath)
+    context.clip()
+    if let stemGrad = CGGradient(
+      colorsSpace: colorSpace,
+      colors: [
+        NSColor(srgbRed: 0.98, green: 0.44, blue: 0.52, alpha: 1.0).cgColor,
+        NSColor(srgbRed: 0.66, green: 0.33, blue: 0.97, alpha: 1.0).cgColor,
+        NSColor(srgbRed: 0.39, green: 0.40, blue: 0.95, alpha: 1.0).cgColor,
+      ] as CFArray,
+      locations: [0.0, 0.55, 1.0])
+    {
+      context.drawLinearGradient(
+        stemGrad,
+        start: CGPoint(x: stemRect.midX, y: stemRect.minY),
+        end: CGPoint(x: stemRect.midX, y: stemRect.maxY),
+        options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
+    }
+    context.restoreGState()
+
+    // Luminous golden spark orb.
+    let sparkCenter = CGPoint(x: u(704), y: v(282))
+    let sparkR = r(42)
+    let sparkPath = CGPath(
+      ellipseIn: CGRect(
+        x: sparkCenter.x - sparkR, y: sparkCenter.y - sparkR,
+        width: sparkR * 2, height: sparkR * 2),
+      transform: nil)
+    context.saveGState()
+    context.addPath(sparkPath)
+    context.clip()
+    if let dotGrad = CGGradient(
+      colorsSpace: colorSpace,
+      colors: [
+        NSColor(srgbRed: 1.0, green: 0.94, blue: 0.54, alpha: 1.0).cgColor,
+        NSColor(srgbRed: 0.96, green: 0.62, blue: 0.04, alpha: 1.0).cgColor,
+        NSColor(srgbRed: 0.85, green: 0.47, blue: 0.02, alpha: 1.0).cgColor,
+      ] as CFArray,
+      locations: [0.0, 0.55, 1.0])
+    {
+      context.drawRadialGradient(
+        dotGrad,
+        startCenter: CGPoint(x: sparkCenter.x - sparkR * 0.28, y: sparkCenter.y - sparkR * 0.28),
+        startRadius: 0,
+        endCenter: sparkCenter,
+        endRadius: sparkR * 1.15,
+        options: [.drawsAfterEndLocation])
+    }
+    context.restoreGState()
+    context.restoreGState()
   }
 }

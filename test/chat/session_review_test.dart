@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:baocode/chat/chat_models.dart';
 import 'package:baocode/chat/chat_screen.dart';
@@ -11,6 +13,7 @@ import 'package:baocode/kernel/mock/mock_kernels.dart';
 import 'package:baocode/theme/app_theme.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as p;
 
 class _NoStore implements ReviewStore {
   @override
@@ -179,4 +182,157 @@ void main() {
     expect(session.undoChanges, isNull);
     await tester.pump(const Duration(seconds: 5));
   });
+
+  test('ChangeReview deduplicates Windows case-variant paths across before/after, report, baseOf, keep, undo, rewind, and resume', () async {
+    final store = _MemoryWindowsReviewStore();
+    store.files[r'c:\repo\lib\a.dart'] = 'base1\nbase2\n';
+
+    final review = ChangeReview(
+      store,
+      root: r'C:\Repo',
+      paths: p.windows,
+    );
+    addTearDown(review.dispose);
+    review.session = 'win-case-session';
+
+    // Tracked edit: before with relative/root casing, after with lowercase drive + forward slashes.
+    await review.before('lib/a.dart', turn: 't1');
+    store.files[r'c:\repo\lib\a.dart'] = 'edit1\nbase2\n';
+    await review.after(r'c:/Repo/lib/a.dart', turn: 't1');
+
+    // Second tracked edit on same file with uppercase path variant.
+    await review.before(r'C:\REPO\LIB\A.DART', turn: 't2');
+    store.files[r'c:\repo\lib\a.dart'] = 'edit1\nedit2\n';
+    await review.after(r'c:\repo\lib\a.dart', turn: 't2');
+
+    // Untracked reports with mixed casing.
+    review.report(
+      const FileChange(path: r'C:\Repo\lib\other2.dart', added: 1, removed: 0),
+    );
+    review.report(
+      const FileChange(path: r'c:\repo\lib\other2.dart', added: 2, removed: 0),
+    );
+    await review.keep(const []);
+
+    expect(review.changes, hasLength(2));
+    expect(
+      review.changes.map((c) => c.path).toList(),
+      [r'C:\Repo\lib\a.dart', r'C:\Repo\lib\other2.dart'],
+    );
+    expect(review.changes[1].added, 3);
+    expect(review.baseOf(r'c:\repo\lib\a.dart'), isNotNull);
+    expect(await review.original(r'c:/Repo/lib/a.dart')!(), 'base1\nbase2\n');
+
+    // Rewind t2 via persisted/canonical turn map and verify file + pending change.
+    await review.rewind({'t2'});
+    expect(store.files[r'c:\repo\lib\a.dart'], 'edit1\nbase2\n');
+    expect(review.changes.first.path, r'C:\Repo\lib\a.dart');
+
+    // Resume from persisted state and keep via lowercase variant.
+    final reopened = await ChangeReview.resume(
+      store,
+      'win-case-session',
+      root: r'C:\Repo',
+      paths: p.windows,
+    );
+    addTearDown(reopened.dispose);
+    expect(reopened.changes, hasLength(2));
+    await reopened.keep([r'c:\repo\lib\other2.dart']);
+    expect(reopened.changes.map((c) => c.path), [r'C:\Repo\lib\a.dart']);
+
+    // Undo via lowercase variant restores original and clears entry.
+    await reopened.undo([r'c:/Repo/lib/a.dart']);
+    expect(store.files[r'c:\repo\lib\a.dart'], 'base1\nbase2\n');
+    expect(reopened.changes, isEmpty);
+  });
+}
+
+class _MemoryWindowsReviewStore implements ReviewStore {
+  final Map<String, String> files = {};
+  final Map<String, Uint8List> blobs = {};
+  final Map<String, String> sessions = {};
+  int _nextOid = 1;
+
+  String _key(String path) => p.windows.canonicalize(path);
+
+  @override
+  Future<ReviewBlob?> take(String path) async {
+    final text = files[_key(path)];
+    if (text == null) return null;
+    return store(Uint8List.fromList(utf8.encode(text)), mode: '100644');
+  }
+
+  @override
+  Future<ReviewBlob?> current(String path) async {
+    final text = files[_key(path)];
+    if (text == null) return null;
+    for (final entry in blobs.entries) {
+      if (utf8.decode(entry.value) == text) {
+        return ReviewBlob('100644', entry.key);
+      }
+    }
+    return store(Uint8List.fromList(utf8.encode(text)), mode: '100644');
+  }
+
+  @override
+  Future<Uint8List> read(ReviewBlob blob) async => blobs[blob.oid]!;
+
+  @override
+  Future<ReviewBlob> store(Uint8List bytes, {required String mode}) async {
+    final text = utf8.decode(bytes);
+    for (final entry in blobs.entries) {
+      if (utf8.decode(entry.value) == text) {
+        return ReviewBlob(mode, entry.key);
+      }
+    }
+    final oid = 'oid_${_nextOid++}';
+    blobs[oid] = bytes;
+    return ReviewBlob(mode, oid);
+  }
+
+  @override
+  Future<void> restore(String path, ReviewBlob? blob, {String? root}) async {
+    final k = _key(path);
+    if (blob == null) {
+      files.remove(k);
+    } else {
+      files[k] = utf8.decode(blobs[blob.oid]!);
+    }
+  }
+
+  @override
+  Future<void> write(String path, Uint8List bytes) async {
+    files[_key(path)] = utf8.decode(bytes);
+  }
+
+  @override
+  Future<Uint8List?> merge(ReviewBlob mine, ReviewBlob from, ReviewBlob to) async =>
+      null;
+
+  @override
+  Future<({int added, int removed})?> lineCounts(
+    ReviewBlob? from,
+    ReviewBlob? to,
+  ) async {
+    final a = from == null ? const <String>[] : utf8.decode(blobs[from.oid]!).split('\n');
+    final b = to == null ? const <String>[] : utf8.decode(blobs[to.oid]!).split('\n');
+    return (added: b.length, removed: a.length);
+  }
+
+  @override
+  Future<String?> load(String session) async => sessions[session];
+
+  @override
+  Future<void> save(
+    String session,
+    String data, {
+    required Iterable<ReviewBlob> blobs,
+  }) async {
+    sessions[session] = data;
+  }
+
+  @override
+  Future<void> forget(String session) async {
+    sessions.remove(session);
+  }
 }

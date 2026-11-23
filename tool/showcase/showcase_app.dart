@@ -101,7 +101,7 @@ Future<void> _run() async {
   followSettingsFiles(files);
   EmojiSheet.start(EmojiSheetStore.cache());
   KernelRegistry.use([showClaudeCode]);
-  ClaudeCore.current = () => ClaudeCore.cli;
+  ClaudeCore.current = () => ClaudeCore.antigravity;
   final themes = WorkbenchThemeService.instance;
   themes.restore(setting: ThemeSettingDefaults.colorThemeDark);
   await themes.initialize();

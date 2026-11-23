@@ -14,6 +14,62 @@ import 'codebuddy_account_models.dart';
 /// Models and the session model picker.
 const codebuddyBuiltinProviderId = 'codebuddy-cli';
 
+/// Built-in CodeBuddy CLI (`codebuddy` / `cbc`) slash commands offered in the
+/// composer's `/` menu before and after session initialization.
+const List<Map<String, Object?>> codebuddyBuiltinCommands = [
+  {
+    'name': 'compact',
+    'description': 'Compact conversation context to free up context window',
+    'argumentHint': '[instructions]',
+    'builtin': true,
+    'category': 'builtin',
+  },
+  {
+    'name': 'clear',
+    'description': 'Start a fresh conversation',
+    'builtin': true,
+    'category': 'builtin',
+  },
+  {
+    'name': 'plan',
+    'description': 'Plan step-by-step before execution',
+    'argumentHint': '<task>',
+    'builtin': true,
+    'category': 'builtin',
+  },
+  {
+    'name': 'init',
+    'description': 'Initialize project CODEBUDDY.md instructions',
+    'builtin': true,
+    'category': 'builtin',
+  },
+  {
+    'name': 'review',
+    'description': 'Review current code changes and diffs',
+    'argumentHint': '[target]',
+    'builtin': true,
+    'category': 'builtin',
+  },
+  {
+    'name': 'context',
+    'description': 'Show current context window usage',
+    'builtin': true,
+    'category': 'builtin',
+  },
+  {
+    'name': 'cost',
+    'description': 'Show token and credit usage for the current session',
+    'builtin': true,
+    'category': 'builtin',
+  },
+  {
+    'name': 'status',
+    'description': 'Show CodeBuddy account, model, and session status',
+    'builtin': true,
+    'category': 'builtin',
+  },
+];
+
 /// Settings → General → CodeBuddy CLI: custom executable path
 /// (`codebuddy.path` in settings.json).
 abstract final class CodeBuddyPathSetting {
@@ -178,6 +234,11 @@ class CodeBuddyModel {
     }
     return best;
   }
+
+  /// Menu label for a selectable context window option (`baseLabel` is e.g.
+  /// `256K` or `1M`).
+  String contextOptionLabel(String baseLabel, int tokens) =>
+      contextOptions.length == 1 ? '$baseLabel（官方固定）' : baseLabel;
 
   String contextOptionDescription(int tokens) {
     if (tokens == defaultContext) return '默认上下文窗口';
@@ -822,9 +883,11 @@ abstract final class CodeBuddyModels {
   }
 
   static CodeBuddyModel? of(String? model) {
+    if (model == null || model.isEmpty) return null;
+    final prefixed = model.startsWith('@$codebuddyBuiltinProviderId/');
     final bare = stripPrefix(model);
     if (bare.isEmpty) return null;
-    if (bare == 'default') return _current.first;
+    if (bare == 'default') return prefixed ? _current.first : null;
     for (final m in _current) {
       if (m.id == bare || m.effectiveCliModel == bare) return m;
     }
@@ -988,48 +1051,138 @@ abstract final class LocalCodeBuddy {
     _installed = true;
   }
 
-  static Map<String, String> _enrichedPathEnvironment(
+  static String? _lookupEnvVar(
+    Map<String, String> env,
+    String name, {
+    required bool win,
+  }) {
+    if (env[name] case final v? when v.isNotEmpty) return v;
+    if (win) {
+      final lower = name.toLowerCase();
+      for (final entry in env.entries) {
+        if (entry.key.toLowerCase() == lower && entry.value.isNotEmpty) {
+          return entry.value;
+        }
+      }
+      for (final entry in env.entries) {
+        if (entry.key.toLowerCase() == lower) {
+          return entry.value;
+        }
+      }
+    } else if (env.containsKey(name)) {
+      return env[name];
+    }
+    return null;
+  }
+
+  static String _readEnvWithFallback(
     Map<String, String> base,
-  ) {
-    final home =
-        base['HOME'] ??
-        base['USERPROFILE'] ??
-        Platform.environment['HOME'] ??
-        Platform.environment['USERPROFILE'] ??
+    String name, {
+    required bool win,
+  }) {
+    final direct = _lookupEnvVar(base, name, win: win);
+    if (direct != null) return direct;
+    return _lookupEnvVar(Platform.environment, name, win: win) ?? '';
+  }
+
+  static String _resolveHome(
+    Map<String, String> env, {
+    required bool win,
+  }) {
+    final baseHome = _lookupEnvVar(env, 'HOME', win: win);
+    if (baseHome != null && baseHome.isNotEmpty) return baseHome;
+    final baseUserProfile = _lookupEnvVar(env, 'USERPROFILE', win: win);
+    if (baseUserProfile != null && baseUserProfile.isNotEmpty) {
+      return baseUserProfile;
+    }
+    if (baseHome != null || baseUserProfile != null) {
+      return '';
+    }
+    final hostHome = _lookupEnvVar(Platform.environment, 'HOME', win: win);
+    if (hostHome != null && hostHome.isNotEmpty) return hostHome;
+    return _lookupEnvVar(Platform.environment, 'USERPROFILE', win: win) ?? '';
+  }
+
+  /// Reads `PATH` case-insensitively on Windows (e.g. `Path` vs `PATH`).
+  @visibleForTesting
+  static String readPathVar(
+    Map<String, String> env, {
+    bool? forceWindows,
+  }) =>
+      _lookupEnvVar(env, 'PATH', win: forceWindows ?? Platform.isWindows) ??
+      '';
+
+  static Map<String, String> _withPath(
+    Map<String, String> base,
+    String pathValue, {
+    required bool win,
+  }) {
+    final result = <String, String>{};
+    for (final entry in base.entries) {
+      if (win && entry.key.toLowerCase() == 'path') continue;
+      result[entry.key] = entry.value;
+    }
+    result['PATH'] = pathValue;
+    return result;
+  }
+
+  /// Enriches `PATH` with CodeBuddy CLI runtime directories while keeping
+  /// explicit `PATH` entries ahead of fallbacks and handling Windows env case
+  /// insensitively.
+  @visibleForTesting
+  static Map<String, String> enrichedPathEnvironment(
+    Map<String, String> base, {
+    bool? forceWindows,
+  }) => _enrichedPathEnvironment(base, forceWindows: forceWindows);
+
+  static Map<String, String> _enrichedPathEnvironment(
+    Map<String, String> base, {
+    bool? forceWindows,
+  }) {
+    final win = forceWindows ?? Platform.isWindows;
+    final home = _resolveHome(base, win: win);
+    final sep = win ? ';' : ':';
+    final rawPath =
+        _lookupEnvVar(base, 'PATH', win: win) ??
+        _lookupEnvVar(Platform.environment, 'PATH', win: win) ??
         '';
-    final sep = Platform.isWindows ? ';' : ':';
-    final existing = (base['PATH'] ?? Platform.environment['PATH'] ?? '')
+    final existing = rawPath
         .split(sep)
+        .map((s) => s.trim())
         .where((s) => s.isNotEmpty)
         .toList();
     final extras = <String>[
-      if (home.isNotEmpty && !Platform.isWindows) ...[
-        p.join(home, '.local', 'bin'),
-        p.join(home, '.hermes', 'node', 'bin'),
-        p.join(home, '.codebuddy', 'bin'),
-        p.join(home, '.bun', 'bin'),
-        p.join(home, '.volta', 'bin'),
+      if (home.isNotEmpty && !win) ...[
+        p.posix.join(home, '.local', 'bin'),
+        p.posix.join(home, '.hermes', 'node', 'bin'),
+        p.posix.join(home, '.codebuddy', 'bin'),
+        p.posix.join(home, '.bun', 'bin'),
+        p.posix.join(home, '.volta', 'bin'),
         '/opt/homebrew/bin',
         '/usr/local/bin',
         ..._globNodeBins(
-          p.join(home, '.local', 'share', 'fnm', 'node-versions'),
+          p.posix.join(home, '.local', 'share', 'fnm', 'node-versions'),
           'installation/bin',
         ),
-        ..._globNodeBins(p.join(home, '.nvm', 'versions', 'node'), 'bin'),
+        ..._globNodeBins(p.posix.join(home, '.nvm', 'versions', 'node'), 'bin'),
       ],
-      if (home.isNotEmpty && Platform.isWindows) ...[
-        if (base['APPDATA'] case final appData? when appData.isNotEmpty)
-          p.join(appData, 'npm'),
-        p.join(home, '.local', 'bin'),
-        p.join(home, '.bun', 'bin'),
+      if (win) ...[
+        if (_readEnvWithFallback(base, 'APPDATA', win: true)
+            case final appData when appData.isNotEmpty)
+          p.windows.join(appData, 'npm'),
+        if (home.isNotEmpty) ...[
+          p.windows.join(home, '.local', 'bin'),
+          p.windows.join(home, '.bun', 'bin'),
+        ],
       ],
     ];
     final seen = <String>{};
-    final merged = <String>[
-      for (final dir in [...extras, ...existing])
-        if (seen.add(dir)) dir,
-    ];
-    return {...base, 'PATH': merged.join(sep)};
+    final merged = <String>[];
+    for (final dir in [...existing, ...extras]) {
+      final key = win ? dir.toLowerCase() : dir;
+      if (seen.add(key)) merged.add(dir);
+    }
+    return _withPath(base, merged.join(sep), win: win);
   }
 
   static List<String> _globNodeBins(String parentDir, String sub) {
@@ -1050,13 +1203,18 @@ abstract final class LocalCodeBuddy {
     }
   }
 
-  static String? _locateSync(Map<String, String> env) {
-    final home =
-        env['HOME'] ??
-        env['USERPROFILE'] ??
-        Platform.environment['HOME'] ??
-        Platform.environment['USERPROFILE'] ??
-        '';
+  @visibleForTesting
+  static String? locateSyncForTesting(
+    Map<String, String> env, {
+    bool? forceWindows,
+  }) => _locateSync(env, forceWindows: forceWindows);
+
+  static String? _locateSync(
+    Map<String, String> env, {
+    bool? forceWindows,
+  }) {
+    final win = forceWindows ?? Platform.isWindows;
+    final home = _resolveHome(env, win: win);
 
     if (CodeBuddyPathSetting.current() case final custom?
         when custom.isNotEmpty) {
@@ -1067,21 +1225,24 @@ abstract final class LocalCodeBuddy {
       if (File(expanded).existsSync()) return expanded;
     }
 
-    final enriched = _enrichedPathEnvironment(env);
+    final enriched = _enrichedPathEnvironment(env, forceWindows: win);
     for (final name in const ['codebuddy', 'cbc', 'codebuddy-code']) {
-      if (_findBinaryInEnv(name, enriched) case final hit?) {
+      if (_findBinaryInEnv(name, enriched, forceWindows: win) case final hit?) {
         return hit;
       }
     }
     return null;
   }
 
-  static String? _findBinaryInEnv(String name, Map<String, String> env) {
-    final sep = Platform.isWindows ? ';' : ':';
-    final pathVar = env['PATH'] ?? '';
-    final exts = Platform.isWindows
-        ? const ['.cmd', '.exe', '.bat', '']
-        : const [''];
+  static String? _findBinaryInEnv(
+    String name,
+    Map<String, String> env, {
+    bool? forceWindows,
+  }) {
+    final win = forceWindows ?? Platform.isWindows;
+    final sep = win ? ';' : ':';
+    final pathVar = readPathVar(env, forceWindows: win);
+    final exts = win ? const ['.cmd', '.exe', '.bat', ''] : const [''];
     for (final dir in pathVar.split(sep)) {
       if (dir.trim().isEmpty) continue;
       for (final ext in exts) {

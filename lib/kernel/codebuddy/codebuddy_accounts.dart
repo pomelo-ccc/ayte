@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
+import '../claude_code/claude_environment.dart';
 import 'codebuddy_account_models.dart';
 import 'codebuddy_cli.dart';
 import 'codebuddy_oauth.dart';
@@ -27,8 +28,14 @@ class CodeBuddyAccounts extends ChangeNotifier {
   onActiveAccountSwitched;
 
   final String? _overrideDir;
+  String? _resolvedDataDir;
+  String? _loadedDir;
+  String? _latestTargetDir;
+  int _loadEpoch = 0;
   bool _initialized = false;
+  bool _disposed = false;
   Future<void>? _initFuture;
+  Zone? _initZone;
   Timer? _refreshTimer;
   Timer? _postTurnRefreshTimer;
 
@@ -62,44 +69,135 @@ class CodeBuddyAccounts extends ChangeNotifier {
 
   String get dataDirectoryPath {
     if (_overrideDir case final dir? when dir.isNotEmpty) return dir;
-    final home =
-        Platform.environment['HOME'] ??
-        Platform.environment['USERPROFILE'] ??
-        '';
+    if (_resolvedDataDir case final dir? when dir.isNotEmpty) return dir;
+    final home = _resolveHome(
+      Platform.environment,
+      fallbackToPlatform: false,
+    );
     return p.join(home, '.cyte', 'codebuddy_accounts');
   }
 
-  Future<void> ensureInitialized() {
-    if (_initialized) return Future.value();
-    return _initFuture ??= _doInitialize();
-  }
+  static String? _nonEmptyEnv(String? value) =>
+      (value != null && value.trim().isNotEmpty) ? value.trim() : null;
 
-  Future<void> _doInitialize() async {
-    try {
-      final dir = Directory(dataDirectoryPath);
-      await dir.create(recursive: true);
-      await _loadFromDisk(dir);
-      _syncActiveRegionModels();
-      _startBackgroundRefreshTimer();
-      if (_accounts.isNotEmpty) {
-        unawaited(refreshAllQuotas(silent: true));
+  static String? _lookupEnvVar(
+    Map<String, String> env,
+    String name, {
+    required bool win,
+  }) {
+    final direct = _nonEmptyEnv(env[name]);
+    if (direct != null) return direct;
+    if (win) {
+      final lower = name.toLowerCase();
+      for (final entry in env.entries) {
+        if (entry.key.toLowerCase() == lower) {
+          final value = _nonEmptyEnv(entry.value);
+          if (value != null) return value;
+        }
       }
-    } finally {
-      _initialized = true;
+      for (final entry in env.entries) {
+        if (entry.key.toLowerCase() == lower) {
+          return '';
+        }
+      }
+    } else if (env.containsKey(name)) {
+      return _nonEmptyEnv(env[name]) ?? '';
     }
-    notifyListeners();
+    return null;
   }
 
-  Future<void> _loadFromDisk(Directory dir) async {
-    _accounts.clear();
+  static String _resolveHome(
+    Map<String, String> env, {
+    bool fallbackToPlatform = true,
+  }) {
+    final win = Platform.isWindows;
+    final envHome = _lookupEnvVar(env, 'HOME', win: win);
+    if (envHome != null && envHome.isNotEmpty) return envHome;
+    final envUserProfile = _lookupEnvVar(env, 'USERPROFILE', win: win);
+    if (envUserProfile != null && envUserProfile.isNotEmpty) {
+      return envUserProfile;
+    }
+    if (!fallbackToPlatform || envHome != null || envUserProfile != null) {
+      return '';
+    }
+    final platHome = _lookupEnvVar(Platform.environment, 'HOME', win: win);
+    if (platHome != null && platHome.isNotEmpty) return platHome;
+    final platProfile = _lookupEnvVar(
+      Platform.environment,
+      'USERPROFILE',
+      win: win,
+    );
+    if (platProfile != null && platProfile.isNotEmpty) return platProfile;
+    return '';
+  }
+
+  Future<String> _resolveDataDirectoryPath() async {
+    if (_overrideDir case final dir? when dir.isNotEmpty) return dir;
+    final env = await ClaudeEnvironment.of();
+    final home = _resolveHome(env);
+    final resolved = p.join(home, '.cyte', 'codebuddy_accounts');
+    _resolvedDataDir = resolved;
+    return resolved;
+  }
+
+  Future<void> ensureInitialized() {
+    if (_disposed) return Future.value();
+    if (_initFuture case final inFlight?
+        when identical(_initZone, Zone.current)) {
+      return inFlight;
+    }
+    if (_initialized && _overrideDir != null) return Future.value();
+    final run = _ensureInitializedAsync();
+    _initFuture = run;
+    _initZone = Zone.current;
+    return run.whenComplete(() {
+      if (identical(_initFuture, run)) {
+        _initFuture = null;
+        _initZone = null;
+      }
+    });
+  }
+
+  Future<void> _ensureInitializedAsync() async {
+    if (_disposed) return;
+    final targetDir = await _resolveDataDirectoryPath();
+    if (_disposed) return;
+    if (_initialized && _loadedDir == targetDir) return;
+    await _doInitialize(targetDir);
+  }
+
+  Future<void> _doInitialize(String targetDir) async {
+    if (_disposed) return;
+    _latestTargetDir = targetDir;
+    final epoch = ++_loadEpoch;
+    final dir = Directory(targetDir);
+    await dir.create(recursive: true);
+    if (_disposed) return;
+    if (_initialized && _loadedDir == targetDir && epoch != _loadEpoch) return;
+    if (_latestTargetDir != targetDir && epoch != _loadEpoch) return;
+    final committed = await _loadFromDisk(dir, expectedEpoch: epoch);
+    if (_disposed || !committed) return;
+    _syncActiveRegionModels();
+    _startBackgroundRefreshTimer();
+    if (_accounts.isNotEmpty &&
+        !Platform.environment.containsKey('FLUTTER_TEST')) {
+      unawaited(refreshAllQuotas(silent: true));
+    }
+    _safeNotify();
+  }
+
+  Future<bool> _loadFromDisk(Directory dir, {int? expectedEpoch}) async {
+    final epoch = expectedEpoch ?? ++_loadEpoch;
     final accountsDir = Directory(p.join(dir.path, 'accounts'));
     final byId = <String, CodeBuddyAccount>{};
 
     if (accountsDir.existsSync()) {
       for (final entity in accountsDir.listSync()) {
+        if (_disposed) return false;
         if (entity is! File || !entity.path.endsWith('.json')) continue;
         try {
           final raw = _stripBom(await entity.readAsString());
+          if (_disposed) return false;
           final decoded = jsonDecode(raw);
           if (decoded is Map) {
             final acc = CodeBuddyAccount.fromJson(
@@ -117,11 +215,13 @@ class CodeBuddyAccounts extends ChangeNotifier {
 
     final indexFile = File(p.join(dir.path, 'accounts.json'));
     final orderedIds = <String>[];
+    String? loadedCurrentId;
     if (indexFile.existsSync()) {
       try {
         final decoded = jsonDecode(_stripBom(await indexFile.readAsString()));
+        if (_disposed) return false;
         if (decoded is Map) {
-          _currentAccountId = decoded['current_account_id'] as String?;
+          loadedCurrentId = decoded['current_account_id'] as String?;
           if (decoded['accounts'] case final List list) {
             for (final item in list) {
               if (item is Map && item['id'] is String) {
@@ -135,26 +235,35 @@ class CodeBuddyAccounts extends ChangeNotifier {
       }
     }
 
+    final loadedAccounts = <CodeBuddyAccount>[];
+    final seenIds = <String>{};
     for (final id in orderedIds) {
+      if (!seenIds.add(id)) continue;
       if (byId.remove(id) case final acc?) {
-        _accounts.add(acc);
+        loadedAccounts.add(acc);
       }
     }
     final remaining = byId.values.toList()
       ..sort((a, b) => b.lastUsed.compareTo(a.lastUsed));
-    _accounts.addAll(remaining);
-
-    if (_currentAccountId == null ||
-        !_accounts.any((a) => a.id == _currentAccountId)) {
-      _currentAccountId = _accounts.firstOrNull?.id;
+    for (final acc in remaining) {
+      if (seenIds.add(acc.id)) {
+        loadedAccounts.add(acc);
+      }
     }
 
+    final resolvedCurrentId = (loadedCurrentId != null &&
+            loadedAccounts.any((a) => a.id == loadedCurrentId))
+        ? loadedCurrentId
+        : loadedAccounts.firstOrNull?.id;
+
+    CodeBuddyAutoSwitchConfig? loadedAutoSwitch;
     final autoFile = File(p.join(dir.path, 'auto_switch.json'));
     if (autoFile.existsSync()) {
       try {
         final decoded = jsonDecode(_stripBom(await autoFile.readAsString()));
+        if (_disposed) return false;
         if (decoded is Map) {
-          _autoSwitch = CodeBuddyAutoSwitchConfig.fromJson(
+          loadedAutoSwitch = CodeBuddyAutoSwitchConfig.fromJson(
             decoded.cast<String, Object?>(),
           );
         }
@@ -163,9 +272,29 @@ class CodeBuddyAccounts extends ChangeNotifier {
       }
     }
 
-    if (remaining.isNotEmpty || !indexFile.existsSync()) {
-      await _saveIndex();
+    if (_disposed) return false;
+    final isLatest = epoch == _loadEpoch;
+    final needsFirstCommitForDir =
+        _latestTargetDir == dir.path && (!_initialized || _loadedDir != dir.path);
+    if (!isLatest && !needsFirstCommitForDir) {
+      return false;
     }
+
+    _accounts
+      ..clear()
+      ..addAll(loadedAccounts);
+    _currentAccountId = resolvedCurrentId;
+    if (loadedAutoSwitch != null) {
+      _autoSwitch = loadedAutoSwitch;
+    }
+    _loadedDir = dir.path;
+    _initialized = true;
+
+    if (remaining.isNotEmpty || !indexFile.existsSync()) {
+      if (_disposed) return true;
+      await _saveIndex(dirPath: dir.path);
+    }
+    return true;
   }
 
   void _syncActiveRegionModels() {
@@ -175,9 +304,20 @@ class CodeBuddyAccounts extends ChangeNotifier {
     }
   }
 
+  void _safeNotify() {
+    if (!_disposed) notifyListeners();
+  }
+
   void _startBackgroundRefreshTimer() {
     _refreshTimer?.cancel();
+    _refreshTimer = null;
+    if (_disposed || _accounts.isEmpty) return;
+    if (_overrideDir == null &&
+        Platform.environment.containsKey('FLUTTER_TEST')) {
+      return;
+    }
     _refreshTimer = Timer.periodic(const Duration(minutes: 5), (_) {
+      if (_disposed) return;
       _backgroundTick++;
       if (_backgroundTick % 3 == 0) {
         unawaited(refreshAllQuotas(silent: true));
@@ -187,7 +327,18 @@ class CodeBuddyAccounts extends ChangeNotifier {
     });
   }
 
+  @override
+  void dispose() {
+    _disposed = true;
+    _refreshTimer?.cancel();
+    _refreshTimer = null;
+    _postTurnRefreshTimer?.cancel();
+    _postTurnRefreshTimer = null;
+    super.dispose();
+  }
+
   Future<void> _saveAccount(CodeBuddyAccount account) async {
+    if (_disposed) return;
     final filePath = p.join(
       dataDirectoryPath,
       'accounts',
@@ -200,8 +351,9 @@ class CodeBuddyAccounts extends ChangeNotifier {
     );
   }
 
-  Future<void> _saveIndex() async {
-    final indexPath = p.join(dataDirectoryPath, 'accounts.json');
+  Future<void> _saveIndex({String? dirPath}) async {
+    if (_disposed) return;
+    final indexPath = p.join(dirPath ?? dataDirectoryPath, 'accounts.json');
     const encoder = JsonEncoder.withIndent('  ');
     await CodeBuddyOAuth.writeAtomicSecure(
       indexPath,
@@ -225,7 +377,10 @@ class CodeBuddyAccounts extends ChangeNotifier {
     CodeBuddyAccount account, {
     bool makeActive = true,
   }) async {
+    if (_disposed) return account;
     await ensureInitialized();
+    if (_disposed) return account;
+    _loadEpoch++;
     final idx = _accounts.indexWhere((a) => a.id == account.id);
     final merged = idx >= 0
         ? account.copyWith(
@@ -239,15 +394,22 @@ class CodeBuddyAccounts extends ChangeNotifier {
       _accounts.insert(0, merged);
     }
     await _saveAccount(merged);
+    if (_disposed) return merged;
     if (makeActive || _currentAccountId == null) {
       _currentAccountId = merged.id;
       _syncActiveRegionModels();
       await _saveIndex();
-      notifyListeners();
+      if (_disposed) return merged;
+      _safeNotify();
       await onActiveAccountSwitched?.call(merged);
     } else {
       await _saveIndex();
-      notifyListeners();
+      if (_disposed) return merged;
+      _safeNotify();
+    }
+    if (_disposed) return merged;
+    if (_refreshTimer == null) {
+      _startBackgroundRefreshTimer();
     }
     unawaited(refreshQuota(merged.id));
     return merged;
@@ -335,7 +497,9 @@ class CodeBuddyAccounts extends ChangeNotifier {
 
   /// Ensures [account] has a fresh non-expired `accessToken` before spawning `codebuddy`.
   Future<CodeBuddyAccount> ensureFreshAccount(CodeBuddyAccount account) async {
-    if (!account.auth.needsRefresh || account.auth.refreshToken.isEmpty) {
+    if (_disposed ||
+        !account.auth.needsRefresh ||
+        account.auth.refreshToken.isEmpty) {
       return account;
     }
     try {
@@ -343,12 +507,15 @@ class CodeBuddyAccounts extends ChangeNotifier {
         auth: account.auth,
         endpoint: account.endpoint,
       );
+      if (_disposed) return account;
       final updated = account.copyWith(auth: refreshedAuth, clearDisabled: true);
       final idx = _accounts.indexWhere((a) => a.id == account.id);
       if (idx >= 0) {
+        _loadEpoch++;
         _accounts[idx] = updated;
         await _saveAccount(updated);
-        notifyListeners();
+        if (_disposed) return updated;
+        _safeNotify();
       }
       return updated;
     } on Object {
@@ -358,74 +525,98 @@ class CodeBuddyAccounts extends ChangeNotifier {
 
   /// Switches the active CodeBuddy account to [accountId].
   Future<void> switchAccount(String accountId) async {
+    if (_disposed) return;
     await ensureInitialized();
+    if (_disposed) return;
     final targetIdx = _accounts.indexWhere((a) => a.id == accountId);
     if (targetIdx < 0) return;
 
     _switchingId = accountId;
-    notifyListeners();
+    _safeNotify();
     try {
       final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       var target = _accounts[targetIdx].copyWith(lastUsed: nowSec);
       target = await ensureFreshAccount(target);
-      _accounts[targetIdx] = target;
+      if (_disposed) return;
+      final currentIdx = _accounts.indexWhere((a) => a.id == accountId);
+      if (currentIdx < 0) return;
+      _loadEpoch++;
+      _accounts[currentIdx] = target;
       _currentAccountId = accountId;
       _syncActiveRegionModels();
       await _saveAccount(target);
+      if (_disposed) return;
       await _saveIndex();
-      notifyListeners();
+      if (_disposed) return;
+      _safeNotify();
       await onActiveAccountSwitched?.call(target);
     } finally {
       _switchingId = null;
-      notifyListeners();
+      _safeNotify();
     }
   }
 
   /// Clears active managed account selection? Deleting the active account
   /// switches to the next available account (or falls back to CLI default).
   Future<void> deleteAccount(String accountId) async {
+    if (_disposed) return;
     await ensureInitialized();
+    if (_disposed) return;
     final idx = _accounts.indexWhere((a) => a.id == accountId);
     if (idx < 0) return;
+    _loadEpoch++;
     _accounts.removeAt(idx);
     final file = File(p.join(dataDirectoryPath, 'accounts', '$accountId.json'));
     if (file.existsSync()) {
       await file.delete();
+      if (_disposed) return;
     }
     final wasActive = _currentAccountId == accountId;
     if (wasActive) {
       _currentAccountId = _accounts.firstOrNull?.id;
       _syncActiveRegionModels();
     }
+    if (_accounts.isEmpty) {
+      _refreshTimer?.cancel();
+      _refreshTimer = null;
+    }
     await _saveIndex();
-    notifyListeners();
+    if (_disposed) return;
+    _safeNotify();
     if (wasActive) {
       await onActiveAccountSwitched?.call(currentAccount);
     }
   }
 
   Future<void> setCustomLabel(String accountId, String label) async {
+    if (_disposed) return;
     await ensureInitialized();
+    if (_disposed) return;
     final idx = _accounts.indexWhere((a) => a.id == accountId);
     if (idx < 0) return;
+    _loadEpoch++;
     final trimmed = label.trim();
     final updated = trimmed.isEmpty
         ? _accounts[idx].copyWith(clearCustomLabel: true)
         : _accounts[idx].copyWith(customLabel: trimmed);
     _accounts[idx] = updated;
     await _saveAccount(updated);
-    notifyListeners();
+    if (_disposed) return;
+    _safeNotify();
   }
 
   Future<void> setAutoSwitch(CodeBuddyAutoSwitchConfig config) async {
+    if (_disposed) return;
     await ensureInitialized();
+    if (_disposed) return;
+    _loadEpoch++;
     _autoSwitch = config;
     const encoder = JsonEncoder.withIndent('  ');
     await CodeBuddyOAuth.writeAtomicSecure(
       p.join(dataDirectoryPath, 'auto_switch.json'),
       encoder.convert(config.toJson()),
     );
-    notifyListeners();
+    _safeNotify();
   }
 
   /// Records live credit & token usage reported by `codebuddy` stream-json
@@ -437,6 +628,7 @@ class CodeBuddyAccounts extends ChangeNotifier {
     int tokens = 0,
     bool quotaExhausted = false,
   }) async {
+    if (_disposed) return;
     final active = currentAccount;
     if (active == null) return;
     final idx = _accounts.indexWhere((a) => a.id == active.id);
@@ -459,14 +651,17 @@ class CodeBuddyAccounts extends ChangeNotifier {
       lastUpdated: nowSec,
     );
     final updated = active.copyWith(quota: nextQuota, lastUsed: nowSec);
+    _loadEpoch++;
     _accounts[idx] = updated;
     await _saveAccount(updated);
-    notifyListeners();
+    if (_disposed) return;
+    _safeNotify();
 
     if (quotaExhausted && _autoSwitch.enabled) {
       await _tryAutoSwitchFrom(updated);
       return;
     }
+    if (_disposed) return;
 
     // Sync authoritative server credit balance after turn settles.
     if (updated.auth.kind != CodeBuddyAuthKind.apiKey &&
@@ -474,6 +669,7 @@ class CodeBuddyAccounts extends ChangeNotifier {
       _postTurnRefreshTimer?.cancel();
       final targetId = updated.id;
       _postTurnRefreshTimer = Timer(const Duration(milliseconds: 2200), () {
+        if (_disposed) return;
         unawaited(refreshQuota(targetId));
       });
     }
@@ -485,8 +681,10 @@ class CodeBuddyAccounts extends ChangeNotifier {
   Future<void> syncFromCliInitializeAccount(
     Map<String, Object?> rawAccount,
   ) async {
+    if (_disposed) return;
     await ensureInitialized();
-    if (_accounts.isNotEmpty) return;
+    if (_disposed || _accounts.isNotEmpty) return;
+    _loadEpoch++;
     final uid =
         (rawAccount['uid'] ?? rawAccount['userId'] ?? rawAccount['id'])
             as String? ??
@@ -529,8 +727,12 @@ class CodeBuddyAccounts extends ChangeNotifier {
     _accounts.add(account);
     _currentAccountId = account.id;
     await _saveAccount(account);
+    if (_disposed) return;
     await _saveIndex();
-    notifyListeners();
+    if (_disposed) return;
+    _startBackgroundRefreshTimer();
+    _safeNotify();
+    if (_disposed) return;
     unawaited(refreshQuota(account.id));
   }
 
@@ -556,18 +758,21 @@ class CodeBuddyAccounts extends ChangeNotifier {
   }
 
   Future<void> refreshQuota(String accountId) async {
+    if (_disposed) return;
     await ensureInitialized();
+    if (_disposed) return;
     if (_refreshingIds.contains(accountId)) return;
     final idx = _accounts.indexWhere((a) => a.id == accountId);
     if (idx < 0) return;
 
     _refreshingIds.add(accountId);
     _lastRefreshError = null;
-    notifyListeners();
+    _safeNotify();
     try {
       final (:updatedAccount, :quota) = await CodeBuddyQuotaService.fetchQuota(
         _accounts[idx],
       );
+      if (_disposed) return;
       final newIdx = _accounts.indexWhere((a) => a.id == accountId);
       if (newIdx >= 0) {
         final latest = _accounts[newIdx];
@@ -596,14 +801,17 @@ class CodeBuddyAccounts extends ChangeNotifier {
           customLabel: latest.customLabel,
           quota: mergedQuota,
         );
+        _loadEpoch++;
         _accounts[newIdx] = mergedAccount;
         await _saveAccount(mergedAccount);
+        if (_disposed) return;
         if (_currentAccountId == accountId &&
             mergedQuota.availableModelIds.isNotEmpty) {
           CodeBuddyModels.syncForAccount(mergedAccount);
         }
       }
     } on CodeBuddyUnauthorizedException catch (e) {
+      if (_disposed) return;
       final newIdx = _accounts.indexWhere((a) => a.id == accountId);
       if (newIdx >= 0) {
         final marked = _accounts[newIdx].copyWith(
@@ -612,29 +820,34 @@ class CodeBuddyAccounts extends ChangeNotifier {
         );
         _accounts[newIdx] = marked;
         await _saveAccount(marked);
+        if (_disposed) return;
       }
       _lastRefreshError = e.message;
     } on Object catch (e) {
+      if (_disposed) return;
       _lastRefreshError = '$e';
     } finally {
       _refreshingIds.remove(accountId);
-      notifyListeners();
+      _safeNotify();
     }
   }
 
   Future<void> refreshAllQuotas({bool silent = false}) async {
+    if (_disposed) return;
     await ensureInitialized();
+    if (_disposed) return;
     if (_refreshingAll || _accounts.isEmpty) return;
     _refreshingAll = true;
     if (!silent) _lastRefreshError = null;
-    notifyListeners();
+    _safeNotify();
     try {
       for (final acc in [..._accounts]) {
+        if (_disposed) return;
         await refreshQuota(acc.id);
       }
     } finally {
       _refreshingAll = false;
-      notifyListeners();
+      _safeNotify();
     }
   }
 
@@ -648,7 +861,9 @@ class CodeBuddyAccounts extends ChangeNotifier {
   }
 
   Future<int> importAccountsJson(String rawJson) async {
+    if (_disposed) return 0;
     await ensureInitialized();
+    if (_disposed) return 0;
     final decoded = jsonDecode(_stripBom(rawJson));
     final items = <Map<String, Object?>>[];
     if (decoded is List) {
@@ -666,9 +881,11 @@ class CodeBuddyAccounts extends ChangeNotifier {
     }
     var count = 0;
     for (final map in items) {
+      if (_disposed) break;
       final acc = CodeBuddyAccount.fromJson(map);
       if (acc.id.isEmpty) continue;
       await upsertAccount(acc, makeActive: count == 0 && _accounts.isEmpty);
+      if (_disposed) break;
       count++;
     }
     return count;

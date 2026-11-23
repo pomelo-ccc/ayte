@@ -109,7 +109,17 @@ void main() {
     final background = _thread(workspace, 'Rate limit per API key');
     background.session.send(const ComposerMessage(text: '加一个限流'));
     await tester.pump();
-    expect(host.trays.last!.labels['running'], '1 running');
+    final runningTray = host.trays.last!;
+    expect(runningTray.labels['running'], '1 running');
+    expect(runningTray.running.single.title, 'Rate limit per API key');
+    expect(runningTray.running.single.project, background.project.name);
+    expect(runningTray.running.single.detail, isNotEmpty);
+    expect(runningTray.tooltip, contains('1 running'));
+
+    // Running agents can also be opened directly from the tray popover.
+    host.openHandler!(runningTray.running.single.id);
+    expect(opened, [background]);
+    opened.clear();
 
     await _runUntilQuestion(tester, background.session);
     expect(host.notifications, hasLength(1));
@@ -120,7 +130,22 @@ void main() {
     expect(host.sounds, hasLength(1));
     expect(host.sounds.single, isA<Uint8List>());
     expect(host.badge, 2);
-    expect(host.trays.last!.waiting.single.title, 'Rate limit per API key');
+    final waitingTray = host.trays.last!;
+    expect(waitingTray.waiting.single.title, 'Rate limit per API key');
+    expect(waitingTray.waiting.single.project, background.project.name);
+    expect(waitingTray.waiting.single.detail, isNotEmpty);
+    expect(waitingTray.badgeCount, 2);
+    expect(waitingTray.encoded['running'], isEmpty);
+    expect((waitingTray.encoded['waiting'] as List).single, {
+      'id': waitingTray.waiting.single.id,
+      'title': 'Rate limit per API key',
+      'project': background.project.name,
+      'detail': waitingTray.waiting.single.detail,
+    });
+    expect(waitingTray.labels['runningHeader'], 'Running');
+    expect(waitingTray.labels['newChat'], isNotEmpty);
+    expect(waitingTray.labels['settings'], isNotEmpty);
+    expect(waitingTray.labels['idle'], isNotEmpty);
 
     background.session.answer(_answer);
     await _runUntilDone(tester, background.session);
@@ -131,6 +156,10 @@ void main() {
     expect(host.attentionRequests, 1);
     expect(host.badge, 2);
     expect(host.trays.last!.waiting, isEmpty);
+    expect(
+      host.trays.last!.unread.map((agent) => agent.title),
+      contains('Rate limit per API key'),
+    );
 
     // Clicked: the agent opens.
     host.openHandler!(asked.id);
@@ -249,6 +278,72 @@ void main() {
     expect(host.badge, badge);
     expect(host.trays.last!.waiting, isEmpty);
     bot.session.stop();
+    await tester.pump(const Duration(seconds: 5));
+  });
+
+  testWidgets('populates rich tray popover state for running, waiting, unread, and idle', (
+    tester,
+  ) async {
+    settings = const AttentionSettings(sound: NotificationSoundValue.none);
+    start();
+
+    final initialTray = host.trays.last!;
+    expect(initialTray.dot, isTrue);
+    expect(initialTray.badgeCount, 1);
+    expect(initialTray.unread, hasLength(1));
+    expect(initialTray.labels['runningHeader'], 'Running');
+    expect(initialTray.labels['idle'], 'All caught up');
+    expect(initialTray.labels['idleHint'], isNotEmpty);
+    expect(initialTray.labels['newChat'], isNotEmpty);
+    expect(initialTray.labels['settings'], isNotEmpty);
+
+    // Start a background agent -> appears in running list and can be opened.
+    final background = _thread(workspace, 'Rate limit per API key');
+    background.session.send(const ComposerMessage(text: '加一个限流'));
+    await tester.pump();
+
+    final runningTray = host.trays.last!;
+    expect(runningTray.running.single.title, 'Rate limit per API key');
+    expect(runningTray.running.single.project, background.project.name);
+    expect(runningTray.running.single.detail, isNotEmpty);
+    expect(runningTray.labels['running'], '1 running');
+    expect(runningTray.tooltip, 'Ayte · 1 running');
+
+    host.openHandler!(runningTray.running.single.id);
+    expect(opened, [background]);
+    opened.clear();
+
+    // Agent asks a question -> moves to waiting with detail and encoded payload.
+    await _runUntilQuestion(tester, background.session);
+    final waitingTray = host.trays.last!;
+    expect(waitingTray.running, isEmpty);
+    expect(waitingTray.waiting.single.title, 'Rate limit per API key');
+    expect(waitingTray.waiting.single.project, background.project.name);
+    expect(waitingTray.waiting.single.detail, isNotEmpty);
+    expect(waitingTray.badgeCount, 2);
+    expect(waitingTray.tooltip, 'Ayte · 1 waiting');
+    expect(waitingTray.encoded['badgeCount'], 2);
+    expect((waitingTray.encoded['waiting'] as List).single, {
+      'id': waitingTray.waiting.single.id,
+      'title': 'Rate limit per API key',
+      'project': background.project.name,
+      'detail': waitingTray.waiting.single.detail,
+    });
+
+    // Agent finishes -> moves to unread and can be opened directly.
+    background.session.answer(_answer);
+    await _runUntilDone(tester, background.session);
+    final unreadTray = host.trays.last!;
+    expect(unreadTray.waiting, isEmpty);
+    expect(unreadTray.running, isEmpty);
+    final finishedItem = unreadTray.unread.firstWhere(
+      (agent) => agent.title == 'Rate limit per API key',
+    );
+    expect(finishedItem.project, background.project.name);
+    expect(finishedItem.detail, isNotEmpty);
+
+    host.openHandler!(finishedItem.id);
+    expect(opened, [background]);
     await tester.pump(const Duration(seconds: 5));
   });
 

@@ -22,7 +22,10 @@ typedef ClaudeSdkAsk = Future<ApprovalDecision?> Function(
 class ClaudeSdkCall {
   const ClaudeSdkCall({
     required this.cwd,
-    this.sessionId,
+    this._sessionId,
+    this.sessionIdProvider,
+    this._turnId,
+    this.turnIdProvider,
     this.cancelled,
     this.toolUseId,
     this.ask,
@@ -33,7 +36,22 @@ class ClaudeSdkCall {
   /// Asks the user, on the agent's conversation: its id is the kernel's
   /// to give (the request's own is not kept). None where the kernel cannot.
   final ClaudeSdkAsk? ask;
-  final String? sessionId;
+  final String? _sessionId;
+  final String? Function()? sessionIdProvider;
+  final String? _turnId;
+  final String? Function()? turnIdProvider;
+
+  String? get sessionId {
+    final provided = sessionIdProvider?.call();
+    if (provided != null && provided.isNotEmpty) return provided;
+    return _sessionId;
+  }
+
+  String? get turnId {
+    final provided = turnIdProvider?.call();
+    if (provided != null && provided.isNotEmpty) return provided;
+    return _turnId;
+  }
 
   /// The tool use it answers, as Claude Code says (`_meta`'s
   /// `claudecode/toolUseId`): its step's in the conversation
@@ -170,6 +188,22 @@ abstract final class ClaudeSdkTools {
   /// user at the computer ([ClaudeSdkGate.asksUser]).
   static bool asksUser(String cwd) => gate?.asksUser(cwd) ?? true;
 
+  /// Whether [name] is a registered SDK tool on this server.
+  static bool hasTool(String name) => _tools.containsKey(name);
+
+  /// The registered SDK tool named [name], or null if none.
+  static ClaudeSdkTool? toolNamed(String name) => _tools[name];
+
+  /// The combined feature instructions offered for an agent working in [cwd],
+  /// or null when none apply.
+  static String? instructionsFor(String cwd) {
+    final told = [
+      for (final MapEntry(key: feature, value: text) in _instructions.entries)
+        if (_tells(cwd, feature)) ?text(cwd),
+    ];
+    return told.isEmpty ? null : told.join('\n\n');
+  }
+
   /// The tool an agent calls [name] (`mcp__baocode__<name>`), if one of
   /// this server's.
   static ClaudeSdkTool? called(String name) {
@@ -195,25 +229,34 @@ abstract final class ClaudeSdkTools {
     Map<String, Object?> message,
     ClaudeSdkCall call,
   ) async {
-    final id = message['id'];
-    final params = (message['params'] as Map?)?.cast<String, Object?>() ?? {};
+    final id = message.containsKey('id') ? message['id'] : 0;
+    final rawParams = message['params'];
+    if (rawParams != null && rawParams is! Map) {
+      return {
+        'jsonrpc': '2.0',
+        'id': id,
+        'error': {
+          'code': -32602,
+          'message': 'Invalid params: expected object.',
+        },
+      };
+    }
+    final params = rawParams is Map
+        ? rawParams.cast<String, Object?>()
+        : const <String, Object?>{};
     Map<String, Object?> result(Map<String, Object?> result) => {
       'jsonrpc': '2.0',
-      'id': id ?? 0,
+      'id': id,
       'result': result,
     };
     switch (message['method']) {
       case 'initialize':
-        final told = [
-          for (final MapEntry(key: feature, value: text)
-              in _instructions.entries)
-            if (_tells(call.cwd, feature)) ?text(call.cwd),
-        ];
+        final instructions = instructionsFor(call.cwd);
         return result({
           'protocolVersion': params['protocolVersion'] ?? '2024-11-05',
           'capabilities': {'tools': <String, Object?>{}},
           'serverInfo': {'name': server, 'version': '1.0.0'},
-          if (told.isNotEmpty) 'instructions': told.join('\n\n'),
+          'instructions': ?instructions,
         });
       case 'tools/list':
         return result({
@@ -229,35 +272,64 @@ abstract final class ClaudeSdkTools {
           ],
         });
       case 'tools/call':
-        final tool = switch (params['name']) {
-          final String name when _offers(call.cwd, name) => _tools[name],
-          _ => null,
-        };
-        final input =
-            (params['arguments'] as Map?)?.cast<String, Object?>() ?? {};
+        final rawName = params['name'];
+        if (rawName is! String || rawName.isEmpty) {
+          return {
+            'jsonrpc': '2.0',
+            'id': id,
+            'error': {
+              'code': -32602,
+              'message': 'Invalid params: "name" must be a non-empty string.',
+            },
+          };
+        }
+        final rawArgs = params['arguments'];
+        if (rawArgs != null && rawArgs is! Map) {
+          return {
+            'jsonrpc': '2.0',
+            'id': id,
+            'error': {
+              'code': -32602,
+              'message': 'Invalid params: "arguments" must be an object.',
+            },
+          };
+        }
+        final tool = _offers(call.cwd, rawName) ? _tools[rawName] : null;
+        final input = rawArgs is Map
+            ? rawArgs.cast<String, Object?>()
+            : const <String, Object?>{};
         if (tool == null) {
           return result({
             'content': [
-              {'type': 'text', 'text': 'No tool ${params['name']}.'},
+              {'type': 'text', 'text': 'No tool $rawName.'},
             ],
             'isError': true,
           });
         }
         // Given up as the turn stops, or as the agent says.
         final cancel = Completer<void>();
-        final key = (call.sessionId, id ?? cancel);
+        final sessionKey = call.sessionId;
+        final key = (sessionKey, id ?? cancel);
         _calls[key] = cancel;
         unawaited(
-          call.cancelled?.then((_) {
-            if (!cancel.isCompleted) cancel.complete();
-          }),
+          call.cancelled?.then(
+            (_) {
+              if (!cancel.isCompleted) cancel.complete();
+            },
+            onError: (_, _) {
+              if (!cancel.isCompleted) cancel.complete();
+            },
+          ),
         );
         try {
           final answer = await tool.run(
             input,
             ClaudeSdkCall(
               cwd: call.cwd,
-              sessionId: call.sessionId,
+              sessionId: sessionKey,
+              sessionIdProvider: call.sessionIdProvider,
+              turnId: call.turnId,
+              turnIdProvider: call.turnIdProvider,
               cancelled: cancel.future,
               ask: call.ask,
               toolUseId: switch (params['_meta']) {
@@ -280,12 +352,16 @@ abstract final class ClaudeSdkTools {
             'isError': true,
           });
         } finally {
-          if (_calls[key] == cancel) _calls.remove(key);
+          if (identical(_calls[key], cancel)) _calls.remove(key);
+          if (!cancel.isCompleted) cancel.complete();
         }
       case 'notifications/cancelled':
-        if (_calls.remove((call.sessionId, params['requestId']))
-            case final cancel? when !cancel.isCompleted) {
-          cancel.complete();
+        final requestId = params['requestId'];
+        if (requestId != null) {
+          if (_calls.remove((call.sessionId, requestId)) case final cancel?
+              when !cancel.isCompleted) {
+            cancel.complete();
+          }
         }
         return result({});
       case final String method when method.startsWith('notifications/'):
@@ -293,7 +369,7 @@ abstract final class ClaudeSdkTools {
       default:
         return {
           'jsonrpc': '2.0',
-          'id': id ?? 0,
+          'id': id,
           'error': {
             'code': -32601,
             'message': 'Method not found: ${message['method']}',

@@ -54,22 +54,45 @@ class MockCodexTransport implements CodexTransport {
         _respond(id, {
           'thread': {'id': _threadId},
         });
+      case 'thread/resume':
+        _respond(id, {
+          'thread': {'id': params['threadId'] ?? _threadId, 'turns': const []},
+        });
+      case 'thread/fork':
+        _respond(id, {
+          'thread': {'id': '${_threadId}_fork'},
+        });
+      case 'thread/name/set':
+        _respond(id, {});
       case 'thread/rollback':
         _respond(id, {
           'thread': {'id': _threadId},
         });
+      case 'model/list':
+        _respond(id, {'data': const <Object?>[]});
+      case 'mcpServerStatus/list':
+        _respond(id, {'data': const <Object?>[]});
+      case 'account/rateLimits/read':
+        _respond(id, const <String, Object?>{});
+      case 'config/mcpServer/reload':
+        _respond(id, const <String, Object?>{});
       case 'turn/start':
         final turnId = 'turn_${++_turns}';
         _respond(id, {
           'turn': {'id': turnId, 'status': 'inProgress'},
         });
-        final input = (params['input'] as List).first as Map;
+        final inputs = (params['input'] as List?) ?? const [];
+        final textEntry = inputs.whereType<Map>().firstWhere(
+          (entry) => entry['type'] == 'text',
+          orElse: () => const {'text': ''},
+        );
+        final promptText = '${textEntry['text'] ?? ''}';
         final readOnly =
             (params['sandboxPolicy'] as Map?)?['type'] == 'readOnly';
         final run = Object();
         _run = run;
         _turnId = turnId;
-        unawaited(_script(run, turnId, input['text'] as String, readOnly));
+        unawaited(_script(run, turnId, promptText, readOnly));
       case 'turn/interrupt':
         _respond(id, {});
         if (_turnId case final turnId? when _run != null) {

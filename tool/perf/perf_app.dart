@@ -336,7 +336,7 @@ void _setUpApp(String temp) {
     ),
   );
   KernelRegistry.use([perfClaudeCode]);
-  ClaudeCore.current = () => ClaudeCore.cli;
+  ClaudeCore.current = () => ClaudeCore.antigravity;
   MonacoLanguageAssets.defaultPacks = () => LanguagePackRegistry.instance;
   WorkbenchThemeService.instance.restore();
 }

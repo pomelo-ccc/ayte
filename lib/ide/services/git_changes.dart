@@ -67,13 +67,13 @@ class GitChangesService {
   /// thrown again for the diff to keep the edit.
   Future<void> write(String path, String text, {String? expectedText}) async {
     final doc = workspace?.documents
-        .where((doc) => doc.path == path && doc.isFile)
+        .where((doc) => doc.isFile && workspace!.paths.equals(doc.path, path))
         .firstOrNull;
     try {
       if (doc == null) {
         await files.write(path, text, expectedText: expectedText);
       } else {
-        workspace!.edit(path, text);
+        workspace!.edit(doc.path, text);
         await workspace!.save(doc);
       }
     } on Object catch (error) {
@@ -88,9 +88,10 @@ class GitChangesService {
     final edits = _agentEdits?.call();
     final edit = edits?.of(path);
     if (edits == null || edit == null) return null;
+    final paths = edit.session.paths;
     final turns = <String, String>{
       for (final turn in edits.turnEdits)
-        if (turn.path == path) turn.turn: turn.request,
+        if (paths.equals(turn.path, path)) turn.turn: turn.request,
     };
     return IdeDiffAgentMarks(edit.base, turns.values.toList());
   }

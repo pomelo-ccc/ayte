@@ -1063,10 +1063,22 @@ class _ChatScreenState extends State<ChatScreen>
   /// The kernel's commands as suggestions, kept while its list is the same.
   List<Suggestion> _commandSuggestions() {
     final commands = _session.commands;
-    if (!identical(commands, _commandSource)) {
+    final locale = Localizations.maybeLocaleOf(context)?.languageCode ?? 'en';
+    if (!identical(commands, _commandSource) || locale != _commandLocale) {
       _commandSource = commands;
+      _commandLocale = locale;
       final aside = widget.onSideQuestion != null;
       final fork = widget.onFork != null;
+      final grouped = commands.any((c) => c.category != null);
+      final zh = locale == 'zh';
+      String? groupLabel(String? category) => switch (category) {
+        'builtin' => zh ? '内置命令' : 'Built-in',
+        'project' => zh ? '项目命令与技能' : 'Project',
+        'user' => zh ? '个人命令与技能' : 'User',
+        'plugin' => zh ? '插件技能' : 'Plugin Skills',
+        _ => null,
+      };
+      final builtinGroup = grouped ? groupLabel('builtin') : null;
       _commands = [
         // Taken here, not by the agent: a conversation beside this one
         // (see [ChatScreen.onSideQuestion]), in place of the CLI's own.
@@ -1076,6 +1088,7 @@ class _ChatScreenState extends State<ChatScreen>
             label: _asideCommand,
             detail: context.l10n.btwCommandDetail,
             icon: Codicons.commentDiscussion,
+            group: builtinGroup,
           ),
         // And a copy of this one (see [ChatScreen.onFork]).
         if (fork)
@@ -1084,6 +1097,7 @@ class _ChatScreenState extends State<ChatScreen>
             label: _forkCommand,
             detail: context.l10n.forkCommandDetail,
             icon: Codicons.repoForked,
+            group: builtinGroup,
           ),
         for (final command in commands)
           if ((!aside || command.name != _asideCommand) &&
@@ -1095,6 +1109,7 @@ class _ChatScreenState extends State<ChatScreen>
                   ? command.description
                   : '${command.argumentHint}  ${command.description}',
               icon: command.icon,
+              group: grouped ? groupLabel(command.category) : null,
             ),
       ];
     }
@@ -1143,6 +1158,7 @@ class _ChatScreenState extends State<ChatScreen>
       _interceptSideQuestion(message) || _interceptFork(message);
 
   List<KernelCommand>? _commandSource;
+  String? _commandLocale;
   List<Suggestion> _commands = const [];
 
   /// [ChatScreen.commandFile]'s answers, asked once each while the
@@ -1200,13 +1216,22 @@ class _ChatScreenState extends State<ChatScreen>
     if (links == null) return;
     var opened = request;
     if (request.diff && request.change == null) {
-      for (final change in _session.fileChanges) {
-        if (change.path == request.path) {
-          opened = request.copyWith(
-            change: change,
-            original: _session.originalOf(change),
-          );
-          break;
+      final resolvedRequest = request.path.trim().isEmpty
+          ? ''
+          : _session.resolvePath(request.path);
+      if (resolvedRequest.isNotEmpty) {
+        for (final change in _session.fileChanges) {
+          final resolvedChange = change.path.trim().isEmpty
+              ? ''
+              : _session.resolvePath(change.path);
+          if (resolvedChange.isNotEmpty &&
+              _session.paths.equals(resolvedChange, resolvedRequest)) {
+            opened = request.copyWith(
+              change: change,
+              original: _session.originalOf(change),
+            );
+            break;
+          }
         }
       }
     }

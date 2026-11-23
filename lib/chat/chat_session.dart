@@ -935,12 +935,14 @@ class ChatSession extends ChangeNotifier implements ChatFeed {
   List<FileChange> get fileChanges {
     if (_activeReview case final review?) return review.changes;
     return _cached(#fileChanges, () {
+      final hostPaths = paths;
       final byPath = <String, FileChange>{};
       for (final (seq: _, :change, turnId: _) in _pendingEdits) {
         final path = _absolute(change.path);
-        final before = byPath[path];
-        byPath[path] = FileChange(
-          path: path,
+        final key = path.isEmpty ? '' : hostPaths.canonicalize(path);
+        final before = byPath[key];
+        byPath[key] = FileChange(
+          path: before?.path ?? path,
           added: (before?.added ?? 0) + change.added,
           removed: (before?.removed ?? 0) + change.removed,
         );
@@ -973,18 +975,30 @@ class ChatSession extends ChangeNotifier implements ChatFeed {
   /// The same list while they stay the same, as the reply streams: what
   /// looks a path up in it indexes each list once (FileOpenScope).
   List<String> get filesSeen => _cached(#filesSeen, () {
-    final files = {
-      for (var i = 0; i < _transcript.length; i++)
-        if (_transcript.itemAt(i) case ToolCallItem(
-          :final path,
-          :final imageFiles,
-        )) ...[
-          if (path != null && path.isNotEmpty) _absolute(path),
-          // The pictures the CLI saved for it: the agent may link them.
-          for (final file in imageFiles) _absolute(file),
-        ],
-      for (final edit in _transcript.edits) _absolute(edit.change.path),
-    }.toList();
+    final hostPaths = paths;
+    final seen = <String, String>{};
+    void add(String raw) {
+      final path = _absolute(raw);
+      final key = path.isEmpty ? '' : hostPaths.canonicalize(path);
+      seen.putIfAbsent(key, () => path);
+    }
+
+    for (var i = 0; i < _transcript.length; i++) {
+      if (_transcript.itemAt(i) case ToolCallItem(
+        :final path,
+        :final imageFiles,
+      )) {
+        if (path != null && path.isNotEmpty) add(path);
+        // The pictures the CLI saved for it: the agent may link them.
+        for (final file in imageFiles) {
+          add(file);
+        }
+      }
+    }
+    for (final edit in _transcript.edits) {
+      add(edit.change.path);
+    }
+    final files = seen.values.toList();
     if (listEquals(files, _filesSeen)) return _filesSeen;
     return _filesSeen = files;
   });
@@ -999,13 +1013,36 @@ class ChatSession extends ChangeNotifier implements ChatFeed {
     null => p.context,
   };
 
+  /// [path] absolute and normalized on the project's host (or normalized
+  /// as-is when [kernelContext.cwd] is unknown).
+  String resolvePath(String path) => _absolute(path);
+
   String _absolute(String path) {
+    if (path.isEmpty) return path;
     final cwd = kernelContext.cwd;
-    if (cwd == null) return path;
-    final paths = RemoteLocation.pathsOf(cwd);
-    return paths.isAbsolute(path)
-        ? path
-        : paths.join(RemoteLocation.pathOf(cwd), path);
+    if (cwd == null) return paths.normalize(path);
+    final hostPaths = RemoteLocation.pathsOf(cwd);
+    final resolved = hostPaths.normalize(
+      hostPaths.isAbsolute(path)
+          ? path
+          : hostPaths.joinAll([RemoteLocation.pathOf(cwd), ...path.split('/')]),
+    );
+    final real = _activeReview?.realRoot;
+    final reviewRoot = _activeReview?.root;
+    if (real != null &&
+        reviewRoot != null &&
+        (hostPaths.equals(real, resolved) ||
+            hostPaths.isWithin(real, resolved))) {
+      return hostPaths.normalize(
+        hostPaths.join(reviewRoot, hostPaths.relative(resolved, from: real)),
+      );
+    }
+    return resolved;
+  }
+
+  String _canonicalKey(String path) {
+    final resolved = _absolute(path);
+    return resolved.isEmpty ? '' : paths.canonicalize(resolved);
   }
 
   Iterable<({int seq, FileChange change, String? turnId})> get _pendingEdits {
@@ -1013,7 +1050,7 @@ class ChatSession extends ChangeNotifier implements ChatFeed {
     return _transcript.edits.where(
       (edit) =>
           edit.seq > settled &&
-          edit.seq > (_keptPaths[_absolute(edit.change.path)] ?? -1),
+          edit.seq > (_keptPaths[_canonicalKey(edit.change.path)] ?? -1),
     );
   }
 
@@ -1032,7 +1069,7 @@ class ChatSession extends ChangeNotifier implements ChatFeed {
       return;
     }
     for (final change in changes) {
-      _keptPaths[change.path] = _transcript.lastSeq;
+      _keptPaths[_canonicalKey(change.path)] = _transcript.lastSeq;
     }
     _cache.clear();
     notifyListeners();

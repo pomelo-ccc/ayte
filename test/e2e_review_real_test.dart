@@ -10,14 +10,32 @@ import 'package:baocode/chat/chat_session.dart';
 import 'package:baocode/chat/review/change_review.dart';
 import 'package:baocode/chat/review/review_store_io.dart';
 import 'package:baocode/kernel/agent_kernel.dart';
+import 'package:baocode/kernel/claude_code/claude_cli_transport.dart';
 import 'package:baocode/kernel/claude_code/claude_code_kernel.dart';
-import 'package:baocode/kernel/claude_code/process_transport.dart';
 import 'package:baocode/kernel/kernel_types.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 
-import 'e2e_claude_real_test.dart' show tempProject;
+Future<String> _tempProject() async {
+  final root = Directory.systemTemp
+      .createTempSync('baocode-e2e-review-project-')
+      .resolveSymbolicLinksSync();
+  addTearDown(() async {
+    for (var i = 0; i < 10; i++) {
+      try {
+        if (Directory(root).existsSync()) {
+          Directory(root).deleteSync(recursive: true);
+        }
+        return;
+      } on FileSystemException {
+        await Future<void>.delayed(const Duration(seconds: 1));
+      }
+    }
+  });
+  await Process.run('git', ['init', '-q'], workingDirectory: root);
+  return root;
+}
 
 void main() {
   final settings = Platform.environment['BAOCODE_LIVE_SETTINGS'];
@@ -26,11 +44,23 @@ void main() {
     "real Claude Code: each conversation's edits and its subagent's are "
     'its own to undo',
     () async {
-      final cwd = await tempProject();
-      final checkpoints = p.join(
-        (await Directory.systemTemp.createTemp('baocode-e2e-review-')).path,
-        'checkpoints',
+      final cwd = await _tempProject();
+      final checkpointsRoot = await Directory.systemTemp.createTemp(
+        'baocode-e2e-review-',
       );
+      addTearDown(() async {
+        for (var i = 0; i < 10; i++) {
+          try {
+            if (checkpointsRoot.existsSync()) {
+              checkpointsRoot.deleteSync(recursive: true);
+            }
+            return;
+          } on FileSystemException {
+            await Future<void>.delayed(const Duration(seconds: 1));
+          }
+        }
+      });
+      final checkpoints = p.join(checkpointsRoot.path, 'checkpoints');
       String read(String name) => File(p.join(cwd, name)).readAsStringSync();
       File(p.join(cwd, 'b.txt')).writeAsStringSync('alpha\nbeta\ngamma\n');
 
@@ -44,7 +74,7 @@ void main() {
           descriptor,
           context,
           start: (launch) =>
-              startClaudeProcess(launch.copyWith(settingsPath: settings)),
+              startClaudeCli(launch.copyWith(settingsPath: settings)),
         ),
       );
       ChatSession conversation() {

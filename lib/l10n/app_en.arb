@@ -2734,6 +2734,27 @@
     },
     "description": "Tray menu: how many agents are running."
   },
+  "trayRunningHeader": "Running",
+  "@trayRunningHeader": {
+    "description": "Tray popover section header over currently running agents."
+  },
+  "trayUnreadCount": "{count} finished",
+  "@trayUnreadCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    },
+    "description": "Tray summary: how many agents finished unread."
+  },
+  "trayIdle": "All caught up",
+  "@trayIdle": {
+    "description": "Tray popover status when no agents are waiting, running, or unread."
+  },
+  "trayIdleHint": "Agents keep working here in the background.",
+  "@trayIdleHint": {
+    "description": "Tray popover empty state helper text."
+  },
   "trayQuit": "Quit Ayte",
   "attentionNeedsInput": "Needs your input",
   "@attentionNeedsInput": {

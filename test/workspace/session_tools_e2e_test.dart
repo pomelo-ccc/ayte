@@ -93,7 +93,7 @@ void main() {
     });
   });
 
-  for (final core in [ClaudeCore.cli, ClaudeCore.builtin]) {
+  for (final core in [ClaudeCore.antigravity, ClaudeCore.builtin]) {
     test('${core.name}: a lead starts a worker, is told when it is done, '
         'and checks its work', () async {
       if (skip != null) return markTestSkipped(skip);

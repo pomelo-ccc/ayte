@@ -95,14 +95,22 @@ class ExpressionContainer {
   bool get childrenHaveBeenLoaded => _children != null;
 
   Future<void> evaluateLazy() async {
+    final session = this.session;
     final reference = this.reference;
-    if (reference == null) return;
-    final response = await session!.variables(reference, threadId, null, null, null);
+    if (session == null ||
+        session.isDisposed ||
+        session.raw == null ||
+        reference == null ||
+        reference <= 0) {
+      return;
+    }
+    final response = await session.variables(reference, threadId, null, null, null);
     final variables = response?.obj('body')?.objects('variables');
     if (variables == null || variables.length != 1) return;
     final dummy = variables.first;
     this.reference = dummy.integer('variablesReference');
     _value = dummy.str('value') ?? '';
+    type = dummy.str('type') ?? type;
     namedVariables = dummy.integer('namedVariables');
     indexedVariables = dummy.integer('indexedVariables');
     memoryReference = dummy.str('memoryReference');
@@ -276,6 +284,7 @@ class ExpressionContainer {
     String context, {
     bool keepLazyVars = false,
     ({int line, int column, Json source})? location,
+    bool rethrowCancel = false,
   }) async {
     if (session == null || (stackFrame == null && context != 'repl')) {
       value = context == 'repl'
@@ -302,6 +311,12 @@ class ExpressionContainer {
         }
         return true;
       }
+      return false;
+    } on DebugCancelledError {
+      if (rethrowCancel) rethrow;
+      value = 'Canceled';
+      reference = 0;
+      memoryReference = null;
       return false;
     } on Object catch (e) {
       value = errorMessage(e);

@@ -439,6 +439,40 @@ final class AppWindows: NSObject {
     show(next)
   }
 
+  /// A compact summary of an open window for the menu bar popover.
+  struct WindowSummary {
+    let viewId: Int64
+    let title: String
+    let edited: Bool
+    let active: Bool
+  }
+
+  /// Open windows for the menu bar popover, with the current key window marked.
+  var windowSummaries: [WindowSummary] {
+    guard started else { return [] }
+    let keyId = (NSApp.keyWindow as? BaoWindow)?.viewId
+    return entries.map { entry in
+      WindowSummary(
+        viewId: entry.viewId,
+        title: entry.title,
+        edited: entry.edited,
+        active: keyId == entry.viewId)
+    }
+  }
+
+  var windowsSectionTitle: String { labels["windows"] ?? "Windows" }
+  var newWindowTitle: String { labels["newWindow"] ?? "New Window" }
+
+  func focusWindow(viewId: Int64) {
+    if let window = window(viewId) {
+      show(window)
+    }
+  }
+
+  func openNewWindow() {
+    newWindowChosen(nil)
+  }
+
   /// The windows as the menus list them, and the labels' in the app's
   /// language: the Dock's menu and the menu bar icon's.
   func menuItems(target: AnyObject, choose: Selector, newWindow: Selector) -> [NSMenuItem] {

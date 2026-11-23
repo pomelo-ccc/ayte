@@ -7,10 +7,13 @@ import '../chat/chat_models.dart';
 import '../chat/chat_session.dart';
 import '../ide/git/git_checkout.dart' show ideSanitizeBranchName;
 import '../ide/git/git_service.dart';
-import '../kernel/agent_kernel.dart' show KernelChoiceKind;
+import '../kernel/agent_kernel.dart'
+    show KernelChoiceKind, KernelContext, KernelDescriptor, SelectsModel;
+import '../kernel/agent_message_parser.dart';
 import '../kernel/claude_code/claude_sdk_tools.dart';
 import '../kernel/kernel_types.dart';
 import '../remote/project_host.dart';
+import '../remote/remote_location.dart';
 import '../remote/remote_services.dart' show remoteGitService;
 import '../remote/ssh_host.dart' show SshHost;
 import 'agent_work_path.dart';
@@ -130,8 +133,16 @@ abstract final class SessionTools {
     }
 
     /// Those the agent asking started or wrote to.
-    Set<AgentThread> mine(ClaudeSdkCall call) =>
-        _reports?.mine[call.sessionId] ?? const {};
+    Set<AgentThread> mine(ClaudeSdkCall call) {
+      final key = _callerKey(workspace, call);
+      if (key != null) {
+        if (_reports?.mine[key] case final set?) return set;
+      }
+      if (call.sessionId case final sid?) {
+        return _reports?.mine[sid] ?? const {};
+      }
+      return const {};
+    }
 
     /// The project [name] names (its name or folder); the asking agent's
     /// own for none.
@@ -145,7 +156,9 @@ abstract final class SessionTools {
         for (final project in workspace.sidebarProjects)
           if (!workspace.isAppFolder(project.path)) project,
       ];
-      return listed.where((project) => project.path == named).firstOrNull ??
+      return listed
+              .where((project) => _sameLocation(project.path, named))
+              .firstOrNull ??
           listed.where((project) => project.name == named).firstOrNull ??
           (throw ArgumentError(
             'No project "$named". Theirs: '
@@ -222,7 +235,7 @@ abstract final class SessionTools {
             for (final thread in chats(call))
               if ((project == null ||
                       thread.project.name == project ||
-                      thread.project.path == project) &&
+                      _sameLocation(thread.project.path, project)) &&
                   (status == 'all' || BotTools.statusOf(thread) == status) &&
                   (query == null ||
                       thread.title.toLowerCase().contains(query)) &&
@@ -320,6 +333,13 @@ abstract final class SessionTools {
             'type': 'string',
             'description': 'Its title in the list; made from the task if none.',
           },
+          'kernel': {
+            'type': 'string',
+            'description':
+                'Which agent kernel to start on (e.g. claude-code, '
+                'antigravity-cli, codebuddy-cli, codex); session_models '
+                'lists them.',
+          },
           'model': {
             'type': 'string',
             'description':
@@ -341,13 +361,26 @@ abstract final class SessionTools {
           final project = projectNamed(input['project'], call);
           final caller = _callerOf(workspace, call);
           // Checked before anything is made.
-          final model = switch (input['model']) {
-            final String name when name.trim().isNotEmpty => _modelNamed(
-              caller?.session.models?.options ?? const [],
-              name.trim(),
-            ),
-            _ => null,
-          };
+          final kernelName = (input['kernel'] as String?)?.trim();
+          final modelName = (input['model'] as String?)?.trim();
+          KernelDescriptor? targetKernel;
+          KernelOption? model;
+          if (kernelName != null && kernelName.isNotEmpty) {
+            targetKernel = _kernelNamed(workspace, kernelName);
+            if (modelName != null && modelName.isNotEmpty) {
+              model = _modelNamed(
+                _modelsForKernel(workspace, targetKernel, project.path),
+                modelName,
+              );
+            }
+          } else if (modelName != null && modelName.isNotEmpty) {
+            (:targetKernel, :model) = _resolveCrossKernelModel(
+              workspace,
+              modelName,
+              project.path,
+              caller: caller,
+            );
+          }
           final worktree = switch (input['worktree']) {
             final String branch when branch.trim().isNotEmpty =>
               await _newWorktree(workspace, project, branch.trim()),
@@ -355,6 +388,9 @@ abstract final class SessionTools {
           };
           final thread = workspace.startAgent(project);
           final session = thread.session;
+          if (targetKernel != null && thread.kernel.id != targetKernel.id) {
+            session.setKernel(targetKernel);
+          }
           if (model != null) {
             _select(session.models, model.id);
           }
@@ -417,7 +453,7 @@ abstract final class SessionTools {
                 'can answer it: tell them.';
           }
           final target = idOf(thread);
-          final key = (call.sessionId, target);
+          final key = (_callerKey(workspace, call), target);
           final now = DateTime.now();
           if (_sent[key] case (final last, final at)
               when last == text && now.difference(at) < _resendAfter) {
@@ -458,29 +494,67 @@ abstract final class SessionTools {
             'BaoCode (by upstream): id | name, and which new conversations '
             'start on and which you are on. For session_new and '
             "session_send's model.",
-        const {},
+        {
+          'kernel': {
+            'type': 'string',
+            'description': "Only this kernel's models (its id or name).",
+          },
+        },
         (input, call) async {
           final caller = _callerOf(workspace, call);
-          final options =
-              caller?.session.models?.options ?? const <KernelOption>[];
-          if (options.isEmpty) return 'No models known yet.';
+          final kernelFilter = (input['kernel'] as String?)?.trim();
           final mine = caller?.session.selected(KernelChoiceKind.model);
           final fresh = workspace.newAgentModel;
-          final lines = <String>[];
-          String? group;
-          for (final option in options) {
-            final heading = option.group?.label;
-            if (heading != null && heading != group) {
-              group = heading;
-              lines.add('$heading:');
-            }
-            lines.add(
-              '${heading == null ? '' : '  '}${option.id} | ${option.label}'
-              '${option.id == fresh ? ' | new conversations start on it' : ''}'
-              '${option.id == mine ? ' | you are on it' : ''}',
+
+          if ((kernelFilter == null || kernelFilter.isEmpty) &&
+              workspace.kernels.length <= 1) {
+            final options =
+                caller?.session.models?.options ??
+                (workspace.kernels.isNotEmpty
+                    ? _modelsForKernel(
+                        workspace,
+                        workspace.kernels.first,
+                        call.cwd,
+                      )
+                    : const <KernelOption>[]);
+            if (options.isEmpty) return 'No models known yet.';
+            return _formatModelOptions(
+              options,
+              fresh: fresh,
+              mine: mine,
             );
           }
-          return lines.join('\n');
+
+          final targetKernels = (kernelFilter != null && kernelFilter.isNotEmpty)
+              ? [_kernelNamed(workspace, kernelFilter)]
+              : workspace.kernels;
+          if (targetKernels.isEmpty) return 'No models known yet.';
+
+          final sections = <String>[];
+          for (final k in targetKernels) {
+            final options =
+                (caller != null &&
+                    caller.kernel.id == k.id &&
+                    (caller.session.models?.options.isNotEmpty ?? false))
+                ? caller.session.models!.options
+                : _modelsForKernel(workspace, k, caller?.project.path ?? call.cwd);
+            final header =
+                'Kernel: ${k.id} (${k.label})'
+                '${k.id == workspace.preferredKernel.id ? ' | default for new conversations' : ''}'
+                '${k.id == caller?.kernel.id ? ' | your kernel' : ''}';
+            if (options.isEmpty) {
+              sections.add('$header\n  (no models)');
+            } else {
+              final body = _formatModelOptions(
+                options,
+                fresh: k.id == workspace.preferredKernel.id ? fresh : null,
+                mine: k.id == caller?.kernel.id ? mine : null,
+                indent: '  ',
+              );
+              sections.add('$header\n$body');
+            }
+          }
+          return sections.join('\n\n');
         },
       ),
       tool(
@@ -529,7 +603,11 @@ abstract final class SessionTools {
             }
           }
 
-          await (_reports?.waiting(call.sessionId, {...threads}, wait) ??
+          await (_reports?.waiting(
+                _callerKey(workspace, call),
+                {...threads},
+                wait,
+              ) ??
               wait());
           final done = stopped();
           final working = [
@@ -560,7 +638,9 @@ abstract final class SessionTools {
             return 'It is not working on anything.';
           }
           // Stopped by the one who would be told of it.
-          if (call.sessionId case final by?) _reports?.unfollow(by, thread);
+          if (_callerKey(workspace, call) case final by?) {
+            _reports?.unfollow(by, thread);
+          }
           thread.session.stop();
           return thread.session.queued.isEmpty
               ? 'Stopped.'
@@ -579,31 +659,67 @@ abstract final class SessionTools {
         (input, call) async {
           final thread = chat(input['session'], call);
           final session = await _opened(thread);
-          final pending = {
-            for (final change in session.fileChanges) change.path: change,
-          };
-          final edited = <String>{
-            for (var i = 0; i < session.itemCount; i++)
-              if (session.itemAt(i)
-                  case ToolCallItem(kind: ToolKind.edit, :final path?)
-                  when path.isNotEmpty)
-                path,
-            ...pending.keys,
-          };
+          final paths = session.paths;
+          final pending = <String, FileChange>{};
+          for (final change in session.fileChanges) {
+            if (change.path.trim().isEmpty) continue;
+            final resolved = session.resolvePath(change.path);
+            if (resolved.trim().isEmpty) continue;
+            final key = paths.canonicalize(resolved);
+            final prior = pending[key];
+            pending[key] = prior == null
+                ? FileChange(
+                    path: resolved,
+                    added: change.added,
+                    removed: change.removed,
+                    kind: change.kind,
+                    binary: change.binary,
+                    tracked: change.tracked,
+                    conflict: change.conflict,
+                  )
+                : FileChange(
+                    path: prior.path,
+                    added: prior.added + change.added,
+                    removed: prior.removed + change.removed,
+                    kind: prior.kind,
+                    binary: prior.binary || change.binary,
+                    tracked: prior.tracked && change.tracked,
+                    conflict: prior.conflict || change.conflict,
+                  );
+          }
+          final edited = <String, String>{};
+          for (var i = 0; i < session.itemCount; i++) {
+            if (session.itemAt(i)
+                case ToolCallItem(kind: ToolKind.edit, :final path?)
+                when path.trim().isNotEmpty) {
+              final resolved = session.resolvePath(path);
+              if (resolved.trim().isEmpty) continue;
+              final key = paths.canonicalize(resolved);
+              edited.putIfAbsent(key, () => pending[key]?.path ?? resolved);
+            }
+          }
+          for (final MapEntry(:key, :value) in pending.entries) {
+            edited.putIfAbsent(key, () => value.path);
+          }
           final at = agentWorkPathOf(session);
+          final normalizedAt = at == null ? null : session.resolvePath(at);
+          final projectRoot = RemoteLocation.pathOf(thread.project.root);
+          final inProjectRoot =
+              normalizedAt != null &&
+              (paths.equals(projectRoot, normalizedAt) ||
+                  paths.isWithin(projectRoot, normalizedAt));
           return [
             if (edited.isEmpty)
               'It edited no files.'
             else ...[
               'The files it edited:',
-              for (final path in edited)
-                switch (pending[path]) {
-                  final change? => '$path +${change.added} -${change.removed}',
-                  null => path,
+              for (final MapEntry(:key, :value) in edited.entries)
+                switch (pending[key]) {
+                  final change? => '$value +${change.added} -${change.removed}',
+                  null => value,
                 },
             ],
-            if (at != null && !at.startsWith(thread.project.root))
-              'It last worked at $at.',
+            if (at != null && !inProjectRoot) 'It last worked at $at.',
           ].join('\n');
         },
         required: ['session'],
@@ -611,6 +727,15 @@ abstract final class SessionTools {
       ),
     ];
   }
+
+  /// Kernels that parse and render `<agent-message>` blocks (`ClaudeTranslator`
+  /// and `CodexKernel`).
+  static const _agentMessageKernels = {
+    'claude-code',
+    'antigravity-cli',
+    'codebuddy-cli',
+    'codex',
+  };
 
   /// [text] to [thread] from the agent asking: as another agent's message,
   /// shown as such, with what the agent there should know of it. The one
@@ -622,12 +747,17 @@ abstract final class SessionTools {
     String text,
   ) {
     final from = _callerOf(workspace, call);
-    if (call.sessionId case final by?) _reports?.follow(by, thread);
+    if (_callerKey(workspace, call) case final by?) {
+      _reports?.follow(by, thread);
+    }
+    final senderName = (from?.title.trim().isNotEmpty ?? false)
+        ? from!.title.trim()
+        : 'Another conversation';
     thread.session.send(
       ComposerMessage(
-        text: thread.kernel.id == 'claude-code'
+        text: _agentMessageKernels.contains(thread.kernel.id)
             ? agentMessage(
-                from?.title ?? 'Another conversation',
+                senderName,
                 text,
                 session: from == null ? null : idOf(from),
               )
@@ -647,9 +777,7 @@ abstract final class SessionTools {
   /// [text] as a message from another agent, [from] it: shown as its card.
   @visibleForTesting
   static String agentMessage(String from, String text, {String? session}) =>
-      '<agent-message from="${from.replaceAll('"', "'")}"'
-      '${session == null ? '' : ' session="${session.replaceAll('"', '')}"'}>'
-      '$text</agent-message>';
+      formatAgentMessage(from, text, session: session);
 
   /// The model [thread] is on, for the agent: its name and id.
   static String? _modelOf(AgentThread thread) => switch (modelOf(thread)) {
@@ -711,14 +839,139 @@ abstract final class SessionTools {
 
   static final _started = RegExp(r'^Started: (\S+)');
 
-  static KernelOption _modelNamed(List<KernelOption> options, String name) {
-    final wanted = name.toLowerCase();
-    return options.where((o) => o.id.toLowerCase() == wanted).firstOrNull ??
-        options.where((o) => o.label.toLowerCase() == wanted).firstOrNull ??
+  static KernelDescriptor _kernelNamed(Workspace workspace, String name) {
+    final wanted = name.trim().toLowerCase();
+    return workspace.kernels
+            .where((k) => k.id.toLowerCase() == wanted)
+            .firstOrNull ??
+        workspace.kernels
+            .where((k) => k.label.toLowerCase() == wanted)
+            .firstOrNull ??
         (throw ArgumentError(
-          'No model "$name". The models: '
-          '${options.map((o) => '${o.id} (${o.label})').join(', ')}',
+          'No kernel "$name". Available: '
+          '${workspace.kernels.map((k) => '${k.id} (${k.label})').join(', ')}',
         ));
+  }
+
+  static List<KernelOption> _modelsForKernel(
+    Workspace workspace,
+    KernelDescriptor kernel,
+    String cwd,
+  ) {
+    for (final thread in workspace.threads) {
+      if (thread.isOpen && thread.kernel.id == kernel.id) {
+        if (thread.session.models?.options case final options?
+            when options.isNotEmpty) {
+          return options;
+        }
+      }
+    }
+    final probe = kernel.create(KernelContext(cwd: cwd));
+    try {
+      return switch (probe) {
+        final SelectsModel selector => selector.model.options,
+        _ => const [],
+      };
+    } finally {
+      probe.dispose();
+    }
+  }
+
+  static ({KernelDescriptor? targetKernel, KernelOption model})
+  _resolveCrossKernelModel(
+    Workspace workspace,
+    String modelName,
+    String cwd, {
+    AgentThread? caller,
+  }) {
+    final primaryKernel = caller?.kernel ?? workspace.preferredKernel;
+    final primaryOptions =
+        caller?.session.models?.options ??
+        (workspace.kernels.contains(primaryKernel)
+            ? _modelsForKernel(workspace, primaryKernel, cwd)
+            : const <KernelOption>[]);
+
+    final direct = _tryModelNamed(primaryOptions, modelName);
+    if (direct != null) {
+      return (targetKernel: null, model: direct);
+    }
+
+    if (workspace.kernels.length > 1) {
+      final matches = <(KernelDescriptor, KernelOption)>[];
+      for (final kernel in workspace.kernels) {
+        if (kernel.id == primaryKernel.id) continue;
+        final options = _modelsForKernel(workspace, kernel, cwd);
+        if (_tryModelNamed(options, modelName) case final option?) {
+          matches.add((kernel, option));
+        }
+      }
+      if (matches.length == 1) {
+        return (targetKernel: matches.single.$1, model: matches.single.$2);
+      }
+      if (matches.length > 1) {
+        throw ArgumentError(
+          'Model "$modelName" matches multiple kernels '
+          '(${matches.map((m) => m.$1.id).join(', ')}); pass kernel.',
+        );
+      }
+    }
+
+    throw ArgumentError(
+      'No model "$modelName". The models: '
+      '${primaryOptions.map((o) => '${o.id} (${o.label})').join(', ')}',
+    );
+  }
+
+  static KernelOption? _tryModelNamed(
+    List<KernelOption> options,
+    String name,
+  ) {
+    final wanted = name.toLowerCase();
+    if (options.where((o) => o.id.toLowerCase() == wanted).firstOrNull
+        case final exactId?) {
+      return exactId;
+    }
+    if (options.where((o) => o.label.toLowerCase() == wanted).firstOrNull
+        case final exactLabel?) {
+      return exactLabel;
+    }
+    final suffixMatches = [
+      for (final o in options)
+        if (o.id.toLowerCase().endsWith('/$wanted')) o,
+    ];
+    if (suffixMatches.length == 1) return suffixMatches.single;
+    return null;
+  }
+
+  static KernelOption _modelNamed(List<KernelOption> options, String name) =>
+      _tryModelNamed(options, name) ??
+      (throw ArgumentError(
+        'No model "$name". The models: '
+        '${options.map((o) => '${o.id} (${o.label})').join(', ')}',
+      ));
+
+  static String _formatModelOptions(
+    List<KernelOption> options, {
+    String? fresh,
+    String? mine,
+    String indent = '',
+  }) {
+    final lines = <String>[];
+    String? group;
+    for (final option in options) {
+      final heading = option.group?.label;
+      if (heading != null && heading != group) {
+        group = heading;
+        lines.add('$indent$heading:');
+      }
+      final rowIndent = heading == null ? indent : '$indent  ';
+      lines.add(
+        '$rowIndent${option.id} | ${option.label}'
+        '${option.id == fresh ? ' | new conversations start on it' : ''}'
+        '${option.id == mine ? ' | you are on it' : ''}',
+      );
+    }
+    return lines.join('\n');
   }
 
   /// [id] picked of [choice], where it is one of its options.
@@ -915,18 +1168,66 @@ abstract final class SessionTools {
     return trimmed.length > max ? '${trimmed.substring(0, max)}…' : trimmed;
   }
 
-  static bool _isCaller(AgentThread thread, ClaudeSdkCall call) =>
-      call.sessionId != null && thread.id == call.sessionId;
+  static bool _isCaller(AgentThread thread, ClaudeSdkCall call) {
+    if (call.sessionId case final sid? when sid.isNotEmpty) {
+      if (thread.id == sid || BotTools.idOf(thread) == sid) return true;
+    }
+    if (call.turnId case final tid? when tid.isNotEmpty) {
+      if (thread.isOpen && thread.session.isStreaming) {
+        final session = thread.session;
+        for (var i = session.itemCount - 1; i >= 0; i--) {
+          if (session.itemIdAt(i) == tid) return true;
+        }
+      }
+    }
+    return false;
+  }
 
-  static AgentThread? _callerOf(Workspace workspace, ClaudeSdkCall call) =>
-      _threadWithId(workspace, call.sessionId);
-
-  static AgentThread? _threadWithId(Workspace workspace, String? id) {
-    if (id == null) return null;
-    for (final thread in workspace.threads) {
-      if (thread.id == id) return thread;
+  static AgentThread? _callerOf(Workspace workspace, ClaudeSdkCall call) {
+    if (call.sessionId case final sid? when sid.isNotEmpty) {
+      if (threadOf(workspace, sid) case final thread?) return thread;
+    }
+    if (call.turnId case final tid? when tid.isNotEmpty) {
+      for (final thread in workspace.threads) {
+        if (!thread.isOpen || !thread.session.isStreaming) continue;
+        final session = thread.session;
+        for (var i = session.itemCount - 1; i >= 0; i--) {
+          if (session.itemIdAt(i) == tid) return thread;
+        }
+      }
+    }
+    if (call.sessionId == null && call.turnId == null) {
+      final matches = [
+        for (final thread in workspace.threads)
+          if (thread.isOpen &&
+              thread.id == null &&
+              thread.session.isStreaming &&
+              _sameLocation(thread.project.path, call.cwd))
+            thread,
+      ];
+      if (matches.length == 1) return matches.single;
     }
     return null;
+  }
+
+  static bool _sameLocation(String a, String b) {
+    final ta = a.trim();
+    final tb = b.trim();
+    if (ta.isEmpty || tb.isEmpty) return false;
+    if (RemoteLocation.isRemote(ta) || RemoteLocation.isRemote(tb)) {
+      if (RemoteLocation.hostOf(ta) != RemoteLocation.hostOf(tb)) return false;
+      final paths = RemoteLocation.pathsOf(ta);
+      return paths.equals(RemoteLocation.pathOf(ta), RemoteLocation.pathOf(tb));
+    }
+    return RemoteLocation.pathsOf(ta).equals(ta, tb);
+  }
+
+  static String? _callerKey(Workspace workspace, ClaudeSdkCall call) {
+    if (_callerOf(workspace, call) case final caller?) {
+      return BotTools.idOf(caller);
+    }
+    final sid = call.sessionId;
+    return (sid != null && sid.isNotEmpty) ? sid : null;
   }
 }
 
@@ -1046,7 +1347,7 @@ class _Reports {
   void _deliver() {
     for (final report in [..._undelivered]) {
       final (to, from, (:text, :note)) = report;
-      final agent = SessionTools._threadWithId(workspace, to);
+      final agent = SessionTools.threadOf(workspace, to);
       if (agent == null || agent.archived) {
         _undelivered.remove(report);
         continue;
@@ -1060,13 +1361,18 @@ class _Reports {
         continue;
       }
       _undelivered.remove(report);
+      final senderName = from.title.trim().isNotEmpty
+          ? from.title.trim()
+          : 'Another conversation';
       session.send(
         ComposerMessage(
-          text: SessionTools.agentMessage(
-            from.title,
-            text,
-            session: SessionTools.idOf(from),
-          ),
+          text: SessionTools._agentMessageKernels.contains(agent.kernel.id)
+              ? SessionTools.agentMessage(
+                  senderName,
+                  text,
+                  session: SessionTools.idOf(from),
+                )
+              : text,
         ),
         notes: [
           '<system-reminder>A report from a conversation you handed work '

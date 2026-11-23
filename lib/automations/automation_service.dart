@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
 import '../acp/acp_agent_service.dart';
+import '../canvas/canvas_controller.dart';
 import '../chat/chat_models.dart' show ToolKind;
 import '../kernel/claude_code/claude_sdk_tools.dart';
 import '../platform/data_dir.dart';
@@ -49,12 +50,23 @@ class AutomationRule {
     required this.cwd,
     required this.cronExpression,
     this.agentId = 'agy',
+    String? model,
+    String? effort,
+    String? workflowTemplateId,
     this.enabled = true,
     this.useWorktree = false,
     this.lastRunAt,
     this.running = false,
     List<AutomationRunRecord>? history,
-  }) : history = history ?? [];
+  }) : model = _cleanOpt(model),
+       effort = _cleanOpt(effort),
+       workflowTemplateId = _cleanOpt(workflowTemplateId),
+       history = history ?? [];
+
+  static String? _cleanOpt(String? raw) {
+    final trimmed = raw?.trim() ?? '';
+    return trimmed.isEmpty ? null : trimmed;
+  }
 
   final String id;
   String name;
@@ -62,6 +74,9 @@ class AutomationRule {
   String cwd;
   String cronExpression;
   String agentId;
+  String? model;
+  String? effort;
+  String? workflowTemplateId;
   bool enabled;
   bool useWorktree;
   DateTime? lastRunAt;
@@ -74,6 +89,42 @@ class AutomationRule {
     return schedule?.nextAfter(DateTime.now());
   }
 
+  AutomationRule copyWith({
+    String? name,
+    String? prompt,
+    String? cwd,
+    String? cronExpression,
+    String? agentId,
+    String? model,
+    bool clearModel = false,
+    String? effort,
+    bool clearEffort = false,
+    String? workflowTemplateId,
+    bool clearWorkflowTemplateId = false,
+    bool? enabled,
+    bool? useWorktree,
+    DateTime? lastRunAt,
+    bool? running,
+    List<AutomationRunRecord>? history,
+  }) => AutomationRule(
+    id: id,
+    name: name ?? this.name,
+    prompt: prompt ?? this.prompt,
+    cwd: cwd ?? this.cwd,
+    cronExpression: cronExpression ?? this.cronExpression,
+    agentId: agentId ?? this.agentId,
+    model: clearModel ? null : (model ?? this.model),
+    effort: clearEffort ? null : (effort ?? this.effort),
+    workflowTemplateId: clearWorkflowTemplateId
+        ? null
+        : (workflowTemplateId ?? this.workflowTemplateId),
+    enabled: enabled ?? this.enabled,
+    useWorktree: useWorktree ?? this.useWorktree,
+    lastRunAt: lastRunAt ?? this.lastRunAt,
+    running: running ?? this.running,
+    history: history ?? List<AutomationRunRecord>.from(this.history),
+  );
+
   Map<String, Object?> toJson() => {
     'id': id,
     'name': name,
@@ -81,6 +132,10 @@ class AutomationRule {
     'cwd': cwd,
     'cronExpression': cronExpression,
     'agentId': agentId,
+    if (model != null && model!.isNotEmpty) 'model': model,
+    if (effort != null && effort!.isNotEmpty) 'effort': effort,
+    if (workflowTemplateId != null && workflowTemplateId!.isNotEmpty)
+      'workflowTemplateId': workflowTemplateId,
     'enabled': enabled,
     'useWorktree': useWorktree,
     'lastRunAt': lastRunAt?.toIso8601String(),
@@ -108,6 +163,9 @@ class AutomationRule {
       cwd: cwd,
       cronExpression: cron,
       agentId: raw['agentId'] as String? ?? 'agy',
+      model: raw['model'] as String?,
+      effort: raw['effort'] as String?,
+      workflowTemplateId: raw['workflowTemplateId'] as String?,
       enabled: raw['enabled'] != false,
       useWorktree: raw['useWorktree'] == true,
       lastRunAt: DateTime.tryParse(raw['lastRunAt'] as String? ?? ''),
@@ -132,8 +190,22 @@ class AutomationService extends ChangeNotifier {
   Timer? _tick;
   bool _loaded = false;
   bool _toolsRegistered = false;
+  int _idSeq = 0;
+  Future<void> _saveChain = Future<void>.value();
 
   List<AutomationRule> get rules => List.unmodifiable(_rules);
+
+  String _nextRuleId() {
+    final ts = DateTime.now().millisecondsSinceEpoch.toRadixString(36);
+    while (true) {
+      final seq = (_idSeq++).toRadixString(36);
+      final candidate = 'auto_${ts}_$seq';
+      if (!_rules.any((r) => r.id == candidate)) return candidate;
+    }
+  }
+
+  @visibleForTesting
+  Future<void> flushForTest() => _saveChain;
 
   String get _filePath =>
       storagePathOverride ??
@@ -166,22 +238,27 @@ class AutomationService extends ChangeNotifier {
     }
   }
 
-  Future<void> _save() async {
+  Future<void> _save() {
     if (Platform.environment.containsKey('FLUTTER_TEST') &&
         storagePathOverride == null) {
-      return;
+      return Future<void>.value();
     }
-    try {
-      final file = File(_filePath);
-      file.parent.createSync(recursive: true);
-      await file.writeAsString(
-        const JsonEncoder.withIndent('  ').convert([
-          for (final r in _rules) r.toJson(),
-        ]),
-      );
-    } on Object catch (e) {
-      debugPrint('AutomationService save failed: $e');
-    }
+    final payload = const JsonEncoder.withIndent('  ').convert([
+      for (final r in _rules) r.toJson(),
+    ]);
+    final path = _filePath;
+    _saveChain = _saveChain
+        .then((_) async {
+          try {
+            final file = File(path);
+            file.parent.createSync(recursive: true);
+            await file.writeAsString(payload);
+          } on Object catch (e) {
+            debugPrint('AutomationService save failed: $e');
+          }
+        })
+        .catchError((Object _) {});
+    return _saveChain;
   }
 
   AutomationRule addRule({
@@ -190,24 +267,97 @@ class AutomationService extends ChangeNotifier {
     required String cwd,
     required String cronExpression,
     String agentId = 'agy',
+    String? model,
+    String? effort,
+    String? workflowTemplateId,
     bool useWorktree = false,
   }) {
-    if (CronSchedule.tryParse(cronExpression) == null) {
+    final trimmedCwd = cwd.trim();
+    if (trimmedCwd.isEmpty || !Directory(trimmedCwd).existsSync()) {
+      throw ArgumentError('Invalid or missing working directory: $cwd');
+    }
+    final trimmedCron = cronExpression.trim();
+    if (CronSchedule.tryParse(trimmedCron) == null) {
       throw ArgumentError('Invalid cron expression: $cronExpression');
     }
     final rule = AutomationRule(
-      id: 'auto_${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}',
+      id: _nextRuleId(),
       name: name.trim(),
       prompt: prompt.trim(),
-      cwd: cwd.trim(),
-      cronExpression: cronExpression.trim(),
-      agentId: agentId,
+      cwd: trimmedCwd,
+      cronExpression: trimmedCron,
+      agentId: agentId.trim().isEmpty ? 'agy' : agentId.trim(),
+      model: model,
+      effort: effort,
+      workflowTemplateId: workflowTemplateId,
       useWorktree: useWorktree,
     );
     _rules.insert(0, rule);
     notifyListeners();
     unawaited(_save());
     return rule;
+  }
+
+  bool updateRule(
+    String id, {
+    String? name,
+    String? prompt,
+    String? cwd,
+    String? cronExpression,
+    String? agentId,
+    String? model,
+    bool clearModel = false,
+    String? effort,
+    bool clearEffort = false,
+    String? workflowTemplateId,
+    bool clearWorkflow = false,
+    bool? useWorktree,
+    bool? enabled,
+  }) {
+    final idx = _rules.indexWhere((r) => r.id == id);
+    if (idx < 0) return false;
+    final current = _rules[idx];
+    if (cwd != null) {
+      final trimmedCwd = cwd.trim();
+      if (trimmedCwd.isEmpty || !Directory(trimmedCwd).existsSync()) {
+        throw ArgumentError('Invalid or missing working directory: $cwd');
+      }
+    }
+    if (cronExpression != null &&
+        CronSchedule.tryParse(cronExpression.trim()) == null) {
+      throw ArgumentError('Invalid cron expression: $cronExpression');
+    }
+    if (name != null && name.trim().isNotEmpty) current.name = name.trim();
+    if (prompt != null && prompt.trim().isNotEmpty) {
+      current.prompt = prompt.trim();
+    }
+    if (cwd != null) current.cwd = cwd.trim();
+    if (cronExpression != null) current.cronExpression = cronExpression.trim();
+    if (agentId != null && agentId.trim().isNotEmpty) {
+      current.agentId = agentId.trim();
+    }
+    if (clearModel) {
+      current.model = null;
+    } else if (model != null) {
+      current.model = AutomationRule._cleanOpt(model);
+    }
+    if (clearEffort) {
+      current.effort = null;
+    } else if (effort != null) {
+      current.effort = AutomationRule._cleanOpt(effort);
+    }
+    if (clearWorkflow) {
+      current.workflowTemplateId = null;
+    } else if (workflowTemplateId != null) {
+      current.workflowTemplateId = AutomationRule._cleanOpt(
+        workflowTemplateId,
+      );
+    }
+    if (useWorktree != null) current.useWorktree = useWorktree;
+    if (enabled != null) current.enabled = enabled;
+    notifyListeners();
+    unawaited(_save());
+    return true;
   }
 
   void toggleRule(String id, bool enabled) {
@@ -268,6 +418,9 @@ class AutomationService extends ChangeNotifier {
           prompt: rule.prompt,
           repoPath: rule.cwd,
           agentId: rule.agentId,
+          model: rule.model,
+          effort: rule.effort,
+          workflowTemplateId: rule.workflowTemplateId,
         );
         unawaited(TaskQueueService.instance.runTask(task.id));
         rule.history.insert(
@@ -278,11 +431,35 @@ class AutomationService extends ChangeNotifier {
             summary: 'Dispatched into worktree task #${task.id}',
           ),
         );
+      } else if (rule.workflowTemplateId case final wfId?
+          when wfId.isNotEmpty) {
+        final wfRes = await CanvasController.instance.runWorkflow(
+          templateId: wfId,
+          defaultCwd: rule.cwd,
+          selectOnStart: false,
+          runName: rule.name,
+          inputs: {'prompt': rule.prompt, 'repo': rule.cwd},
+        );
+        final text = wfRes.ok
+            ? (wfRes.log.trim().isEmpty
+                  ? 'Workflow completed'
+                  : wfRes.log.trim())
+            : (wfRes.error ?? 'Workflow failed');
+        rule.history.insert(
+          0,
+          AutomationRunRecord(
+            startedAt: rule.lastRunAt!,
+            ok: wfRes.ok,
+            summary: text.length > 2000 ? text.substring(0, 2000) : text,
+          ),
+        );
       } else {
         final res = await AcpAgentService.instance.runHeadlessPrompt(
           agentId: rule.agentId,
           prompt: rule.prompt,
           cwd: rule.cwd,
+          model: rule.model,
+          effort: rule.effort,
         );
         final text = res.ok
             ? (res.output.trim().isEmpty ? 'Completed' : res.output.trim())
@@ -342,18 +519,32 @@ class AutomationService extends ChangeNotifier {
             'prompt': {'type': 'string'},
             'cron': {'type': 'string'},
             'cwd': {'type': 'string'},
+            'agentId': {'type': 'string'},
+            'agent': {'type': 'string'},
+            'model': {'type': 'string'},
+            'effort': {'type': 'string'},
+            'workflowTemplateId': {'type': 'string'},
             'useWorktree': {'type': 'boolean'},
           },
         },
         summary: (input, _) => 'Create automation "${input['name']}"',
         run: (input, call) async {
+          final rawAgentId = (input['agentId'] as String?)?.trim() ?? '';
+          final rawAgent = (input['agent'] as String?)?.trim() ?? '';
+          final agentId = rawAgentId.isNotEmpty
+              ? rawAgentId
+              : (rawAgent.isNotEmpty ? rawAgent : 'agy');
+          final rawCwd = (input['cwd'] as String?)?.trim() ?? '';
           final rule = addRule(
             name: '${input['name'] ?? 'Automation'}',
             prompt: '${input['prompt'] ?? ''}',
-            cwd: (input['cwd'] as String?)?.trim().isNotEmpty == true
-                ? input['cwd'] as String
-                : call.cwd,
+            cwd: rawCwd.isNotEmpty ? rawCwd : call.cwd,
             cronExpression: '${input['cron'] ?? ''}',
+            agentId: agentId,
+            model: (input['model'] as String?)?.trim(),
+            effort: (input['effort'] as String?)?.trim(),
+            workflowTemplateId:
+                (input['workflowTemplateId'] as String?)?.trim(),
             useWorktree: input['useWorktree'] == true,
           );
           return jsonEncode(rule.toJson());

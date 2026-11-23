@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:math' as math;
 
 import '../../chat/chat_models.dart';
+import '../agent_message_parser.dart';
 import '../kernel_event.dart';
 import '../kernel_types.dart';
 import '../output_meter.dart';
@@ -2266,25 +2267,17 @@ class ClaudeTranslator {
     return true;
   }
 
-  /// A subagent's message as the agent is given it: its id, and what it
-  /// says.
-  /// Another conversation's has its session too (`session="…"`).
-  static final _agentMessage = RegExp(
-    r'^<agent-message from="([^"]*)"(?: session="([^"]*)")?>'
-    r'([\s\S]*)</agent-message>$',
-  );
-
   /// [text] as a message another agent sent (`<agent-message from="…">`,
   /// a subagent's or another conversation's): who from (and that one's
   /// session, another conversation's), and what it says; null for any
   /// other.
   static ({String from, String? session, String text})? agentMessage(
     String text,
-  ) => switch (_agentMessage.firstMatch(text.trim())) {
-    final match? => (
-      from: match[1]!,
-      session: match[2],
-      text: match[3]!.trim(),
+  ) => switch (parseAgentMessage(text)) {
+    final AgentMessage msg => (
+      from: msg.from,
+      session: msg.session,
+      text: msg.text,
     ),
     null => null,
   };

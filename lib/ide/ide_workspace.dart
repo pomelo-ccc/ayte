@@ -432,8 +432,12 @@ class IdeWorkspace extends ChangeNotifier
   /// is open; else on disk.
   @override
   Future<void> appendLines(String path, String lines) async {
-    final normalized = paths.normalize(path);
-    final doc = _documents.where((d) => d.path == normalized).firstOrNull;
+    final doc = _documents
+        .where(
+          (d) =>
+              !d.isUntitled && d.label == null && _sameFilePath(d.path, path),
+        )
+        .firstOrNull;
     if (doc == null || doc.openError != null) {
       await ideAppendLinesToFile(files, path, lines);
       return;
@@ -613,19 +617,49 @@ class IdeWorkspace extends ChangeNotifier
     _ => null,
   };
 
+  bool _sameFilePath(String a, String b) =>
+      (a.isEmpty || b.isEmpty) ? a == b : paths.equals(a, b);
+
+  String _pathKey(String path) => path.isEmpty ? '' : paths.canonicalize(path);
+
+  bool _documentMatchesKey(IdeDocument doc, String key) {
+    if (doc.key == key) return true;
+    final sep = key.indexOf('\u0000');
+    if (sep >= 0) {
+      if (doc.isUntitled || doc.label == null) return false;
+      final keyPath = key.substring(0, sep);
+      final keyLabel = key.substring(sep + 1);
+      return doc.label == keyLabel && _sameFilePath(doc.path, keyPath);
+    }
+    return !doc.isUntitled && doc.label == null && _sameFilePath(doc.path, key);
+  }
+
+  IdeDocument? _documentByKey(String key) =>
+      _documents.where((d) => _documentMatchesKey(d, key)).firstOrNull;
+
   /// The open model of [path]'s file, which its tabs share.
-  EditorDocumentModel? _fileModel(String path) =>
-      _documents.where((d) => d.path == path && d.isFile).firstOrNull?.model;
+  EditorDocumentModel? _fileModel(String path) => _documents
+      .where((d) => d.isFile && _sameFilePath(d.path, path))
+      .firstOrNull
+      ?.model;
 
   /// The open model of [path]: its tab's.
   EditorDocumentModel? modelOf(String path) =>
-      _fileModel(paths.normalize(path));
+      _fileModel(paths.normalize(paths.absolute(path)));
 
   /// The document [edit], [applyEdits], [undo] and [redo] change: [path]'s
   /// file's.
   IdeDocument? _fileDocument(String path) =>
-      _documents.where((d) => d.path == path && d.isFile).firstOrNull ??
-      _documents.where((d) => d.path == path && !d.readOnly).firstOrNull;
+      _documents
+          .where((d) => d.isFile && _sameFilePath(d.path, path))
+          .firstOrNull ??
+      _documents
+          .where(
+            (d) =>
+                !d.readOnly &&
+                (d.isUntitled ? d.path == path : _sameFilePath(d.path, path)),
+          )
+          .firstOrNull;
 
   /// Opens [path], or selects it when open. A file that cannot be read
   /// opens too, as VS Code opens one: a tab whose editor says why
@@ -635,8 +669,8 @@ class IdeWorkspace extends ChangeNotifier
     path = paths.normalize(paths.absolute(path));
     _dropReveal(path);
     final request = ++_selection;
-    if (_documents.any((d) => d.key == path)) {
-      select(path);
+    if (_documentByKey(path) case final existing?) {
+      select(existing.key);
       return;
     }
     IdeDocument doc;
@@ -648,13 +682,14 @@ class IdeWorkspace extends ChangeNotifier
     } else if (ideIsImagePath(path)) {
       doc = IdeDocument.media(path);
     } else {
-      final read = _reads.putIfAbsent(path, () => files.read(path));
+      final readKey = _pathKey(path);
+      final read = _reads.putIfAbsent(readKey, () => files.read(path));
       try {
         doc = IdeDocument(path, await read);
       } catch (error) {
         doc = IdeDocument.unopenable(path, error);
       } finally {
-        if (identical(_reads[path], read)) _reads.remove(path);
+        if (identical(_reads[readKey], read)) _reads.remove(readKey);
       }
     }
     _add(doc, select: request == _selection);
@@ -676,12 +711,20 @@ class IdeWorkspace extends ChangeNotifier
   (String, LspRange)? _reveal;
 
   void _dropReveal(String key) {
-    if (_reveal?.$1 != key) _reveal = null;
+    if (_reveal case (final path, _)) {
+      if (key.contains('\u0000') || !_sameFilePath(path, key)) {
+        _reveal = null;
+      }
+    }
   }
 
   /// The range [openAt] asked for, once, while its file is the active one.
   LspRange? takeReveal() {
-    if (_reveal case (final path, final range) when active?.path == path) {
+    if (_reveal case (final path, final range)
+        when active != null &&
+            !active!.isUntitled &&
+            active!.label == null &&
+            _sameFilePath(active!.path, path)) {
       _reveal = null;
       return range;
     }
@@ -696,7 +739,7 @@ class IdeWorkspace extends ChangeNotifier
     for (final path in paths) {
       if (_disposed) return;
       final normal = this.paths.normalize(this.paths.absolute(path));
-      if (_documents.any((d) => d.key == normal)) continue;
+      if (_documentByKey(normal) != null) continue;
       final IdeDocument doc;
       if (FileViews.of(normal) case final view?) {
         doc = IdeDocument.media(normal, view: view.id);
@@ -715,7 +758,7 @@ class IdeWorkspace extends ChangeNotifier
     }
     if (_disposed || _selection != request) return;
     final shown =
-        _documents.where((d) => d.key == active).firstOrNull ??
+        (active == null ? null : _documentByKey(active)) ??
         _documents.firstOrNull;
     if (shown != null && _activeKey == null) select(shown.key);
   }
@@ -726,13 +769,15 @@ class IdeWorkspace extends ChangeNotifier
       _release(doc);
       return;
     }
-    if (_documents.any((d) => d.key == doc.key)) {
+    final existing = _documentByKey(doc.key);
+    if (existing != null) {
       _release(doc);
+      if (select) _activeKey = existing.key;
     } else {
       _documents.add(doc);
       _startSync(doc);
+      if (select) _activeKey = doc.key;
     }
-    if (select) _activeKey = doc.key;
     notifyListeners();
   }
 
@@ -760,8 +805,8 @@ class IdeWorkspace extends ChangeNotifier
     _dropReveal(path);
     final request = ++_selection;
     final key = '$path\u0000$label';
-    if (_documents.where((d) => d.key == key).firstOrNull case final open?) {
-      select(key);
+    if (_documentByKey(key) case final open?) {
+      select(open.key);
       unawaited(open.diff?.reload());
       return;
     }
@@ -813,8 +858,8 @@ class IdeWorkspace extends ChangeNotifier
     _dropReveal(path);
     final request = ++_selection;
     final key = '$path\u0000$label';
-    if (_documents.any((d) => d.key == key)) {
-      select(key);
+    if (_documentByKey(key) case final open?) {
+      select(open.key);
       return;
     }
     String text;
@@ -883,10 +928,10 @@ class IdeWorkspace extends ChangeNotifier
   /// unsaved changes keep them; those whose file is gone are [deleted].
   @override
   Future<void> reload(Iterable<String> paths) async {
-    final wanted = {for (final path in paths) this.paths.normalize(path)};
+    final wanted = {for (final path in paths) _pathKey(path)};
     var changed = false;
     for (final doc in _documents.toList()) {
-      if (!wanted.contains(doc.path) || !doc.isFile) continue;
+      if (!doc.isFile || !wanted.contains(_pathKey(doc.path))) continue;
       final String text;
       try {
         // A modified document's too, for whether its file is there: the
@@ -916,18 +961,20 @@ class IdeWorkspace extends ChangeNotifier
   /// Watches the folders of the open files, and no others.
   void _watchOpenFiles() {
     if (_disposed) return;
-    final directories = {
-      for (final doc in _documents)
-        if (doc.isFile) paths.dirname(doc.path),
-    };
-    for (final directory in _watches.keys.toList()) {
-      if (!directories.contains(directory)) {
-        unawaited(_watches.remove(directory)!.cancel());
+    final directories = <String, String>{};
+    for (final doc in _documents) {
+      if (!doc.isFile) continue;
+      final dir = paths.dirname(doc.path);
+      directories.putIfAbsent(_pathKey(dir), () => dir);
+    }
+    for (final key in _watches.keys.toList()) {
+      if (!directories.containsKey(key)) {
+        unawaited(_watches.remove(key)!.cancel());
       }
     }
-    for (final directory in directories) {
-      _watches[directory] ??= _watchDirectory(directory).listen((_) {
-        _changedDirectories.add(directory);
+    for (final MapEntry(:key, value: directory) in directories.entries) {
+      _watches[key] ??= _watchDirectory(directory).listen((_) {
+        _changedDirectories.add(key);
         // A write comes as several events; read once they settle.
         _changesTimer?.cancel();
         _changesTimer = Timer(_changesDelay, _reloadChanged);
@@ -943,7 +990,7 @@ class IdeWorkspace extends ChangeNotifier
     unawaited(
       reload([
         for (final doc in _documents)
-          if (directories.contains(paths.dirname(doc.path))) doc.path,
+          if (directories.contains(_pathKey(paths.dirname(doc.path)))) doc.path,
       ]),
     );
   }
@@ -952,12 +999,14 @@ class IdeWorkspace extends ChangeNotifier
   /// documents in it take their new paths, and stay open.
   void moved(String from, String to) {
     if (_disposed) return;
-    from = paths.normalize(from);
-    to = paths.normalize(to);
+    from = paths.normalize(paths.absolute(from));
+    to = paths.normalize(paths.absolute(to));
     final moved = <IdeDocument>[];
     for (final (index, doc) in _documents.indexed.toList()) {
-      if (doc.path != from && !paths.isWithin(from, doc.path)) continue;
-      final path = doc.path == from
+      if (doc.isUntitled) continue;
+      final isExact = _sameFilePath(doc.path, from);
+      if (!isExact && !paths.isWithin(from, doc.path)) continue;
+      final path = isExact
           ? to
           : paths.join(to, paths.relative(doc.path, from: from));
       _stopSync(doc, force: true);
@@ -976,10 +1025,12 @@ class IdeWorkspace extends ChangeNotifier
   /// The documents in [path] (a file or folder), for asking before it is
   /// deleted with unsaved changes.
   List<IdeDocument> documentsIn(String path) {
-    path = paths.normalize(path);
+    path = paths.normalize(paths.absolute(path));
     return [
       for (final doc in _documents)
-        if (doc.path == path || paths.isWithin(path, doc.path)) doc,
+        if (!doc.isUntitled &&
+            (_sameFilePath(doc.path, path) || paths.isWithin(path, doc.path)))
+          doc,
     ];
   }
 
@@ -994,11 +1045,13 @@ class IdeWorkspace extends ChangeNotifier
   /// Selects the tab of [key] (a file's own tab's is its path; see
   /// [IdeDocument.key]).
   void select(String key) {
-    if (_disposed || !_documents.any((d) => d.key == key)) return;
-    _dropReveal(key);
+    if (_disposed) return;
+    final target = _documentByKey(key);
+    if (target == null) return;
+    _dropReveal(target.key);
     _selection++;
-    if (_activeKey == key) return;
-    _activeKey = key;
+    if (_activeKey == target.key) return;
+    _activeKey = target.key;
     notifyListeners();
   }
 
@@ -1063,7 +1116,9 @@ class IdeWorkspace extends ChangeNotifier
     final sync = _sync;
     if (sync == null || !doc.isFile || _syncing.containsKey(doc.model)) return;
     // Lent to [formatOutside]: the tab's text from now on.
-    if (_lent.remove(doc.path)) sync.closeDocument(doc.path);
+    if (_lent.remove(_pathKey(doc.path)) case final lentPath?) {
+      sync.closeDocument(lentPath);
+    }
     sync.openDocument(doc.path, doc.text, version: doc.model.version);
     _syncing[doc.model] = doc.model.changes.listen(
       (event) => sync.changeDocument(
@@ -1096,8 +1151,8 @@ class IdeWorkspace extends ChangeNotifier
   }
 
   /// The files [formatOutside] has open with the language servers, no tab
-  /// having them.
-  final Set<String> _lent = {};
+  /// having them (keyed by canonical path, storing the path sent to [sync]).
+  final Map<String, String> _lent = {};
 
   /// How long [formatOutside] waits for the servers of a file to start.
   static const formatStartTimeout = Duration(seconds: 20);
@@ -1114,9 +1169,10 @@ class IdeWorkspace extends ChangeNotifier
     required bool insertSpaces,
   }) {
     path = paths.normalize(paths.absolute(path));
+    final formatKey = _pathKey(path);
     // One of a file at a time: the servers have one text of it, lent by the
     // one under way; the next lends its own once that is given back.
-    final previous = _formatting[path] ?? Future<void>.value();
+    final previous = _formatting[formatKey] ?? Future<void>.value();
     final next = previous.then(
       (_) => _formatOutside(
         path,
@@ -1127,10 +1183,12 @@ class IdeWorkspace extends ChangeNotifier
       ),
     );
     final done = next.then<void>((_) {}, onError: (Object _) {});
-    _formatting[path] = done;
+    _formatting[formatKey] = done;
     unawaited(
       done.whenComplete(() {
-        if (identical(_formatting[path], done)) _formatting.remove(path);
+        if (identical(_formatting[formatKey], done)) {
+          _formatting.remove(formatKey);
+        }
       }),
     );
     return next;
@@ -1151,6 +1209,7 @@ class IdeWorkspace extends ChangeNotifier
     if (_disposed || languages == null || sync == null) {
       return const IdeFormatOutcome(null);
     }
+    final lentKey = _pathKey(path);
     final request = range == null
         ? LanguageRequest.format
         : LanguageRequest.rangeFormat;
@@ -1161,9 +1220,9 @@ class IdeWorkspace extends ChangeNotifier
       if (_fileModel(path)!.snapshot.text != text) {
         return const IdeFormatOutcome(null);
       }
-    } else if (!_lent.contains(path)) {
+    } else if (!_lent.containsKey(lentKey)) {
       sync.openDocument(path, text);
-      _lent.add(path);
+      _lent[lentKey] = path;
       lent = true;
     }
     try {
@@ -1204,10 +1263,12 @@ class IdeWorkspace extends ChangeNotifier
         insertSpaces: insertSpaces,
       );
       // A tab opened it meanwhile, with its own text.
-      if (lent && !_lent.contains(path)) return const IdeFormatOutcome(null);
+      if (lent && !_lent.containsKey(lentKey)) return const IdeFormatOutcome(null);
       return IdeFormatOutcome(edits);
     } finally {
-      if (lent && _lent.remove(path) && !_disposed) sync.closeDocument(path);
+      if (lent && _lent.remove(lentKey) != null && !_disposed) {
+        sync.closeDocument(path);
+      }
     }
   }
 
@@ -1280,7 +1341,11 @@ class IdeWorkspace extends ChangeNotifier
     await files.write(path, text);
     if (_disposed || !_documents.contains(doc)) return null;
     for (final other in [..._documents]) {
-      if (other.path == path && !identical(other, doc)) close(other);
+      if (!other.isUntitled &&
+          _sameFilePath(other.path, path) &&
+          !identical(other, doc)) {
+        close(other);
+      }
     }
     final index = _documents.indexOf(doc);
     if (index < 0) return null;

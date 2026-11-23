@@ -11,6 +11,7 @@ import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 
+import 'acp/ayte_ipc_server.dart';
 import 'base/mouse_navigation.dart';
 import 'theme/wb_motion.dart';
 import 'browser/browser_bridge.dart';
@@ -98,6 +99,8 @@ import 'ide/lsp/packs/lsp_settings_template.dart';
 import 'ide/terminal/links/terminal_links.dart';
 import 'ide/terminal/terminal_instance.dart';
 import 'ide/terminal/terminal_panel.dart' show terminalCommandsToSkipShell;
+import 'kernel/agent_kernel.dart' show KernelChoiceKind;
+import 'kernel/kernel_types.dart' show KernelOption;
 import 'keybindings/chat_keybindings.dart';
 import 'keybindings/default_keybindings.dart';
 import 'keybindings/key_chord.dart';
@@ -153,6 +156,7 @@ import 'stash/stash_host.dart' show StashCapture;
 import 'stash/stash_note.dart';
 import 'stash/stash_thread_view.dart' show sidebarStashes;
 import 'stash/stash_view.dart';
+import 'tasks/task_queue_service.dart' show TaskQueueService, WorktreeTask;
 import 'workspace/workspace_hub_view.dart';
 import 'stash/stash_welcome.dart' show showStashWelcome;
 import 'workspace/agent_work_path.dart';
@@ -195,6 +199,74 @@ import 'remote/port_forwards.dart';
 /// This machine's files, for what is shown as a file in the IDE (see
 /// FileOpenScope.showLocal).
 final IdeFileService _localFiles = IdeFileService(p.current);
+
+/// Applies task handoff metadata ([kernelId], [model], [effort], and
+/// [draftPrompt]) to an interactive [ChatSession].
+void applyTaskHandoffToSession(
+  ChatSession session, {
+  String? kernelId,
+  String? model,
+  String? effort,
+  String? draftPrompt,
+}) {
+  if (kernelId != null && kernelId.isNotEmpty && !session.kernelLocked) {
+    final targetKernel = session.kernels
+        .where((k) => k.id == kernelId)
+        .firstOrNull;
+    if (targetKernel != null) {
+      session.setKernel(targetKernel);
+    }
+  }
+
+  final wantedModel = model?.trim() ?? '';
+  if (wantedModel.isNotEmpty && session.models != null) {
+    final modelsChoice = session.models!;
+    final lower = wantedModel.toLowerCase();
+    KernelOption? matched = modelsChoice.options
+        .where((o) => o.id.toLowerCase() == lower)
+        .firstOrNull;
+    if (matched == null) {
+      final suffixMatches = [
+        for (final o in modelsChoice.options)
+          if (o.id.toLowerCase().endsWith('/$lower')) o,
+      ];
+      if (suffixMatches.length == 1) matched = suffixMatches.single;
+    }
+    matched ??= modelsChoice.options
+        .where((o) => o.label.toLowerCase() == lower)
+        .firstOrNull;
+    if (matched != null && matched.id != modelsChoice.selected.id) {
+      modelsChoice.onSelected(matched);
+    }
+  }
+
+  final wantedEffort = effort?.trim() ?? '';
+  final activeModelId = session.models?.selected.id;
+  if (wantedEffort.isNotEmpty && activeModelId != null) {
+    final lowerEffort = wantedEffort.toLowerCase();
+    final effortSetting = session
+        .modelSettings(activeModelId)
+        .where((s) => s.kind == KernelChoiceKind.effort)
+        .firstOrNull;
+    if (effortSetting != null) {
+      final matchedEffort = effortSetting.options
+          .where(
+            (o) =>
+                o.id.toLowerCase() == lowerEffort ||
+                o.label.toLowerCase() == lowerEffort,
+          )
+          .firstOrNull;
+      if (matchedEffort != null &&
+          matchedEffort.id != effortSetting.selected?.id) {
+        effortSetting.onSelected(matchedEffort);
+      }
+    }
+  }
+
+  if (draftPrompt != null && draftPrompt.isNotEmpty) {
+    session.draft.restore(draftPrompt, const []);
+  }
+}
 
 class Workbench extends StatefulWidget {
   const Workbench({
@@ -639,6 +711,7 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
     widget.window?.attach(this);
     _windows?.addListener(_windowsChanged);
     if (_main) {
+      AyteIpcServer.instance.workspace = _workspace;
       // A link to a stash (#12 references) shows it here.
       StashController.current?.showPage = _showStash;
       // A stash's file opens as the Stash page shows it.
@@ -976,6 +1049,9 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
     }
     _chordTimer?.cancel();
     if (_main) {
+      if (identical(AyteIpcServer.instance.workspace, _workspace)) {
+        AyteIpcServer.instance.workspace = null;
+      }
       OpenRequests.stop();
       _workspace.removeListener(_syncRecentMenu);
     }
@@ -1774,7 +1850,7 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
       ?action(ChatCommandIds.toggleSidePanel, Codicons.layoutSidebarRight),
       ?action(ChatCommandIds.toggleSidePanelPosition, Codicons.arrowSwap),
       for (final section in alwaysShownSections)
-        ?action(section.command!, section.icon),
+        if (section.command case final cmd?) ?action(cmd, section.icon),
       ?action(toggleTerminalCommand, Codicons.terminal),
       ?action(newTerminalCommand, Codicons.add),
       if (WindowControls.canPickDirectory)
@@ -2285,6 +2361,15 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
   void _runMenuCommand(String command) {
     if (command == openSettingsCommandId) {
       unawaited(openSettings());
+      return;
+    }
+    if (command == ChatCommandIds.newChat) {
+      if (_showsIde) _workspace.layout = WorkspaceLayout.chat;
+      if (_workspace.sidebarProjects.isNotEmpty) {
+        _newAgent();
+      } else if (WindowControls.canPickDirectory) {
+        unawaited(_openFolder());
+      }
       return;
     }
     if (_windowCommands()[command] case final run?) {
@@ -5041,10 +5126,16 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
   Widget _buildWorkspacePage(WorkspacePage page, {required bool showToggle}) {
     final header = WindowControls.drawsHeader;
     final thread = _workspace.current;
+    final localRepos = [
+      for (final project in _workspace.sidebarProjects)
+        if (project.host == null) project.path,
+    ];
     return WorkspacePageView(
       key: ValueKey(('workspace-page', page)),
       page: page,
       session: thread?.session,
+      availableRepos: localRepos,
+      onHandOffTask: _handOffTaskToChat,
       onClose: _closeCustomize,
       island: AppColors.conversationSurface,
       leading: !header && showToggle && !_sidebarAtRight
@@ -5054,6 +5145,43 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
           ? AppMetrics.trafficLightsWidth + 8
           : 12.0,
     );
+  }
+
+  /// Hands off a background [WorktreeTask] into an interactive chat thread
+  /// anchored on the task's repository (avoiding persistent `<DataDir>/worktrees/`
+  /// entries in the sidebar) with its worktree selected in the side panel,
+  /// pre-filling the composer with task context and applying kernel/model/effort.
+  Future<void> _handOffTaskToChat(WorktreeTask task) async {
+    final isZh = mounted && Localizations.localeOf(context).languageCode == 'zh';
+    final handoff = await TaskQueueService.instance.buildChatHandoff(
+      task.id,
+      isZh: isZh,
+    );
+    if (handoff == null || !mounted) return;
+    final hasRepo =
+        task.repoPath.isNotEmpty && await isDirectory(task.repoPath);
+    if (!mounted) return;
+    final openPath = hasRepo ? task.repoPath : handoff.directory;
+    final thread = await _workspace.openFolder(openPath);
+    if (!mounted) return;
+    if (hasRepo &&
+        !p.equals(handoff.directory, task.repoPath) &&
+        await isDirectory(handoff.directory)) {
+      if (!mounted) return;
+      _sidePanel.chooseWorktree(
+        thread.session,
+        task.repoPath,
+        handoff.directory,
+      );
+    }
+    applyTaskHandoffToSession(
+      thread.session,
+      kernelId: handoff.kernelId,
+      model: handoff.model,
+      effort: handoff.effort,
+      draftPrompt: handoff.draftPrompt,
+    );
+    _openAgent(thread);
   }
 
   /// The stashes, in place of the conversations, as Customize is.

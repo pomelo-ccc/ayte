@@ -80,6 +80,8 @@ class KernelCommand {
     this.description,
     this.icon, {
     this.argumentHint = '',
+    this.category,
+    this.source,
   });
 
   final String name;
@@ -88,6 +90,12 @@ class KernelCommand {
 
   /// What may follow it, e.g. `[low|medium|high]`.
   final String argumentHint;
+
+  /// Optional grouping category (`builtin`, `project`, `user`, `plugin`).
+  final String? category;
+
+  /// Optional provenance label, e.g. the plugin name for plugin skills.
+  final String? source;
 }
 
 /// A file the kernel offers for an `@mention`, relative to the project.

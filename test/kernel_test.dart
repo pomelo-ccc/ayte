@@ -17,6 +17,7 @@ import 'package:baocode/kernel/agent_kernel.dart';
 import 'package:baocode/kernel/claude_code/claude_code_kernel.dart';
 import 'package:baocode/kernel/claude_code/claude_code_transport.dart';
 import 'package:baocode/kernel/claude_code/claude_code_translator.dart';
+import 'package:baocode/kernel/claude_code/claude_core_setting.dart';
 import 'package:baocode/kernel/claude_code/claude_environment.dart';
 import 'package:baocode/kernel/claude_code/claude_goal.dart';
 import 'package:baocode/kernel/claude_code/claude_sdk_tools.dart';
@@ -24,11 +25,14 @@ import 'package:baocode/kernel/claude_code/claude_storage_io.dart';
 import 'package:baocode/kernel/claude_code/cli_locator.dart';
 import 'package:baocode/kernel/claude_code/control_channel.dart';
 import 'package:baocode/kernel/claude_code/turn_stats.dart';
+import 'package:baocode/kernel/codebuddy/codebuddy_account_models.dart';
+import 'package:baocode/kernel/codebuddy/codebuddy_cli.dart';
 import 'package:baocode/kernel/codex/codex_kernel.dart';
 import 'package:baocode/kernel/codex/codex_transport.dart';
 import 'package:baocode/kernel/commit_attribution.dart';
 import 'package:baocode/kernel/extension_switches.dart';
 import 'package:baocode/kernel/kernel_event.dart';
+import 'package:baocode/kernel/kernel_registry.dart';
 import 'package:baocode/kernel/kernel_types.dart';
 import 'package:baocode/kernel/mock/mock_kernels.dart';
 import 'package:baocode/kernel/queued_messages.dart';
@@ -6318,6 +6322,43 @@ void main() {
     kernel.dispose();
   });
 
+  test('antigravity-cli preserves bypassPermissions through _cliApproval', () async {
+    final cli = FakeCli();
+    final launches = <ClaudeLaunch>[];
+    final kernel = ClaudeCodeKernel(
+      KernelRegistry.antigravity,
+      const KernelContext(
+        cwd: '/p',
+        settings: {'permission': 'bypassPermissions'},
+      ),
+      start: (launch) async {
+        launches.add(launch);
+        return cli;
+      },
+    );
+    kernel.prepare();
+    await pumpEventQueue();
+    expect(launches.single.permissionMode, 'bypassPermissions');
+    expect(kernel.permission.selected, 'bypassPermissions');
+
+    kernel.permission.select('acceptEdits');
+    await pumpEventQueue();
+    expect(
+      cli.requests('set_permission_mode').any((r) => r['mode'] == 'acceptEdits'),
+      isTrue,
+    );
+
+    kernel.permission.select('bypassPermissions');
+    await pumpEventQueue();
+    expect(
+      cli.requests('set_permission_mode').any(
+        (r) => r['mode'] == 'bypassPermissions',
+      ),
+      isTrue,
+    );
+    kernel.dispose();
+  });
+
   test('Claude Code is asked to cite code in the chat\'s format', () {
     final arguments = const ClaudeLaunch(cwd: '/p').arguments;
     final at = arguments.indexOf('--append-system-prompt');
@@ -7421,6 +7462,532 @@ exec /usr/bin/env "\$@"
       expect(kernel, isNot(isA<RunsBackgroundTasks>()));
       expect(kernel, isNot(isA<RevertsChanges>()));
       expect(kernel, isA<SelectsMode>());
+    });
+  });
+
+  group('CodeBuddy & ClaudeCodeKernel Feature F5 parity', () {
+    setUp(() {
+      ClaudeCodeKernel.forgetCatalogCache();
+      ClaudeCodeKernel.forgetAccount();
+      ClaudeCodeKernel.usageRetryDelay = Duration.zero;
+    });
+
+    tearDown(() {
+      CodeBuddyModels.syncForRegion(CodeBuddyRegion.cn);
+      ClaudeCodeKernel.forgetCatalogCache();
+      ClaudeCodeKernel.forgetAccount();
+      ClaudeCodeKernel.usageRetryDelay = const Duration(seconds: 3);
+    });
+
+    test('CodeBuddyModels contextSize, effort, and per-model persistence', () async {
+      CodeBuddyModels.syncForRegion(CodeBuddyRegion.global);
+      const astraRef = '@$codebuddyBuiltinProviderId/gpt-6-astra';
+      const bunnyRef = '@$codebuddyBuiltinProviderId/space-bunny';
+
+      final cli = FakeCli(
+        answers: const {
+          'get_context_usage': {
+            'totalTokens': 0,
+            'categories': <Object?>[],
+          },
+        },
+      );
+      final kernel = ClaudeCodeKernel(
+        KernelRegistry.codebuddy,
+        const KernelContext(
+          cwd: '/p',
+          settings: {
+            'model': '@$codebuddyBuiltinProviderId/hy4std',
+            'effort@$bunnyRef': 'xhigh',
+            'context@$astraRef': '512000',
+          },
+        ),
+        start: (_) async => cli,
+      );
+      addTearDown(kernel.dispose);
+
+      // Initial contextWindow from hy4std (960000), not hardcoded 200000.
+      expect(kernel.contextWindow, 960000);
+      expect(kernel.contextSize.selected, '960000');
+      expect(
+        kernel.contextSize.optionsFor('@$codebuddyBuiltinProviderId/hy4std').single.label,
+        '960K（官方固定）',
+      );
+      expect(
+        kernel.contextSize.optionsFor(astraRef).map((o) => o.id).toList(),
+        ['256000', '512000', '1000000'],
+      );
+      expect(kernel.contextSize.selectedFor(astraRef), '512000');
+      expect(kernel.effort.selectedFor(bunnyRef), 'xhigh');
+
+      // Effort options include 'enabled' with description when toggleable without tiers.
+      const toggleOnly = CodeBuddyModel(
+        id: 'toggle-only',
+        label: 'Toggle Only',
+        supportsReasoning: true,
+        canDisableThinking: true,
+      );
+      expect(toggleOnly.effortLevels, ['none', 'enabled']);
+
+      final reportedUsage = <UsageReported>[];
+      kernel.events.listen((e) {
+        if (e is UsageReported) reportedUsage.add(e);
+      });
+
+      kernel.send(const KernelTurn(id: 'u1', text: 'boot'));
+      await pumpEventQueue();
+      cli.push(const {'type': 'result', 'subtype': 'success', 'is_error': false});
+      await pumpEventQueue();
+
+      // Switch to astra and change window live without tearing down transport.
+      kernel.model.select(astraRef);
+      await pumpEventQueue();
+      expect(kernel.contextSize.selected, '512000');
+      expect(kernel.contextWindow, 512000);
+
+      kernel.contextSize.select(astraRef, '1000000');
+      await pumpEventQueue();
+      expect(kernel.contextWindow, 1000000);
+      expect(reportedUsage.last.usage.window, 1000000);
+      expect(
+        cli.requests('apply_flag_settings').any(
+          (r) => (r['settings'] as Map?)?['contextWindow'] == 1000000,
+        ),
+        isTrue,
+      );
+
+      // Sending next turn must NOT restart transport when CodeBuddy contextWindow changes.
+      kernel.send(const KernelTurn(id: 'u2', text: 'turn 2'));
+      await pumpEventQueue();
+      expect(cli.closed, isFalse);
+
+      // Switch to bunny and back to astra: per-model effort & window preserved.
+      kernel.model.select(bunnyRef);
+      await pumpEventQueue();
+      expect(kernel.effort.selected, 'xhigh');
+      kernel.model.select(astraRef);
+      await pumpEventQueue();
+      expect(kernel.contextSize.selected, '1000000');
+    });
+
+    test('isolates _lastCatalog per kernel and seeds codebuddyBuiltinCommands', () async {
+      final claudeCli = FakeCli(
+        answers: const {
+          'initialize': {
+            'commands': [
+              {'name': 'claude-only', 'description': 'Claude cmd', 'builtin': true},
+            ],
+            'models': [
+              {'value': 'claude-opus-x', 'displayName': 'Claude Opus X'},
+            ],
+          },
+        },
+      );
+      final claudeKernel = ClaudeCodeKernel(
+        MockKernels.claudeCode,
+        const KernelContext(cwd: '/p'),
+        start: (_) async => claudeCli,
+      );
+      addTearDown(claudeKernel.dispose);
+      claudeKernel.send(const KernelTurn(id: 'u1', text: 'init'));
+      await pumpEventQueue();
+      expect(claudeKernel.commands.map((c) => c.name), contains('claude-only'));
+
+      // Pre-launch CodeBuddy & Antigravity kernels must NOT see claude-only or claude-opus-x.
+      final cbCli = FakeCli();
+      final cbKernel = ClaudeCodeKernel(
+        KernelRegistry.codebuddy,
+        const KernelContext(cwd: '/p'),
+        start: (_) async => cbCli,
+      );
+      addTearDown(cbKernel.dispose);
+      expect(cbKernel.commands.map((c) => c.name), isNot(contains('claude-only')));
+      expect(
+        cbKernel.commands.map((c) => c.name),
+        containsAll(['compact', 'clear', 'plan', 'init', 'review', 'status']),
+      );
+      expect(cbKernel.model.options.map((o) => o.id), isNot(contains('claude-opus-x')));
+
+      final agyKernel = ClaudeCodeKernel(
+        KernelRegistry.antigravity,
+        const KernelContext(cwd: '/p'),
+        start: (_) async => FakeCli(),
+      );
+      addTearDown(agyKernel.dispose);
+      expect(agyKernel.commands.map((c) => c.name), isNot(contains('claude-only')));
+      expect(agyKernel.commands.map((c) => c.name), containsAll(['teamwork', 'swarm']));
+
+      // commands_changed on CodeBuddy updates subsequent CodeBuddy kernels only.
+      cbKernel.send(const KernelTurn(id: 'u2', text: 'boot cb'));
+      await pumpEventQueue();
+      cbCli.push({
+        'type': 'system',
+        'subtype': 'commands_changed',
+        'commands': const [
+          {'name': 'cb-dynamic', 'description': 'Dynamic CB', 'category': 'project'},
+        ],
+      });
+      await pumpEventQueue();
+
+      final cbKernel2 = ClaudeCodeKernel(
+        KernelRegistry.codebuddy,
+        const KernelContext(cwd: '/p'),
+        start: (_) async => FakeCli(),
+      );
+      addTearDown(cbKernel2.dispose);
+      expect(cbKernel2.commands.map((c) => c.name), ['cb-dynamic']);
+      expect(claudeKernel.commands.map((c) => c.name), isNot(contains('cb-dynamic')));
+    });
+
+    test('_planName avoids Claude prefix on Antigravity and CodeBuddy', () {
+      expect(
+        ClaudeCodeKernel.planNameFor(const {'subscriptionType': 'Antigravity CLI'}),
+        'Antigravity CLI',
+      );
+      expect(
+        ClaudeCodeKernel.planNameFor(const {'subscriptionType': 'CodeBuddy (CN · Pro)'}),
+        'CodeBuddy (CN · Pro)',
+      );
+      expect(
+        ClaudeCodeKernel.planNameFor(
+          const {'subscriptionType': 'pro'},
+          kernelId: codebuddyBuiltinProviderId,
+        ),
+        'CodeBuddy Pro',
+      );
+      expect(
+        ClaudeCodeKernel.planNameFor(
+          const {'subscriptionType': 'pro'},
+          kernelId: 'antigravity-cli',
+        ),
+        'Antigravity Pro',
+      );
+      expect(
+        ClaudeCodeKernel.planNameFor(const {'subscriptionType': 'max'}),
+        'Claude Max',
+      );
+      expect(
+        ClaudeCodeKernel.planNameFor(const {'apiKeySource': 'env'}),
+        'Anthropic API',
+      );
+    });
+
+    test('get_usage parses windows/buckets and isolates limits across kernel ids', () async {
+      final claudeCli = FakeCli(
+        answers: {
+          'get_usage': {
+            'rate_limits_available': true,
+            'rate_limits': {
+              'five_hour': {'utilization': 30},
+            },
+          },
+        },
+      );
+      final cbCli = FakeCli(
+        answers: {
+          'get_usage': {
+            'rate_limits_available': true,
+            'rate_limits': {
+              'windows': [
+                {
+                  'label': 'CodeBuddy Pro',
+                  'utilization': 45.0,
+                  'resets_at': '2026-12-01T00:00:00Z',
+                },
+              ],
+              'buckets': [
+                {'name': 'Extra Bucket', 'remaining_fraction': 0.25},
+              ],
+            },
+          },
+        },
+      );
+
+      final claudeKernel = ClaudeCodeKernel(
+        MockKernels.claudeCode,
+        const KernelContext(cwd: '/p'),
+        start: (_) async => claudeCli,
+      );
+      final cbKernel1 = ClaudeCodeKernel(
+        KernelRegistry.codebuddy,
+        const KernelContext(cwd: '/p'),
+        start: (_) async => cbCli,
+      );
+      final cbKernel2 = ClaudeCodeKernel(
+        KernelRegistry.codebuddy,
+        const KernelContext(cwd: '/p'),
+        start: (_) async => FakeCli(),
+      );
+      addTearDown(() {
+        claudeKernel.dispose();
+        cbKernel1.dispose();
+        cbKernel2.dispose();
+      });
+
+      // Start claudeKernel so a running claude-code session exists in _live.
+      claudeKernel.send(const KernelTurn(id: 'u1', text: 'hi'));
+      await pumpEventQueue();
+      await claudeKernel.refreshUsage();
+      expect(claudeKernel.accountLimits.map((l) => l.label), ['5-hour limit']);
+      expect(cbKernel1.accountLimits, isEmpty);
+
+      // refreshUsage on cbKernel1 must NOT reuse claudeKernel's running control channel!
+      await cbKernel1.refreshUsage();
+      expect(cbCli.requests('get_usage'), hasLength(1));
+      expect(cbKernel1.accountLimits.map((l) => l.label), [
+        'CodeBuddy Pro',
+        'Extra Bucket',
+      ]);
+      expect(cbKernel1.accountLimits[0].utilization, closeTo(0.45, 0.001));
+      expect(cbKernel1.accountLimits[1].utilization, closeTo(0.75, 0.001));
+      // Same descriptor.id shares limits; claudeKernel stays isolated.
+      expect(cbKernel2.accountLimits.map((l) => l.label), [
+        'CodeBuddy Pro',
+        'Extra Bucket',
+      ]);
+      expect(claudeKernel.accountLimits.map((l) => l.label), ['5-hour limit']);
+    });
+
+    test('Defect 1: invalid effort on onlyReasoning CodeBuddy or Antigravity model never overwrites prior valid selection', () async {
+      const glmRef = '@$codebuddyBuiltinProviderId/glm-5.3';
+      const bunnyRef = '@$codebuddyBuiltinProviderId/space-bunny';
+      final cbCli = FakeCli();
+      final cbKernel = ClaudeCodeKernel(
+        KernelRegistry.codebuddy,
+        const KernelContext(cwd: '/p', settings: {'model': glmRef}),
+        start: (_) async => cbCli,
+      );
+      addTearDown(cbKernel.dispose);
+
+      cbKernel.send(const KernelTurn(id: 'u1', text: 'boot'));
+      await pumpEventQueue();
+
+      cbKernel.effort.select(glmRef, 'low');
+      await pumpEventQueue();
+      expect(cbKernel.effort.selectedFor(glmRef), 'low');
+      expect(cbKernel.effort.selected, 'low');
+
+      // 'none' is invalid for onlyReasoning glm-5.3: must be ignored without corrupting 'low'.
+      cbKernel.effort.select(glmRef, 'none');
+      await pumpEventQueue();
+      expect(cbKernel.effort.selectedFor(glmRef), 'low');
+      expect(cbKernel.effort.selected, 'low');
+      expect(
+        cbCli.requests('apply_flag_settings').any(
+          (r) => (r['settings'] as Map?)?['effortLevel'] == 'none',
+        ),
+        isFalse,
+      );
+
+      // Invalid effort on a non-active model must neither overwrite its stored effort nor
+      // mutate current model settings via _keepModelSettings.
+      cbKernel.effort.select(bunnyRef, 'invalid-tier');
+      await pumpEventQueue();
+      expect(cbKernel.effort.selectedFor(bunnyRef), 'max');
+      expect(cbKernel.effort.selectedFor(glmRef), 'low');
+
+      // Same guard holds for AntigravityModel (gemini-4-neon does not accept 'none').
+      const neonRef = '@antigravity-cli/gemini-4-neon';
+      final agyCli = FakeCli();
+      final agyKernel = ClaudeCodeKernel(
+        KernelRegistry.antigravity,
+        const KernelContext(cwd: '/p', settings: {'model': neonRef}),
+        start: (_) async => agyCli,
+      );
+      addTearDown(agyKernel.dispose);
+
+      agyKernel.send(const KernelTurn(id: 'u1', text: 'boot'));
+      await pumpEventQueue();
+      expect(agyKernel.model.options, isNotEmpty);
+      expect(agyKernel.model.selected, neonRef);
+
+      agyKernel.effort.select(neonRef, 'low');
+      await pumpEventQueue();
+      expect(agyKernel.effort.selectedFor(neonRef), 'low');
+
+      agyKernel.effort.select(neonRef, 'none');
+      await pumpEventQueue();
+      expect(agyKernel.effort.selectedFor(neonRef), 'low');
+      expect(agyKernel.effort.selected, 'low');
+      expect(
+        agyCli.requests('apply_flag_settings').any(
+          (r) => (r['settings'] as Map?)?['effortLevel'] == 'none',
+        ),
+        isFalse,
+      );
+    });
+
+    test('Defects 2 & 3: bare CodeBuddy/Antigravity IDs and default never leak into claude-code, while default works on codebuddy-cli', () async {
+      final claudeCli = FakeCli();
+      final claudeKernel = ClaudeCodeKernel(
+        MockKernels.claudeCode,
+        const KernelContext(cwd: '.', settings: {'model': 'default'}),
+        start: (_) async => claudeCli,
+      );
+      addTearDown(claudeKernel.dispose);
+
+      // Defect 3: bare 'default' on claude-code must not be hijacked by Antigravity gemini-4-neon.
+      expect(claudeKernel.model.selected, 'default');
+      expect(claudeKernel.contextSize.selected, isNull);
+      expect(claudeKernel.effort.selected, isNull);
+      expect(
+        claudeKernel.contextSize.optionsFor('gemini-4-neon').map((o) => o.id),
+        isNot(contains('256000')),
+      );
+      expect(claudeKernel.effort.optionsFor('gemini-4-neon'), isEmpty);
+
+      // Defect 2: bare CodeBuddy model IDs must not resolve on claude-code.
+      expect(
+        claudeKernel.contextSize.optionsFor('hy4std').map((o) => o.label),
+        isNot(contains('960K（官方固定）')),
+      );
+      expect(claudeKernel.effort.optionsFor('glm-5.3'), isEmpty);
+
+      claudeKernel.send(const KernelTurn(id: 'u1', text: 'boot'));
+      await pumpEventQueue();
+      claudeKernel.model.select('hy4std');
+      await pumpEventQueue();
+      expect(claudeKernel.model.selected, isNot('@$codebuddyBuiltinProviderId/hy4std'));
+      expect(claudeKernel.model.selected, 'default');
+      expect(claudeCli.requests('set_model'), isEmpty);
+
+      // On codebuddy-cli, selecting 'default' via _selectModel resolves to CodeBuddyModels.current.first.
+      final cbCli = FakeCli();
+      final cbKernel = ClaudeCodeKernel(
+        KernelRegistry.codebuddy,
+        const KernelContext(
+          cwd: '/p',
+          settings: {'model': '@$codebuddyBuiltinProviderId/glm-5.3'},
+        ),
+        start: (_) async => cbCli,
+      );
+      addTearDown(cbKernel.dispose);
+      cbKernel.send(const KernelTurn(id: 'u1', text: 'boot'));
+      await pumpEventQueue();
+
+      cbKernel.model.select('default');
+      await pumpEventQueue();
+      expect(
+        cbKernel.model.selected,
+        '@$codebuddyBuiltinProviderId/${CodeBuddyModels.current.first.id}',
+      );
+      expect(
+        cbCli.requests('set_model').last['model'],
+        CodeBuddyModels.current.first.effectiveCliModel,
+      );
+    });
+
+    test('Finding 2: KernelRegistry.antigravity exposes models and selects default even under ClaudeCore.builtin', () async {
+      final prevCore = ClaudeCore.current;
+      ClaudeCore.current = () => ClaudeCore.builtin;
+      addTearDown(() => ClaudeCore.current = prevCore);
+
+      const neonRef = '@antigravity-cli/gemini-4-neon';
+      final agyCli = FakeCli();
+      final agyKernel = ClaudeCodeKernel(
+        KernelRegistry.antigravity,
+        const KernelContext(cwd: '.', settings: {'model': 'default'}),
+        providers: ModelProviders.memory(providers: const []),
+        start: (_) async => agyCli,
+      );
+      addTearDown(agyKernel.dispose);
+
+      expect(agyKernel.model.options, isNotEmpty);
+      expect(
+        agyKernel.model.options.map((o) => o.id),
+        contains(neonRef),
+      );
+      expect(agyKernel.model.selected, neonRef);
+      expect(agyKernel.contextSize.selected, '256000');
+      expect(agyKernel.effort.selected, 'high');
+    });
+
+    test('Finding 3: _restoreModelFromHistory on codebuddy-cli and claude-code with model="default" does not leak Antigravity 256000', () async {
+      final cbCli = FakeCli();
+      final cbKernel = ClaudeCodeKernel(
+        KernelRegistry.codebuddy,
+        KernelContext(
+          cwd: '/p',
+          resume: SessionRecord(
+            id: 'cb-hist-default',
+            title: 'cb',
+            updatedAt: DateTime(2026),
+            cwd: '/p',
+          ),
+        ),
+        start: (_) async => cbCli,
+        readHistory: (_) async => [
+          {
+            'type': 'assistant',
+            'uuid': 'cb-msg-1',
+            'message': {
+              'id': 'cb-msg-1',
+              'role': 'assistant',
+              'model': 'default',
+              'content': [
+                {'type': 'text', 'text': 'hello'},
+              ],
+            },
+          },
+        ],
+      );
+      addTearDown(cbKernel.dispose);
+      final cbUsage = <UsageReported>[];
+      cbKernel.events.listen((e) {
+        if (e is UsageReported) cbUsage.add(e);
+      });
+      await pumpEventQueue();
+
+      expect(
+        cbKernel.model.selected,
+        '@$codebuddyBuiltinProviderId/${CodeBuddyModels.current.first.id}',
+      );
+      expect(
+        cbKernel.contextSize.selected,
+        '${CodeBuddyModels.current.first.defaultContext}',
+      );
+      expect(cbKernel.contextSize.selected, isNot('256000'));
+      expect(cbUsage, isNotEmpty);
+      expect(cbUsage.last.usage.window, isNot(256000));
+      expect(
+        cbUsage.last.usage.window,
+        CodeBuddyModels.current.first.defaultContext,
+      );
+
+      final claudeCli = FakeCli();
+      final claudeKernel = ClaudeCodeKernel(
+        MockKernels.claudeCode,
+        KernelContext(
+          cwd: '/p',
+          resume: SessionRecord(
+            id: 'claude-hist-default',
+            title: 'cc',
+            updatedAt: DateTime(2026),
+            cwd: '/p',
+          ),
+        ),
+        start: (_) async => claudeCli,
+        readHistory: (_) async => [
+          {
+            'type': 'assistant',
+            'uuid': 'cc-msg-1',
+            'message': {
+              'id': 'cc-msg-1',
+              'role': 'assistant',
+              'model': 'default',
+              'content': [
+                {'type': 'text', 'text': 'hello'},
+              ],
+            },
+          },
+        ],
+      );
+      addTearDown(claudeKernel.dispose);
+      await pumpEventQueue();
+
+      expect(claudeKernel.model.selected, 'default');
+      expect(claudeKernel.contextSize.selected, isNull);
+      expect(claudeKernel.effort.selected, isNull);
     });
   });
 }

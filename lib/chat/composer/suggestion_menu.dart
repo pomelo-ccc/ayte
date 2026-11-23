@@ -16,10 +16,30 @@ class SuggestionMatch {
 
 List<SuggestionMatch> rankSuggestions(List<Suggestion> source, String query) {
   final scored = <(SuggestionMatch, int)>[];
+  final lowerQuery = query.toLowerCase();
   for (final suggestion in source) {
     final match = fuzzyMatch(suggestion.label, query);
     if (match != null) {
-      scored.add((SuggestionMatch(suggestion, match.indexes), match.score));
+      var score = match.score;
+      if (lowerQuery.isNotEmpty) {
+        score += 1000;
+        if (suggestion.label.toLowerCase().startsWith(lowerQuery)) {
+          score += 50;
+        }
+      }
+      scored.add((SuggestionMatch(suggestion, match.indexes), score));
+    } else if (lowerQuery.isNotEmpty &&
+        suggestion.kind == SuggestionKind.command) {
+      final detailIdx = suggestion.detail.toLowerCase().indexOf(lowerQuery);
+      if (detailIdx >= 0) {
+        scored.add((
+          SuggestionMatch(suggestion, const []),
+          100 - detailIdx.clamp(0, 80),
+        ));
+      } else if (suggestion.group case final group?
+          when group.toLowerCase().contains(lowerQuery)) {
+        scored.add((SuggestionMatch(suggestion, const []), 10));
+      }
     }
   }
   if (query.isNotEmpty) scored.sort((a, b) => b.$2.compareTo(a.$2));
@@ -199,7 +219,14 @@ class _SuggestionMenuState extends State<SuggestionMenu> {
                         itemCount: entries.length,
                         itemBuilder: (context, at) {
                           final (:index, :heading) = entries[at];
-                          if (heading != null) return _GroupHeading(heading);
+                          if (heading != null) {
+                            return _GroupHeading(
+                              heading,
+                              isCommand:
+                                  widget.matches[index].suggestion.kind ==
+                                  SuggestionKind.command,
+                            );
+                          }
                           return _SuggestionRow(
                             match: widget.matches[index],
                             highlighted: index == widget.highlighted,
@@ -306,7 +333,10 @@ class _SuggestionRow extends StatelessWidget {
                 if (suggestion.detail.isEmpty)
                   Expanded(child: label)
                 else ...[
-                  label,
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 210),
+                    child: label,
+                  ),
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
@@ -366,11 +396,12 @@ class _SuggestionRow extends StatelessWidget {
   }
 }
 
-/// Over a group's suggestions: its project's folder.
+/// Over a group's suggestions: its project's folder, or a command category.
 class _GroupHeading extends StatelessWidget {
-  const _GroupHeading(this.name);
+  const _GroupHeading(this.name, {this.isCommand = false});
 
   final String name;
+  final bool isCommand;
 
   @override
   Widget build(BuildContext context) => Semantics(
@@ -379,8 +410,11 @@ class _GroupHeading extends StatelessWidget {
       padding: const EdgeInsets.fromLTRB(6, 6, 6, 2),
       child: Row(
         children: [
-          SizedBox(width: 18, child: FolderIcon(name, size: 14)),
-          const SizedBox(width: 6),
+          if (!isCommand) ...[
+            SizedBox(width: 18, child: FolderIcon(name, size: 14)),
+            const SizedBox(width: 6),
+          ] else
+            const SizedBox(width: 4),
           Expanded(
             child: Text(
               name,
@@ -388,7 +422,7 @@ class _GroupHeading extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 color: AppColors.textFaint,
-                fontSize: 11.5,
+                fontSize: isCommand ? 11.0 : 11.5,
                 fontWeight: FontWeight.w500,
               ),
             ),

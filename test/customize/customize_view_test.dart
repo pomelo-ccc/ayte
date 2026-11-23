@@ -9,6 +9,7 @@ import 'package:bao_editor/monaco/flutter/editor_surface_controller.dart';
 
 import 'package:baocode/chat/chat_screen.dart';
 import 'package:baocode/chat/side_panel/side_panel_view.dart';
+import 'package:baocode/customize/customization_disk.dart';
 import 'package:baocode/customize/customization_store.dart';
 import 'package:baocode/customize/customizations.dart';
 import 'package:baocode/customize/customize_view.dart';
@@ -555,4 +556,250 @@ void main() {
     // As far right as on this machine's: 8 off the edge.
     expect(close.right, 1400 - 8);
   });
+
+  testWidgets('folder-matched skills, plugin:skill aliases, and normalized MCP names stay synced with switches and clear aliases on toggle', (tester) async {
+    tester.view.physicalSize = const Size(1200, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+
+    const home = '/home/alice';
+    const agyConfig = '$home/.gemini/config';
+    final disk = _MemoryDisk(
+      {
+        '$agyConfig/skills/folder-alias/SKILL.md':
+            '---\nname: display-alias\ndescription: Folder aliased skill\n---\nBody\n',
+        '$agyConfig/plugins/my-plug-dir/plugin.json': '{"name": "my-plug"}',
+        '$agyConfig/plugins/my-plug-dir/skills/plug-folder/SKILL.md':
+            '---\nname: plug-skill\ndescription: Plugin aliased skill\n---\nBody\n',
+        '$agyConfig/mcp_config.json':
+            '{"mcpServers": {"claude.ai Docs": {"command": "echo", "args": ["docs"]}}}',
+      },
+      home: home,
+      config: agyConfig,
+    );
+
+    final store = CustomizationStore(
+      configDir: agyConfig,
+      homeDir: home,
+      disk: disk,
+    );
+    final prevProber = CustomizeView.mcpProber;
+    CustomizeView.mcpProber = (config, {cwd}) async => const McpProbeResult(
+      McpProbeStatus.connected,
+      server: 'docs-mcp 1.0',
+    );
+    addTearDown(() => CustomizeView.mcpProber = prevProber);
+
+    final changes = ChangeNotifier();
+    addTearDown(changes.dispose);
+    var kept = const ExtensionSwitches(
+      disabledSkills: {'folder-alias', 'my-plug:plug-skill'},
+      disabledServers: {'claude_ai_Docs'},
+    );
+    ExtensionSwitches.current = () => kept;
+    ExtensionSwitches.changes = changes;
+    ExtensionSwitches.save = (switches) async {
+      kept = switches;
+      changes.notifyListeners();
+    };
+    addTearDown(() {
+      ExtensionSwitches.current = () => ExtensionSwitches.none;
+      ExtensionSwitches.changes = null;
+      ExtensionSwitches.save = null;
+    });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: CustomizeSettingsPage(customizations: store)),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    Finder switchOf(String label) => find.byWidgetPredicate(
+      (widget) => widget is IdeSwitch && widget.semanticLabel == label,
+    );
+    bool on(String label) => tester.widget<IdeSwitch>(switchOf(label)).value;
+
+    // Both skills show Disabled text and switch OFF.
+    expect(find.text('Disabled'), findsNWidgets(2));
+    expect(on('display-alias'), isFalse);
+    expect(on('plug-skill'), isFalse);
+
+    // Toggling them ON clears the alias keys completely.
+    await tester.tap(switchOf('display-alias'));
+    await tester.pumpAndSettle();
+    expect(kept.disabledSkills, {'my-plug:plug-skill'});
+    expect(on('display-alias'), isTrue);
+
+    await tester.tap(switchOf('plug-skill'));
+    await tester.pumpAndSettle();
+    expect(kept.disabledSkills, isEmpty);
+    expect(on('plug-skill'), isTrue);
+    expect(find.text('Disabled'), findsNothing);
+
+    // Normalized MCP name starts OFF with Disabled badge, clears alias on toggle, and probes.
+    await tester.tap(find.text('MCPs'));
+    await tester.pumpAndSettle();
+    expect(find.text('Disabled'), findsOneWidget);
+    expect(on('claude.ai Docs'), isFalse);
+
+    await tester.tap(switchOf('claude.ai Docs'));
+    await tester.pumpAndSettle();
+    expect(kept.disabledServers, isEmpty);
+    expect(on('claude.ai Docs'), isTrue);
+    expect(find.text('Connected'), findsOneWidget);
+  });
+
+  testWidgets('open MCP detail panel refreshes status when ExtensionSwitches.changes toggles it', (tester) async {
+    tester.view.physicalSize = const Size(1200, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+
+    const home = '/home/alice';
+    const agyConfig = '$home/.gemini/config';
+    final disk = _MemoryDisk(
+      {
+        '$agyConfig/mcp_config.json':
+            '{"mcpServers": {"srv1": {"command": "echo", "args": ["srv1"]}}}',
+      },
+      home: home,
+      config: agyConfig,
+    );
+
+    final store = CustomizationStore(
+      configDir: agyConfig,
+      homeDir: home,
+      disk: disk,
+    );
+    var probeCalls = 0;
+    final prevProber = CustomizeView.mcpProber;
+    CustomizeView.mcpProber = (config, {cwd}) async {
+      probeCalls++;
+      return const McpProbeResult(
+        McpProbeStatus.connected,
+        server: 'srv1 1.0',
+      );
+    };
+    addTearDown(() => CustomizeView.mcpProber = prevProber);
+
+    final changes = ChangeNotifier();
+    addTearDown(changes.dispose);
+    var kept = const ExtensionSwitches(disabledServers: {'srv1'});
+    ExtensionSwitches.current = () => kept;
+    ExtensionSwitches.changes = changes;
+    addTearDown(() {
+      ExtensionSwitches.current = () => ExtensionSwitches.none;
+      ExtensionSwitches.changes = null;
+    });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: CustomizeView(
+            store: store,
+            projects: const [],
+            kind: CustomizationKind.mcps,
+            onClose: () {},
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    // Open srv1 detail panel while disabled.
+    await tester.tap(find.text('srv1'));
+    await tester.pumpAndSettle();
+    expect(find.text('Disabled'), findsOneWidget);
+    expect(find.text('Connected'), findsNothing);
+    expect(probeCalls, 0);
+
+    // Re-enable srv1 via ExtensionSwitches.changes while detail panel stays open.
+    kept = ExtensionSwitches.none;
+    changes.notifyListeners();
+    await tester.pumpAndSettle();
+    expect(find.text('Disabled'), findsNothing);
+    expect(find.text('Connected'), findsOneWidget);
+    expect(probeCalls, 1);
+
+    // Disable and re-enable again: probe cache clears on disable and re-probes cleanly.
+    kept = const ExtensionSwitches(disabledServers: {'srv1'});
+    changes.notifyListeners();
+    await tester.pumpAndSettle();
+    expect(find.text('Disabled'), findsOneWidget);
+
+    kept = ExtensionSwitches.none;
+    changes.notifyListeners();
+    await tester.pumpAndSettle();
+    expect(find.text('Connected'), findsOneWidget);
+    expect(probeCalls, 2);
+  });
+}
+
+class _MemoryDisk implements CustomizationDisk {
+  _MemoryDisk(this.files, {required this.home, required this.config});
+
+  final Map<String, String> files;
+  final String home;
+  final String config;
+
+  @override
+  bool get isLocal => true;
+
+  @override
+  p.Context get paths => p.posix;
+
+  @override
+  Future<String> configDir() async => config;
+
+  @override
+  Future<String?> homeDir() async => home;
+
+  @override
+  Future<String?> read(String path) async => files[p.posix.normalize(path)];
+
+  @override
+  Future<List<({String path, bool directory})>> children(
+    String directory,
+  ) async {
+    final norm = p.posix.normalize(directory);
+    final prefix = norm == '/' ? '/' : '$norm/';
+    final seen = <String, bool>{};
+    for (final key in files.keys) {
+      if (!key.startsWith(prefix)) continue;
+      final rest = key.substring(prefix.length);
+      if (rest.isEmpty) continue;
+      final slash = rest.indexOf('/');
+      if (slash < 0) {
+        seen[key] = false;
+      } else {
+        seen['$prefix${rest.substring(0, slash)}'] = true;
+      }
+    }
+    return [
+      for (final entry in seen.entries)
+        (path: entry.key, directory: entry.value),
+    ];
+  }
+
+  @override
+  Future<bool?> isDirectory(String path) async {
+    final norm = p.posix.normalize(path);
+    if (files.containsKey(norm)) return false;
+    final prefix = norm == '/' ? '/' : '$norm/';
+    if (files.keys.any((k) => k.startsWith(prefix))) return true;
+    return null;
+  }
+
+  @override
+  Future<void> write(String path, String text) async {
+    files[p.posix.normalize(path)] = text;
+  }
+
+  @override
+  Future<void> delete(String path) async {
+    final norm = p.posix.normalize(path);
+    files.remove(norm);
+    final prefix = '$norm/';
+    files.removeWhere((k, _) => k.startsWith(prefix));
+  }
 }

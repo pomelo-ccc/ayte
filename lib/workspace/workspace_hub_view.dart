@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
 
+import '../automations/automation_service.dart' show AutomationRule;
 import '../automations/automations_view.dart';
 import '../canvas/infinite_canvas_view.dart';
 import '../chat/chat_session.dart';
 import '../ide/ide_back_button.dart';
 import '../library/library_view.dart';
+import '../tasks/task_queue_service.dart' show WorktreeTask;
 import '../tasks/task_queue_view.dart';
 import '../theme/app_theme.dart';
 import '../theme/codicons.dart';
@@ -54,6 +56,9 @@ class WorkspacePageView extends StatelessWidget {
     required this.page,
     required this.session,
     required this.onClose,
+    this.availableRepos = const [],
+    this.onHandOffTask,
+    this.onHandOffAutomation,
     this.leading,
     this.titleBarInset = 12.0,
     this.island,
@@ -62,6 +67,9 @@ class WorkspacePageView extends StatelessWidget {
   final WorkspacePage page;
   final ChatSession? session;
   final VoidCallback onClose;
+  final List<String> availableRepos;
+  final Future<void> Function(WorktreeTask task)? onHandOffTask;
+  final Future<void> Function(AutomationRule rule)? onHandOffAutomation;
   final Widget? leading;
   final double titleBarInset;
   final Color? island;
@@ -75,8 +83,16 @@ class WorkspacePageView extends StatelessWidget {
     final cwd = session?.root;
 
     final Widget body = switch (page) {
-      WorkspacePage.tasks => TaskQueueView(defaultRepoPath: cwd),
-      WorkspacePage.automations => AutomationsView(defaultCwd: cwd),
+      WorkspacePage.tasks => TaskQueueView(
+        defaultRepoPath: cwd,
+        availableRepos: availableRepos,
+        onHandOffTask: onHandOffTask,
+      ),
+      WorkspacePage.automations => AutomationsView(
+        defaultCwd: cwd,
+        availableRepos: availableRepos,
+        onHandOff: onHandOffAutomation,
+      ),
       WorkspacePage.library => session == null
           ? Center(
               child: Text(

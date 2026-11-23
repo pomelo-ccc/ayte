@@ -16,6 +16,11 @@ import '../icons/emoji_sheet.dart';
 import '../icons/icon_library.dart';
 import '../icons/project_icon.dart';
 import '../kernel/agent_kernel.dart';
+import '../kernel/antigravity/antigravity_catalog.dart';
+import '../kernel/antigravity/antigravity_cli.dart'
+    show AntigravityModels, antigravityBuiltinProviderId;
+import '../kernel/codebuddy/codebuddy_cli.dart'
+    show CodeBuddyModels, codebuddyBuiltinProviderId;
 import '../kernel/kernel_registry.dart';
 import '../kernel/kernel_types.dart';
 import '../l10n/l10n.dart';
@@ -686,6 +691,74 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
     }
   }
 
+  KernelDescriptor? _kernelNamed(String? id) {
+    if (id == null || id.isEmpty) return null;
+    for (final k in kernels) {
+      if (k.id == id) return k;
+    }
+    return null;
+  }
+
+  static String? _inferModelKernelId(String? model) {
+    if (model == null) return null;
+    final trimmed = model.trim();
+    if (trimmed.isEmpty || trimmed == 'default') return null;
+    if (AntigravityModels.isAntigravityModel(trimmed)) {
+      return antigravityBuiltinProviderId;
+    }
+    if (CodeBuddyModels.isCodeBuddyModel(trimmed)) {
+      return codebuddyBuiltinProviderId;
+    }
+    final baseAlias = trimmed.split('[').first;
+    if (trimmed.startsWith('claude-') ||
+        const {'opus', 'sonnet', 'haiku'}.contains(baseAlias)) {
+      return claudeCodeKernelId;
+    }
+    return null;
+  }
+
+  KernelDescriptor _resolveKeptKernel(
+    KernelDescriptor catalogKernel,
+    SessionRecord session,
+  ) {
+    final kept = _agentSettings[session.id];
+    final storedId = kept?[_agentKernelKey] ?? kept?['kernel'];
+    if (_kernelNamed(storedId) case final stored?) {
+      return stored;
+    }
+    final keptModel = kept?[KernelChoiceKind.model.name]?.trim();
+    if (_kernelNamed(_inferModelKernelId(keptModel)) case final byModel?) {
+      return byModel;
+    }
+    const claudeFamily = {
+      antigravityBuiltinProviderId,
+      codebuddyBuiltinProviderId,
+      claudeCodeKernelId,
+    };
+    if (session.path case final path?
+        when claudeFamily.contains(catalogKernel.id)) {
+      final inferredId = AntigravityCatalog.inferJsonlKernelId(path);
+      if (_kernelNamed(inferredId) case final byHeader?) {
+        return byHeader;
+      }
+    }
+    if (keptModel == 'default' && claudeFamily.contains(catalogKernel.id)) {
+      if (_kernelNamed(claudeCodeKernelId) case final claude?) {
+        return claude;
+      }
+    }
+    return catalogKernel;
+  }
+
+  static Map<String, String>? _kernelSettingsOf(Map<String, String>? kept) {
+    if (kept == null || kept.isEmpty) return null;
+    return {
+      for (final entry in kept.entries)
+        if (entry.key != _agentKernelKey && entry.key != 'kernel')
+          entry.key: entry.value,
+    };
+  }
+
   void _addKept(
     KernelDescriptor kernel,
     Project project,
@@ -706,10 +779,11 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
         when session.updatedAt.isAfter(since)) {
       _unhide(project.path);
     }
+    final effectiveKernel = _resolveKeptKernel(kernel, session);
     _add(
       AgentThread._(
         project: project,
-        kernel: kernel,
+        kernel: effectiveKernel,
         record: session,
         title:
             _names[id] ??
@@ -718,9 +792,9 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
         pinned: _pinned.contains(id),
         archived: _archived.contains(id),
         open: () {
-          final agentKept = _agentSettings[session.id];
+          final agentKept = _kernelSettingsOf(_agentSettings[session.id]);
           return ChatSession(
-            kernel: kernel,
+            kernel: effectiveKernel,
             kernels: kernels,
             kernelContext: KernelContext(
               cwd: session.cwd,
@@ -1328,6 +1402,7 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
 
   /// Each agent's choices, by session: those it opens with again.
   final Map<String, Map<String, String>> _agentSettings = {};
+  static const _agentKernelKey = 'kernelId';
 
   /// [thread]'s choice of [kind] as kept for when it opens again (the
   /// model it runs on, say); null when none is.
@@ -3128,6 +3203,7 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
     final id = thread.isOpen ? thread.session.sessionId : thread.record?.id;
     if (id == null) return false;
     final choices = {
+      _agentKernelKey: snapshot.kernel,
       for (final (kind, value) in [
         (KernelChoiceKind.mode, snapshot.mode),
         (KernelChoiceKind.permission, snapshot.permission),
@@ -3693,26 +3769,28 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
   /// A new agent in [project] for something other than the window to send
   /// to (a paired phone): listed, not shown, the window left as it is. An
   /// untouched new agent there that does not show is reused.
-  AgentThread startAgent(Project project) {
+  AgentThread startAgent(Project project, {KernelDescriptor? kernel}) {
+    final resolvedKernel = kernel == null
+        ? null
+        : (_kernelNamed(kernel.id) ?? kernel);
     for (final thread in _threads) {
       if (thread.project == project &&
           _isUntouched(thread) &&
-          !_hasPane(thread)) {
+          !_hasPane(thread) &&
+          (resolvedKernel == null || thread.kernel.id == resolvedKernel.id)) {
         return thread;
       }
     }
-    final thread = _newThread(project);
+    final thread = _newThread(project, kernel: resolvedKernel);
     notifyListeners();
     return thread;
   }
 
   /// A new, empty agent in [project], listed here but not shown.
-  AgentThread _newThread(Project project) {
-    final kernel =
-        switch (agentSetup?.call(project.path)?.kernel) {
-          final id? => kernels.where((k) => k.id == id).firstOrNull,
-          null => null,
-        } ??
+  AgentThread _newThread(Project project, {KernelDescriptor? kernel}) {
+    final resolvedKernel =
+        kernel ??
+        _kernelNamed(agentSetup?.call(project.path)?.kernel) ??
         _preferredKernel;
     final settings = _setUp(project.path, {
       ..._preferredSettings,
@@ -3722,10 +3800,10 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
     final cwd = project.path;
     final thread = AgentThread._(
       project: project,
-      kernel: kernel,
+      kernel: resolvedKernel,
       updatedAt: DateTime.now(),
       open: () => ChatSession(
-        kernel: kernel,
+        kernel: resolvedKernel,
         kernels: kernels,
         kernelContext: KernelContext(
           cwd: cwd,
@@ -3777,6 +3855,7 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
     final record = await session.fork(title: title);
     if (record == null || _disposed) return null;
     final settings = {
+      _agentKernelKey: thread.kernel.id,
       for (final kind in KernelChoiceKind.values)
         if (kind != KernelChoiceKind.fast) kind.name: ?session.selected(kind),
     };
@@ -3801,7 +3880,7 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
           resume: record,
           settings: _setUp(record.cwd, {
             ..._preferredSettings,
-            ...?_agentSettings[record.id],
+            ...?_kernelSettingsOf(_agentSettings[record.id]),
           }),
           workspace: () => _kernelWorkspace(record.cwd),
         ),

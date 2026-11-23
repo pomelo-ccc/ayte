@@ -3765,6 +3765,20 @@ class AppLocalizationsZh extends AppLocalizations {
   }
 
   @override
+  String get trayRunningHeader => '运行中';
+
+  @override
+  String trayUnreadCount(int count) {
+    return '$count 个已完成';
+  }
+
+  @override
+  String get trayIdle => '当前无待办任务';
+
+  @override
+  String get trayIdleHint => '智能体会继续在后台运行，有进展时立即提醒。';
+
+  @override
   String get trayQuit => '退出 Ayte';
 
   @override

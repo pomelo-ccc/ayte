@@ -32,7 +32,9 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
   CodeBuddyTransport._({
     required this.cli,
     required this.launch,
-  }) : _sessionId = (launch.resume != null && launch.resume!.isNotEmpty)
+    CodeBuddyAccounts? accounts,
+  }) : _accounts = accounts ?? CodeBuddyAccounts.instance,
+       _sessionId = (launch.resume != null && launch.resume!.isNotEmpty)
            ? launch.resume
            : null,
        _model = CodeBuddyModels.cliModelIdOf(launch.model),
@@ -44,6 +46,50 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
        ),
        _paths = AgentPaths.from(cli.environment) {
     _live.add(this);
+  }
+
+  /// Creates a [CodeBuddyTransport] directly for unit tests with injectable
+  /// [cli] and [accounts] store.
+  @visibleForTesting
+  factory CodeBuddyTransport.forTesting({
+    required CodeBuddyCli cli,
+    required ClaudeLaunch launch,
+    CodeBuddyAccounts? accounts,
+  }) {
+    CodeBuddyAccounts.onActiveAccountSwitched ??= _handleActiveAccountSwitched;
+    return CodeBuddyTransport._(
+      cli: cli,
+      launch: launch,
+      accounts: accounts,
+    );
+  }
+
+  @visibleForTesting
+  Future<void> spawnForTesting() => _spawnProcess();
+
+  @visibleForTesting
+  void simulateProcessExitForTesting(Process proc, int code) =>
+      _onProcessExit(proc, code);
+
+  @visibleForTesting
+  static Duration? forwardedControlFallbackTimeoutOverride;
+
+  static Duration _fallbackTimeoutFor(String subtype) {
+    if (forwardedControlFallbackTimeoutOverride case final override?) {
+      return override;
+    }
+    return switch (subtype) {
+      'file_suggestions' => const Duration(seconds: 4),
+      'get_hooks_listing' ||
+      'stop_task' ||
+      'background_tasks' => const Duration(seconds: 6),
+      'mcp_status' ||
+      'mcp_toggle' ||
+      'mcp_reconnect' ||
+      'reconnect_mcp' => const Duration(seconds: 12),
+      'mcp_authenticate' => const Duration(seconds: 25),
+      _ => const Duration(seconds: 8),
+    };
   }
 
   static int _resolveInitialContextTokens(
@@ -76,17 +122,43 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
   );
 
   static final Set<CodeBuddyTransport> _live = {};
+  static final Set<Future<void>> _pendingStops = {};
+
+  static void _trackStop(Future<void> future) {
+    if (!_pendingStops.add(future)) return;
+    unawaited(
+      future.then<void>((_) {}, onError: (Object _) {}).whenComplete(() {
+        _pendingStops.remove(future);
+      }),
+    );
+  }
 
   static Future<void> stopAll({
     Duration timeout = const Duration(seconds: 3),
   }) async {
-    await Future.wait([
-      for (final transport in [..._live]) transport._stop(timeout),
-    ]);
+    final live = [..._live];
+    final pending = <Future<void>>[
+      for (final transport in live) transport._stop(timeout),
+      for (final stop in [..._pendingStops])
+        stop.timeout(timeout, onTimeout: () {}),
+    ];
+    if (pending.isEmpty && registry.isIdle) return;
+    if (pending.isNotEmpty) {
+      await Future.wait(pending);
+    }
     await registry.flush();
   }
 
   static Future<void> reapLeftovers() => registry.reaped;
+
+  static Future<void> _handleActiveAccountSwitched(CodeBuddyAccount? _) async {
+    for (final transport in [..._live]) {
+      transport._markAccountSwitchNeeded();
+      if (!transport._turnInFlight) {
+        await transport._recycleProcess();
+      }
+    }
+  }
 
   static Future<ClaudeCodeTransport> start(ClaudeLaunch launch) async {
     await registry.reaped;
@@ -94,22 +166,16 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
       throw ClaudeFolderGone(launch.cwd);
     }
     await CodeBuddyAccounts.instance.ensureInitialized();
-    CodeBuddyAccounts.onActiveAccountSwitched ??= (_) async {
-      for (final transport in [..._live]) {
-        transport._needsAccountRespawn = true;
-        if (!transport._turnInFlight) {
-          await transport._recycleProcess();
-        }
-      }
-    };
+    CodeBuddyAccounts.onActiveAccountSwitched ??= _handleActiveAccountSwitched;
     final cli = await LocalCodeBuddy.locate();
     final transport = CodeBuddyTransport._(cli: cli, launch: launch);
-    await transport._spawnProcess();
+    await transport._startInitialProcess();
     return transport;
   }
 
   final CodeBuddyCli cli;
   final ClaudeLaunch launch;
+  final CodeBuddyAccounts _accounts;
   final AgentPaths _paths;
 
   final StreamController<Map<String, Object?>> _messages =
@@ -136,8 +202,15 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
   bool _hasSentTurnOnProcess = false;
   bool _suppressingResumeReplay = false;
   bool _needsAccountRespawn = false;
+  int _accountSwitchEpoch = 0;
   bool _closed = false;
   bool _recycling = false;
+  Future<void>? _initialSpawnFuture;
+  Future<void>? _recyclingFuture;
+  Future<void>? _spawningFuture;
+  Future<void>? _closeCleanupFuture;
+  final Set<Future<void>> _pendingCleanupFutures = {};
+  final List<Map<String, Object?>> _queuedWritesDuringRecycle = [];
   String? _pendingCustomTitle;
   Map<String, Object?>? _lastInitializeRequest;
 
@@ -155,7 +228,29 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
       Timer fallbackTimer,
     })
   > _pendingModelFetches = {};
+  final Map<String, ({String subtype, Timer fallbackTimer})>
+  _pendingControlRequests = {};
   int _internalSeq = 0;
+
+  @visibleForTesting
+  int get pendingControlRequestCountForTesting => _pendingControlRequests.length;
+
+  @visibleForTesting
+  String? get settingsFilePathForTesting => _settingsFilePath;
+
+  void _cancelPendingModelFetches() {
+    for (final entry in _pendingModelFetches.values) {
+      entry.fallbackTimer.cancel();
+    }
+    _pendingModelFetches.clear();
+  }
+
+  void _cancelPendingControlRequests() {
+    for (final entry in _pendingControlRequests.values) {
+      entry.fallbackTimer.cancel();
+    }
+    _pendingControlRequests.clear();
+  }
 
   @override
   Stream<Map<String, Object?>> get messages => _messages.stream;
@@ -264,12 +359,67 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
     ];
   }
 
-  Future<void> _spawnProcess() async {
-    var activeAccount = CodeBuddyAccounts.instance.currentAccount;
+  void _markAccountSwitchNeeded() {
+    _needsAccountRespawn = true;
+    _accountSwitchEpoch++;
+  }
+
+  Future<void> _startInitialProcess() {
+    final completer = Completer<void>();
+    final initial = completer.future;
+    _initialSpawnFuture = initial;
+    return () async {
+      try {
+        await _spawnProcess();
+        while (!_closed && _needsAccountRespawn) {
+          _recycling = true;
+          try {
+            await _killProcessForRespawn();
+          } finally {
+            _recycling = false;
+          }
+          if (_closed) break;
+          await _spawnProcess();
+        }
+      } finally {
+        if (identical(_initialSpawnFuture, initial)) {
+          _initialSpawnFuture = null;
+        }
+        if (!completer.isCompleted) {
+          completer.complete();
+        }
+      }
+    }();
+  }
+
+  Future<void> _trackCleanup(Future<void> future) {
+    _pendingCleanupFutures.add(future);
+    return future.whenComplete(() {
+      _pendingCleanupFutures.remove(future);
+    });
+  }
+
+  Future<void> _spawnProcess() {
+    if (_closed) return Future.value();
+    final future = _spawnProcessImpl();
+    _spawningFuture = future;
+    return future.whenComplete(() {
+      if (identical(_spawningFuture, future)) {
+        _spawningFuture = null;
+      }
+    });
+  }
+
+  Future<void> _spawnProcessImpl() async {
+    if (_closed) return;
+    final spawnEpoch = _accountSwitchEpoch;
+    var activeAccount = _accounts.currentAccount;
+    final spawnAccountId = activeAccount?.id;
     if (activeAccount != null) {
-      activeAccount = await CodeBuddyAccounts.instance.ensureFreshAccount(
+      activeAccount = await _accounts.ensureFreshAccount(
         activeAccount,
       );
+      if (_closed) return;
     }
 
     final accountEnv = activeAccount?.processEnvironment() ?? const {};
@@ -292,6 +442,7 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
 
     String? settingsFile;
     if (hasSecrets) {
+      if (_closed) return;
       final filePayload = <String, Object?>{
         ...settingsMap,
         'env': <String, Object?>{
@@ -301,11 +452,32 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
         },
       };
       settingsFile = await ClaudeSettingsFile.write(filePayload);
+      if (_closed) {
+        await ClaudeSettingsFile.delete(settingsFile);
+        return;
+      }
       _settingsFilePath = settingsFile;
     }
 
+    Future<void> cleanupAbortedSettings() async {
+      if (settingsFile != null) {
+        await ClaudeSettingsFile.delete(settingsFile);
+        if (_settingsFilePath == settingsFile) {
+          _settingsFilePath = null;
+        }
+      }
+    }
+
     final proxy = await NetworkProxy.instance.environment();
+    if (_closed) {
+      await cleanupAbortedSettings();
+      return;
+    }
     final certificates = await nodeCertificatesEnvironment(cli.environment);
+    if (_closed) {
+      await cleanupAbortedSettings();
+      return;
+    }
     final bash = BaoBash.cliEnvironment({
       ...Platform.environment,
       ...cli.environment,
@@ -321,6 +493,11 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
       settingsFilePath: settingsFile,
       inlineSettings: settingsMap,
     );
+
+    if (_closed) {
+      await cleanupAbortedSettings();
+      return;
+    }
 
     try {
       final proc = await Process.start(
@@ -343,10 +520,32 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
         includeParentEnvironment: Platform.isWindows,
         runInShell: cli.throughShell,
       );
+      if (_closed) {
+        unawaited(proc.stdin.close().catchError((Object _) {}));
+        if (Platform.isWindows) {
+          await _trackCleanup(_endTree(proc));
+        } else {
+          proc.kill();
+          await proc.exitCode
+              .timeout(
+                const Duration(seconds: 1),
+                onTimeout: () {
+                  proc.kill(ProcessSignal.sigkill);
+                  return -1;
+                },
+              )
+              .catchError((Object _) => -1);
+        }
+        await cleanupAbortedSettings();
+        return;
+      }
       _process = proc;
       _hasSentTurnOnProcess = false;
       _suppressingResumeReplay = false;
-      _needsAccountRespawn = false;
+      if (_accountSwitchEpoch == spawnEpoch &&
+          _accounts.currentAccount?.id == spawnAccountId) {
+        _needsAccountRespawn = false;
+      }
       unawaited(registry.add(proc.pid));
 
       _stdoutSub = proc.stdout
@@ -376,39 +575,54 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
     }
   }
 
-  Future<void> _recycleProcess() async {
-    if (_closed || _recycling) return;
-    _recycling = true;
-    try {
-      for (final entry in _pendingModelFetches.values) {
-        entry.fallbackTimer.cancel();
-      }
-      _pendingModelFetches.clear();
-      _internalControlIds.clear();
-      final old = _process;
-      _process = null;
-      await _stdoutSub?.cancel();
-      await _stderrSub?.cancel();
-      _stdoutSub = null;
-      _stderrSub = null;
-      if (_settingsFilePath case final path?) {
-        _settingsFilePath = null;
-        unawaited(ClaudeSettingsFile.delete(path));
-      }
-      if (old != null) {
-        unawaited(registry.remove(old.pid));
+  Future<void> _killProcessForRespawn() async {
+    _cancelPendingModelFetches();
+    _cancelPendingControlRequests();
+    _internalControlIds.clear();
+    final old = _process;
+    _process = null;
+    await _stdoutSub?.cancel();
+    await _stderrSub?.cancel();
+    _stdoutSub = null;
+    _stderrSub = null;
+    if (_settingsFilePath case final path?) {
+      _settingsFilePath = null;
+      unawaited(_trackCleanup(ClaudeSettingsFile.delete(path)));
+    }
+    if (old != null) {
+      unawaited(registry.remove(old.pid));
+      if (Platform.isWindows) {
+        await _trackCleanup(_endTree(old, immediate: true));
+        unawaited(old.stdin.close().catchError((Object _) {}));
+      } else {
         unawaited(old.stdin.close().catchError((Object _) {}));
         old.kill();
-        await old.exitCode.timeout(
-          const Duration(seconds: 2),
-          onTimeout: () {
-            old.kill(ProcessSignal.sigkill);
-            return -1;
-          },
-        );
       }
-      if (!_closed) {
-        await _spawnProcess();
+      await old.exitCode.timeout(
+        const Duration(seconds: 2),
+        onTimeout: () {
+          old.kill(ProcessSignal.sigkill);
+          return -1;
+        },
+      );
+    }
+  }
+
+  Future<void> _recycleProcess() {
+    if (_closed) return Future.value();
+    if (_initialSpawnFuture case final initial?) return initial;
+    if (_recyclingFuture case final active?) return active;
+    _recycling = true;
+    late final Future<void> future;
+    future = () async {
+      var failed = false;
+      try {
+        do {
+          await _killProcessForRespawn();
+          if (_closed) return;
+          await _spawnProcess();
+          if (_closed) return;
+        } while (_needsAccountRespawn);
         if (_lastInitializeRequest case final prevInit?) {
           final reinitId = '_cyte_reinit_${++_internalSeq}';
           _internalControlIds.add(reinitId);
@@ -425,9 +639,50 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
             },
           });
         }
+      } on Object catch (error) {
+        failed = true;
+        _failQueuedWritesAfterRecycleError(error);
+      } finally {
+        _recycling = false;
+        if (identical(_recyclingFuture, future)) {
+          _recyclingFuture = null;
+        }
       }
-    } finally {
-      _recycling = false;
+      if (!failed) {
+        _drainQueuedWritesAfterRecycle();
+      }
+    }();
+    _recyclingFuture = future;
+    return future;
+  }
+
+  void _failQueuedWritesAfterRecycleError(Object error) {
+    _turnInFlight = false;
+    final queued = [..._queuedWritesDuringRecycle];
+    _queuedWritesDuringRecycle.clear();
+    if (_closed || _messages.isClosed) return;
+    for (final msg in queued) {
+      if (msg['type'] == 'user') {
+        _messages.add({
+          'type': 'result',
+          'subtype': 'error',
+          'is_error': true,
+          'result': 'CodeBuddy 进程重启失败：$error',
+        });
+      }
+    }
+  }
+
+  void _drainQueuedWritesAfterRecycle() {
+    while (!_closed && _queuedWritesDuringRecycle.isNotEmpty) {
+      if (_recyclingFuture != null) return;
+      final next = _queuedWritesDuringRecycle.first;
+      if (next['type'] == 'user' && _needsAccountRespawn) {
+        unawaited(_recycleProcess());
+        return;
+      }
+      _queuedWritesDuringRecycle.removeAt(0);
+      _dispatchWrite(next);
     }
   }
 
@@ -603,7 +858,7 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
           (resp['response'] as Map?)?.cast<String, Object?>() ?? const {};
       if (payload['account'] case final Map rawAcc) {
         unawaited(
-          CodeBuddyAccounts.instance.syncFromCliInitializeAccount(
+          _accounts.syncFromCliInitializeAccount(
             rawAcc.cast<String, Object?>(),
           ),
         );
@@ -637,6 +892,9 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
       return null;
     }
 
+    // 4. Cancel any timeout fallback timer for forwarded client control requests
+    // and pass both `success` and `error` responses through untouched.
+    _pendingControlRequests.remove(reqId)?.fallbackTimer.cancel();
     return message;
   }
 
@@ -647,9 +905,12 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
         (origMessage['response'] as Map?)?.cast<String, Object?>() ?? const {};
     final payload =
         (resp['response'] as Map?)?.cast<String, Object?>() ?? const {};
-    final activeAccount = CodeBuddyAccounts.instance.currentAccount;
+    final activeAccount = _accounts.currentAccount;
+    final rawCommands = payload['commands'];
+    final hasCommands = rawCommands is List && rawCommands.isNotEmpty;
     final normalizedPayload = <String, Object?>{
       ...payload,
+      if (!hasCommands) 'commands': codebuddyBuiltinCommands,
       'account': {
         'subscriptionType': activeAccount != null
             ? 'CodeBuddy (${activeAccount.region.shortBadge} · ${activeAccount.edition.label})'
@@ -864,7 +1125,7 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
     final turnCredits = _turnCreditsReported;
 
     unawaited(
-      CodeBuddyAccounts.instance.recordTurnUsage(
+      _accounts.recordTurnUsage(
         credits: turnCredits,
         tokens: tokens,
         quotaExhausted: quotaExhausted,
@@ -891,16 +1152,16 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
   }
 
   void _onProcessExit(Process proc, int code) {
-    for (final entry in _pendingModelFetches.values) {
-      entry.fallbackTimer.cancel();
-    }
-    _pendingModelFetches.clear();
+    unawaited(registry.remove(proc.pid));
+    if ((_recycling && !_closed) || _process != proc) return;
+    _process = null;
+    _cancelPendingModelFetches();
+    _cancelPendingControlRequests();
+    _internalControlIds.clear();
     if (_settingsFilePath case final path?) {
       _settingsFilePath = null;
-      unawaited(ClaudeSettingsFile.delete(path));
+      unawaited(_trackCleanup(ClaudeSettingsFile.delete(path)));
     }
-    unawaited(registry.remove(proc.pid));
-    if (_recycling || _process != proc) return;
     _live.remove(this);
     if (!_messages.isClosed) {
       _messages
@@ -913,7 +1174,7 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
         )
         ..close();
     }
-    if (!_exited.isCompleted) {
+    if (_closeCleanupFuture == null && !_exited.isCompleted) {
       _exited.complete();
     }
   }
@@ -1056,6 +1317,19 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
   void write(Map<String, Object?> message) {
     if (_closed) return;
     final type = message['type'] as String?;
+    if (_recyclingFuture != null || (type == 'user' && _needsAccountRespawn)) {
+      _queuedWritesDuringRecycle.add(message);
+      if (_recyclingFuture == null) {
+        unawaited(_recycleProcess());
+      }
+      return;
+    }
+    _dispatchWrite(message);
+  }
+
+  void _dispatchWrite(Map<String, Object?> message) {
+    if (_closed) return;
+    final type = message['type'] as String?;
     if (type == 'control_request') {
       _handleControlRequest(message);
       return;
@@ -1072,15 +1346,6 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
       _turnInFlight = true;
       _turnCreditsReported = 0.0;
       _turnTokensReported = 0;
-      if (_needsAccountRespawn) {
-        unawaited(
-          _recycleProcess().then((_) {
-            _hasSentTurnOnProcess = true;
-            _writeRaw(message);
-          }),
-        );
-        return;
-      }
       _hasSentTurnOnProcess = true;
     }
     _writeRaw(message);
@@ -1248,9 +1513,41 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
         });
       case 'interrupt':
       case 'mcp_message':
-      case 'reconnect_mcp':
       case 'steer':
         _writeRaw(message);
+      case 'mcp_status':
+        _forwardWithFallback(
+          message,
+          requestId,
+          subtype,
+          const {'mcpServers': <Object?>[]},
+        );
+      case 'mcp_toggle':
+      case 'mcp_reconnect':
+      case 'reconnect_mcp':
+      case 'mcp_authenticate':
+      case 'stop_task':
+      case 'background_tasks':
+        _forwardWithFallback(
+          message,
+          requestId,
+          subtype,
+          const <String, Object?>{},
+        );
+      case 'file_suggestions':
+        _forwardWithFallback(
+          message,
+          requestId,
+          subtype,
+          const {'suggestions': <Object?>[]},
+        );
+      case 'get_hooks_listing':
+        _forwardWithFallback(
+          message,
+          requestId,
+          subtype,
+          const {'hooks': <Object?>[]},
+        );
       case 'get_settings':
         respondSuccess({
           'applied': {
@@ -1289,10 +1586,123 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
         }
         respondSuccess(const {'cancelled': true});
       case 'get_usage':
-        respondSuccess(const {'rate_limits_available': false});
+        unawaited(_handleGetUsage(requestId));
       default:
         respondSuccess();
     }
+  }
+
+  void _forwardWithFallback(
+    Map<String, Object?> message,
+    String requestId,
+    String subtype,
+    Map<String, Object?> fallbackPayload,
+  ) {
+    _pendingControlRequests.remove(requestId)?.fallbackTimer.cancel();
+    final timer = Timer(_fallbackTimeoutFor(subtype), () {
+      final removed = _pendingControlRequests.remove(requestId);
+      if (removed == null || _closed || _messages.isClosed) return;
+      _messages.add({
+        'type': 'control_response',
+        'response': {
+          'subtype': 'success',
+          'request_id': requestId,
+          'response': fallbackPayload,
+        },
+      });
+    });
+    _pendingControlRequests[requestId] = (
+      subtype: subtype,
+      fallbackTimer: timer,
+    );
+    _writeRaw(message);
+  }
+
+  Future<void> _handleGetUsage(String requestId) async {
+    try {
+      await _accounts.ensureInitialized();
+    } on Object {
+      // Fall back to whatever accounts are already loaded in memory.
+    }
+    if (_closed || _messages.isClosed) return;
+    final payload = buildUsagePayload(_accounts.currentAccount);
+    _messages.add({
+      'type': 'control_response',
+      'response': {
+        'subtype': 'success',
+        'request_id': requestId,
+        'response': payload,
+      },
+    });
+  }
+
+  @visibleForTesting
+  static Map<String, Object?> buildUsagePayload(CodeBuddyAccount? account) {
+    final quota = account?.quota;
+    if (account == null || quota == null) {
+      return const {'rate_limits_available': false};
+    }
+    final activePackages = [
+      for (final pkg in quota.packages)
+        if (pkg.total > 0) pkg,
+    ];
+    final hasCreditTotals =
+        quota.totalCredits != null && quota.totalCredits! > 0;
+    if (activePackages.isEmpty &&
+        !hasCreditTotals &&
+        !quota.unlimited &&
+        !quota.quotaExhausted) {
+      return const {'rate_limits_available': false};
+    }
+
+    final windows = <Map<String, Object?>>[];
+    if (activePackages.isNotEmpty) {
+      for (final pkg in activePackages) {
+        final remainFraction = (pkg.remain / pkg.total).clamp(0.0, 1.0);
+        final usedPct = ((1.0 - remainFraction) * 100.0).clamp(0.0, 100.0);
+        final resetsAt = _normalizeResetIso(pkg.expireTime ?? quota.resetTime);
+        windows.add({
+          'label': pkg.displayTitle,
+          'utilization': usedPct,
+          'resets_at': ?resetsAt,
+        });
+      }
+    } else {
+      final usedPct = quota.unlimited
+          ? 0.0
+          : quota.quotaExhausted
+          ? 100.0
+          : ((1.0 - quota.remainingFraction) * 100.0).clamp(0.0, 100.0);
+      final pkgName = quota.subscriptionPackageName?.trim();
+      final label = (pkgName != null && pkgName.isNotEmpty)
+          ? pkgName
+          : 'CodeBuddy ${account.edition.label}';
+      final resetsAt = _normalizeResetIso(quota.resetTime);
+      windows.add({
+        'label': label,
+        'utilization': usedPct,
+        'resets_at': ?resetsAt,
+      });
+    }
+
+    return {
+      'rate_limits_available': true,
+      'subscription_type':
+          'CodeBuddy (${account.region.shortBadge} · ${account.edition.label})',
+      'rate_limits': {'windows': windows},
+    };
+  }
+
+  static String? _normalizeResetIso(String? raw) {
+    if (raw == null) return null;
+    final trimmed = raw.trim();
+    if (trimmed.isEmpty) return null;
+    var parsed = DateTime.tryParse(trimmed);
+    if (parsed == null) {
+      final normalized = trimmed.replaceFirst(' ', 'T');
+      parsed = DateTime.tryParse(normalized);
+    }
+    return parsed?.toUtc().toIso8601String();
   }
 
   void _appendCustomTitleToTranscript(String sessionId, String title) {
@@ -1337,29 +1747,115 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
   void close() {
     if (_closed) return;
     _closed = true;
+    _queuedWritesDuringRecycle.clear();
     _live.remove(this);
-    for (final entry in _pendingModelFetches.values) {
-      entry.fallbackTimer.cancel();
-    }
-    _pendingModelFetches.clear();
+    _cancelPendingModelFetches();
+    _cancelPendingControlRequests();
+    _internalControlIds.clear();
     final proc = _process;
-    if (proc == null) {
-      if (!_exited.isCompleted) _exited.complete();
+    final hasPendingWork =
+        proc != null ||
+        _spawningFuture != null ||
+        _initialSpawnFuture != null ||
+        _recyclingFuture != null ||
+        _pendingCleanupFutures.isNotEmpty ||
+        _settingsFilePath != null;
+    if (!hasPendingWork) {
+      if (!_messages.isClosed) {
+        unawaited(_messages.close());
+      }
+      if (!_exited.isCompleted) {
+        _exited.complete();
+      }
       return;
     }
-    unawaited(proc.stdin.close().catchError((Object _) {}));
-    if (Platform.isWindows) {
-      unawaited(_endTree(proc));
-    } else {
-      proc.kill();
+    if (proc != null) {
+      if (Platform.isWindows) {
+        unawaited(_trackCleanup(_endTree(proc, immediate: true)));
+        unawaited(proc.stdin.close().catchError((Object _) {}));
+      } else {
+        unawaited(proc.stdin.close().catchError((Object _) {}));
+        proc.kill();
+      }
+    }
+    final closeFuture = _closeCleanupFuture ??= _finalizeClose();
+    _trackStop(closeFuture);
+  }
+
+  Future<void> _finalizeClose() async {
+    try {
+      while (true) {
+        final pending = <Future<void>>[
+          ?_spawningFuture,
+          ?_initialSpawnFuture,
+          ?_recyclingFuture,
+          ..._pendingCleanupFutures,
+        ];
+        if (pending.isEmpty) break;
+        for (final f in pending) {
+          try {
+            await f;
+          } on Object {
+            // Ignore spawn/cleanup failures during close; finalization completes.
+          }
+        }
+      }
+
+      final proc = _process;
+      if (proc != null) {
+        try {
+          await proc.exitCode.timeout(
+            const Duration(seconds: 2),
+            onTimeout: () {
+              proc.kill(ProcessSignal.sigkill);
+              return -1;
+            },
+          );
+        } on Object {
+          // Proceed to cleanup if exitCode fails.
+        }
+        if (identical(_process, proc)) {
+          _process = null;
+        }
+      }
+
+      await _stdoutSub?.cancel();
+      await _stderrSub?.cancel();
+      _stdoutSub = null;
+      _stderrSub = null;
+
+      while (_pendingCleanupFutures.isNotEmpty) {
+        for (final f in [..._pendingCleanupFutures]) {
+          try {
+            await f;
+          } on Object {
+            // Best-effort drain for cleanup futures triggered on process exit.
+          }
+        }
+      }
+
+      if (_settingsFilePath case final path?) {
+        _settingsFilePath = null;
+        await ClaudeSettingsFile.delete(path);
+      }
+    } finally {
+      _live.remove(this);
+      if (!_messages.isClosed) {
+        await _messages.close();
+      }
+      if (!_exited.isCompleted) {
+        _exited.complete();
+      }
     }
   }
 
-  Future<void> _endTree(Process proc) async {
-    final ended = await proc.exitCode
-        .timeout(const Duration(seconds: 1))
-        .then((_) => true, onError: (Object _) => false);
-    if (ended) return;
+  Future<void> _endTree(Process proc, {bool immediate = false}) async {
+    if (!immediate) {
+      final ended = await proc.exitCode
+          .timeout(const Duration(seconds: 1))
+          .then((_) => true, onError: (Object _) => false);
+      if (ended) return;
+    }
     try {
       await Process.run('taskkill', ['/pid', '${proc.pid}', '/T', '/F']);
     } on ProcessException {

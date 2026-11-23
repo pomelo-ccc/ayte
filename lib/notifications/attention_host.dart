@@ -7,12 +7,49 @@ import 'system_sounds_stub.dart'
     if (dart.library.io) 'system_sounds_io.dart'
     as platform;
 
+/// One agent entry shown in the tray / menu bar panel.
+@immutable
+class TrayAgent {
+  const TrayAgent({
+    required this.id,
+    required this.title,
+    this.project = '',
+    this.detail = '',
+  });
+
+  final String id;
+  final String title;
+  final String project;
+  final String detail;
+
+  Map<String, Object?> get encoded => {
+    'id': id,
+    'title': title,
+    if (project.isNotEmpty) 'project': project,
+    if (detail.isNotEmpty) 'detail': detail,
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is TrayAgent &&
+      other.id == id &&
+      other.title == title &&
+      other.project == project &&
+      other.detail == detail;
+
+  @override
+  int get hashCode => Object.hash(id, title, project, detail);
+}
+
 /// The menu bar / system tray icon as it should be.
 @immutable
 class TrayState {
   const TrayState({
     required this.dot,
     required this.waiting,
+    this.running = const [],
+    this.unread = const [],
+    this.badgeCount = 0,
     required this.tooltip,
     required this.labels,
   });
@@ -21,19 +58,28 @@ class TrayState {
   final bool dot;
 
   /// The agents waiting on the user, by id, their menu's items.
-  final List<({String id, String title})> waiting;
+  final List<TrayAgent> waiting;
+
+  /// The agents currently running in the background.
+  final List<TrayAgent> running;
+
+  /// The agents that finished while out of view.
+  final List<TrayAgent> unread;
+
+  /// Total count needing attention (waiting + unread).
+  final int badgeCount;
 
   final String tooltip;
 
-  /// The menu's own words: `show`, `waiting`, `quit`, and `running` (how
-  /// many run) when any do.
+  /// The menu's / popover's localized words.
   final Map<String, String> labels;
 
   Map<String, Object?> get encoded => {
     'dot': dot,
-    'waiting': [
-      for (final agent in waiting) {'id': agent.id, 'title': agent.title},
-    ],
+    'badgeCount': badgeCount,
+    'waiting': [for (final agent in waiting) agent.encoded],
+    'running': [for (final agent in running) agent.encoded],
+    'unread': [for (final agent in unread) agent.encoded],
     'tooltip': tooltip,
     'labels': labels,
   };
@@ -42,13 +88,23 @@ class TrayState {
   bool operator ==(Object other) =>
       other is TrayState &&
       other.dot == dot &&
+      other.badgeCount == badgeCount &&
       listEquals(other.waiting, waiting) &&
+      listEquals(other.running, running) &&
+      listEquals(other.unread, unread) &&
       other.tooltip == tooltip &&
       mapEquals(other.labels, labels);
 
   @override
-  int get hashCode =>
-      Object.hash(dot, Object.hashAll(waiting), tooltip, labels.length);
+  int get hashCode => Object.hash(
+    dot,
+    badgeCount,
+    Object.hashAll(waiting),
+    Object.hashAll(running),
+    Object.hashAll(unread),
+    tooltip,
+    labels.length,
+  );
 }
 
 /// The system's side of notifying: what the native window does over

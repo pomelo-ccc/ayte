@@ -937,10 +937,26 @@ class ChatComposerState extends State<ChatComposer>
   /// The color theme's colors [_editor] was built with.
   WorkbenchColors? _editorColors;
 
+  List<Suggestion>? _lastCommandVocabulary;
+
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
     _editor = null;
+    final vocabulary = ComposerVocabulary.of(context);
+    if (!identical(vocabulary.commands, _lastCommandVocabulary)) {
+      _lastCommandVocabulary = vocabulary.commands;
+      final trigger = _trigger;
+      if (trigger != null && trigger.kind == SuggestionKind.command) {
+        _matches = rankGroupedSuggestions(vocabulary.commands, trigger.query);
+        if (trigger.start > 0 && _matches.isEmpty) {
+          _trigger = null;
+          _syncMenuRegistration();
+        } else {
+          _highlighted = _highlighted.clamp(0, math.max(0, _matches.length - 1));
+        }
+      }
+    }
   }
 
   // --- Editor state --------------------------------------------------------
@@ -1174,7 +1190,7 @@ class ChatComposerState extends State<ChatComposer>
         trigger != null &&
         trigger.kind == SuggestionKind.command &&
         trigger.start > 0) {
-      commands = rankSuggestions(vocabulary.commands, trigger.query);
+      commands = rankGroupedSuggestions(vocabulary.commands, trigger.query);
       visible = commands.isNotEmpty;
     }
 
@@ -1189,7 +1205,8 @@ class ChatComposerState extends State<ChatComposer>
           }
         } else {
           _matches =
-              commands ?? rankSuggestions(vocabulary.commands, trigger.query);
+              commands ??
+              rankGroupedSuggestions(vocabulary.commands, trigger.query);
         }
         _highlighted = 0;
       }
@@ -1265,6 +1282,10 @@ class ChatComposerState extends State<ChatComposer>
     // A space, a line's end, or a tag's either end.
     bool isBoundary(String char) =>
         char.trim().isEmpty || char == MdAtoms.open || char == MdAtoms.close;
+    // Chinese/fullwidth punctuation may immediately precede a `/` command
+    // (e.g. `好的，/plan`) without false-triggering on paths or URLs.
+    bool isCommandStartBoundary(String char) =>
+        isBoundary(char) || _cjkCommandPunctuation.contains(char);
     // Only at the end of a query: a caret moved into existing text (e.g.
     // `/re|view`) is not typing one.
     if (caret < text.length && !isBoundary(text[caret])) return null;
@@ -1278,15 +1299,19 @@ class ChatComposerState extends State<ChatComposer>
     for (var i = caret - 1; i >= 0; i--) {
       final char = text[i];
       if (isBoundary(char)) return null;
-      if (i > 0 && !isBoundary(text[i - 1])) continue;
       final query = text.substring(i + 1, caret);
-      if (char == '/') return _Trigger(SuggestionKind.command, i, query);
+      if (char == '/' && (i == 0 || isCommandStartBoundary(text[i - 1]))) {
+        return _Trigger(SuggestionKind.command, i, query);
+      }
+      if (i > 0 && !isBoundary(text[i - 1])) continue;
       if (char == '@' && mentions) {
         return _Trigger(SuggestionKind.file, i, query);
       }
     }
     return null;
   }
+
+  static const _cjkCommandPunctuation = '，。！？；：、（）【】「」『』《》“”‘’';
 
   /// Horizontal caret position of [offset] relative to the composer box.
   double _caretX(int offset) {

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:path/path.dart' as p;
 
 import '../../network/network_proxy_io.dart';
@@ -34,38 +35,30 @@ class ClaudeCliTransport implements ClaudeCodeTransport {
           if (_stderr.length >= 40) _stderr.removeAt(0);
           _stderr.add(line);
         });
-    unawaited(
-      _process.exitCode.then((code) async {
-        await _stdoutSub.cancel();
-        await _stderrSub.cancel();
-        _live.remove(this);
-        _cleanupSettingsFile();
-        if (!_messages.isClosed) {
-          _messages.add(
-            ClaudeExit.message(
-              code,
-              _stderr.join('\n').trim(),
-              executable: _executable,
-            ),
-          );
-          await _messages.close();
-        }
-        if (!_exited.isCompleted) _exited.complete();
-      }),
-    );
+    unawaited(_process.exitCode.then(_finalizeExit));
   }
 
   static final Set<ClaudeCliTransport> _live = {};
+  static final Set<Future<void>> _pendingStops = {};
 
   static Future<void> stopAll() async {
-    for (final t in [..._live]) {
+    final live = [..._live];
+    for (final t in live) {
       t.close();
     }
+    final pendingStops = [..._pendingStops];
+    if (live.isEmpty && pendingStops.isEmpty) return;
+    await Future.wait([
+      for (final t in live)
+        t.exited.timeout(const Duration(seconds: 5), onTimeout: () {}),
+      for (final stop in pendingStops)
+        stop.timeout(const Duration(seconds: 5), onTimeout: () {}),
+    ]);
   }
 
   final Process _process;
   final String _executable;
-  final String? _settingsFilePath;
+  String? _settingsFilePath;
   late final StreamSubscription<String> _stdoutSub;
   late final StreamSubscription<String> _stderrSub;
   final StreamController<Map<String, Object?>> _messages =
@@ -73,6 +66,23 @@ class ClaudeCliTransport implements ClaudeCodeTransport {
   final Completer<void> _exited = Completer<void>();
   final List<String> _stderr = [];
   bool _closed = false;
+  Future<void>? _terminationFuture;
+  Future<void>? _finalizeFuture;
+
+  @visibleForTesting
+  String? get settingsFilePathForTesting => _settingsFilePath;
+
+  @visibleForTesting
+  static Map<String, String> enrichEnvironmentForTesting(
+    Map<String, String> base, {
+    bool? forceWindows,
+  }) => _enrichedPath(base, forceWindows: forceWindows);
+
+  @visibleForTesting
+  static String? locateClaudeForTesting(
+    Map<String, String> env, {
+    bool? forceWindows,
+  }) => _locateClaude(env, forceWindows: forceWindows);
 
   @override
   Stream<Map<String, Object?>> get messages => _messages.stream;
@@ -86,7 +96,16 @@ class ClaudeCliTransport implements ClaudeCodeTransport {
     }
     final base = await ClaudeEnvironment.of();
     final proxy = await NetworkProxy.instance.environment();
-    final env = _enrichedPath({...base, ...proxy});
+    final combined = <String, String>{...base};
+    for (final entry in proxy.entries) {
+      if (Platform.isWindows) {
+        combined.removeWhere(
+          (k, _) => k.toLowerCase() == entry.key.toLowerCase(),
+        );
+      }
+      combined[entry.key] = entry.value;
+    }
+    final env = _enrichedPath(combined);
     final executable = _locateClaude(env);
     if (executable == null) {
       throw const ClaudeUnavailable(
@@ -115,7 +134,11 @@ class ClaudeCliTransport implements ClaudeCodeTransport {
       return ClaudeCliTransport._(process, executable, settingsFilePath);
     } on Object catch (error) {
       if (settingsFilePath != null) {
-        ClaudeSettingsFile.delete(settingsFilePath);
+        try {
+          await ClaudeSettingsFile.delete(settingsFilePath);
+        } on Object {
+          // Ignore settings cleanup error.
+        }
       }
       throw ClaudeUnavailable(
         '无法启动 Claude Code CLI ($executable)',
@@ -153,65 +176,247 @@ class ClaudeCliTransport implements ClaudeCodeTransport {
   void close() {
     if (_closed) return;
     _closed = true;
-    try {
-      unawaited(_process.stdin.close());
-    } on Object {
-      // Ignore.
+    if (_exited.isCompleted) {
+      _live.remove(this);
+      return;
     }
-    _process.kill(ProcessSignal.sigterm);
-    _cleanupSettingsFile();
+    if (_finalizeFuture case final fin?) {
+      _pendingStops.add(fin);
+      unawaited(
+        fin.then<void>((_) {}, onError: (Object _) {}).whenComplete(() {
+          _pendingStops.remove(fin);
+        }),
+      );
+      return;
+    }
+    final stopFuture = _stopAndFinalize();
+    _pendingStops.add(stopFuture);
+    unawaited(
+      stopFuture.then<void>((_) {}, onError: (Object _) {}).whenComplete(() {
+        _pendingStops.remove(stopFuture);
+      }),
+    );
   }
 
-  void _cleanupSettingsFile() {
+  Future<void> _stopAndFinalize() async {
     try {
-      if (_settingsFilePath case final path?) {
-        ClaudeSettingsFile.delete(path);
+      await _terminateProcessTree();
+      final code = await _awaitProcessExitBounded(_process);
+      await _finalizeExit(code);
+    } finally {
+      _live.remove(this);
+      if (!_exited.isCompleted) {
+        _exited.complete();
       }
+    }
+  }
+
+  Future<void> _terminateProcessTree() {
+    if (_terminationFuture case final existing?) return existing;
+    final future = _runTerminateProcessTree();
+    _terminationFuture = future;
+    return future;
+  }
+
+  Future<void> _runTerminateProcessTree() async {
+    if (Platform.isWindows) {
+      try {
+        await Process.run('taskkill', ['/pid', '${_process.pid}', '/T', '/F']);
+      } on Object {
+        try {
+          _process.kill();
+        } on Object {
+          // Ignore if already exited.
+        }
+      }
+      try {
+        unawaited(_process.stdin.close().catchError((Object _) {}));
+      } on Object {
+        // Ignore.
+      }
+    } else {
+      try {
+        unawaited(_process.stdin.close().catchError((Object _) {}));
+      } on Object {
+        // Ignore.
+      }
+      try {
+        _process.kill(ProcessSignal.sigterm);
+      } on Object {
+        // Ignore if already exited.
+      }
+    }
+  }
+
+  Future<int> _awaitProcessExitBounded(
+    Process proc, {
+    Duration timeout = const Duration(seconds: 2),
+  }) async {
+    try {
+      return await proc.exitCode.timeout(
+        timeout,
+        onTimeout: () {
+          try {
+            proc.kill(ProcessSignal.sigkill);
+          } on Object {
+            // Ignore.
+          }
+          return -1;
+        },
+      );
+    } on Object {
+      return -1;
+    }
+  }
+
+  Future<void> _finalizeExit(int code) =>
+      _finalizeFuture ??= _doFinalizeExit(code);
+
+  Future<void> _doFinalizeExit(int code) async {
+    try {
+      if (_terminationFuture case final term?) {
+        await term;
+      }
+      await _stdoutSub.cancel();
+      await _stderrSub.cancel();
+      await _cleanupSettingsFile();
+      if (!_messages.isClosed) {
+        _messages.add(
+          ClaudeExit.message(
+            code,
+            _stderr.join('\n').trim(),
+            executable: _executable,
+          ),
+        );
+        await _messages.close();
+      }
+    } finally {
+      _live.remove(this);
+      if (!_exited.isCompleted) _exited.complete();
+    }
+  }
+
+  Future<void> _cleanupSettingsFile() async {
+    final path = _settingsFilePath;
+    if (path == null) return;
+    _settingsFilePath = null;
+    try {
+      await ClaudeSettingsFile.delete(path);
     } on Object {
       // Ignore.
     }
   }
 
-  static Map<String, String> _enrichedPath(Map<String, String> base) {
-    final home =
-        base['HOME'] ??
-        base['USERPROFILE'] ??
-        Platform.environment['HOME'] ??
-        Platform.environment['USERPROFILE'] ??
+  static String? _nonEmptyEnv(String? value) =>
+      (value != null && value.trim().isNotEmpty) ? value.trim() : null;
+
+  static String? _lookupEnvVar(
+    Map<String, String> env,
+    String name, {
+    required bool win,
+  }) {
+    final direct = _nonEmptyEnv(env[name]);
+    if (direct != null) return direct;
+    if (win) {
+      final lower = name.toLowerCase();
+      for (final entry in env.entries) {
+        if (entry.key.toLowerCase() == lower) {
+          final value = _nonEmptyEnv(entry.value);
+          if (value != null) return value;
+        }
+      }
+      for (final entry in env.entries) {
+        if (entry.key.toLowerCase() == lower) {
+          return '';
+        }
+      }
+    } else if (env.containsKey(name)) {
+      return _nonEmptyEnv(env[name]) ?? '';
+    }
+    return null;
+  }
+
+  static String _resolveHome(
+    Map<String, String> base, {
+    required bool win,
+  }) {
+    final baseHome = _lookupEnvVar(base, 'HOME', win: win);
+    if (baseHome != null && baseHome.isNotEmpty) return baseHome;
+    final baseUserProfile = _lookupEnvVar(base, 'USERPROFILE', win: win);
+    if (baseUserProfile != null && baseUserProfile.isNotEmpty) {
+      return baseUserProfile;
+    }
+    if (baseHome != null || baseUserProfile != null) {
+      return '';
+    }
+    final hostHome = _lookupEnvVar(Platform.environment, 'HOME', win: win);
+    if (hostHome != null && hostHome.isNotEmpty) return hostHome;
+    return _lookupEnvVar(Platform.environment, 'USERPROFILE', win: win) ?? '';
+  }
+
+  static Map<String, String> _withPath(
+    Map<String, String> base,
+    String pathValue, {
+    required bool win,
+  }) {
+    final result = <String, String>{};
+    for (final entry in base.entries) {
+      if (win && entry.key.toLowerCase() == 'path') continue;
+      result[entry.key] = entry.value;
+    }
+    result['PATH'] = pathValue;
+    return result;
+  }
+
+  static Map<String, String> _enrichedPath(
+    Map<String, String> base, {
+    bool? forceWindows,
+  }) {
+    final win = forceWindows ?? Platform.isWindows;
+    final home = _resolveHome(base, win: win);
+    final sep = win ? ';' : ':';
+    final rawPath =
+        _lookupEnvVar(base, 'PATH', win: win) ??
+        _lookupEnvVar(Platform.environment, 'PATH', win: win) ??
         '';
-    final sep = Platform.isWindows ? ';' : ':';
-    final existing = (base['PATH'] ?? Platform.environment['PATH'] ?? '')
+    final existing = rawPath
         .split(sep)
+        .map((s) => s.trim())
         .where((s) => s.isNotEmpty)
         .toList();
     final extras = <String>[
-      if (home.isNotEmpty && !Platform.isWindows) ...[
-        p.join(home, '.local', 'bin'),
-        p.join(home, '.hermes', 'node', 'bin'),
-        p.join(home, '.claude', 'local'),
-        p.join(home, '.bun', 'bin'),
+      if (home.isNotEmpty && !win) ...[
+        p.posix.join(home, '.local', 'bin'),
+        p.posix.join(home, '.hermes', 'node', 'bin'),
+        p.posix.join(home, '.claude', 'local'),
+        p.posix.join(home, '.bun', 'bin'),
         '/opt/homebrew/bin',
         '/usr/local/bin',
       ],
     ];
     final seen = <String>{};
-    final merged = [
-      for (final dir in [...extras, ...existing])
-        if (seen.add(dir)) dir,
-    ];
-    return {...base, 'PATH': merged.join(sep)};
+    final merged = <String>[];
+    for (final dir in [...existing, ...extras]) {
+      final key = win ? dir.toLowerCase() : dir;
+      if (seen.add(key)) merged.add(dir);
+    }
+    return _withPath(base, merged.join(sep), win: win);
   }
 
-  static String? _locateClaude(Map<String, String> env) {
-    final sep = Platform.isWindows ? ';' : ':';
-    final pathVar = env['PATH'] ?? '';
-    final exts = Platform.isWindows
-        ? const ['.cmd', '.exe', '.bat', '']
-        : const [''];
+  static String? _locateClaude(
+    Map<String, String> env, {
+    bool? forceWindows,
+  }) {
+    final win = forceWindows ?? Platform.isWindows;
+    final sep = win ? ';' : ':';
+    final pathVar = _lookupEnvVar(env, 'PATH', win: win) ?? '';
+    final exts = win ? const ['.cmd', '.exe', '.bat', ''] : const [''];
+    final join = win ? p.windows.join : p.posix.join;
     for (final dir in pathVar.split(sep)) {
-      if (dir.trim().isEmpty) continue;
+      final trimmed = dir.trim();
+      if (trimmed.isEmpty) continue;
       for (final ext in exts) {
-        final candidate = p.join(dir.trim(), 'claude$ext');
+        final candidate = join(trimmed, 'claude$ext');
         if (File(candidate).existsSync()) return candidate;
       }
     }

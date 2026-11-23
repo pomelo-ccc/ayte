@@ -151,7 +151,7 @@ class RawObjectReplElement implements DebugExpression, NestingReplElement {
   Json? get presentationHint => null;
 
   @override
-  Future<void> evaluateLazy() => throw UnimplementedError('Method not implemented.');
+  Future<void> evaluateLazy() async {}
 
   @override
   Future<List<DebugExpression>> getChildren() async => switch (valueObj) {
@@ -203,10 +203,24 @@ class ReplEvaluationResult extends ExpressionContainer implements ReplElement, D
     String context, {
     bool keepLazyVars = false,
     ({int line, int column, Json source})? location,
+    bool rethrowCancel = false,
   }) async {
-    final result = await super.evaluateExpression(expression, session, stackFrame, context);
+    final result = await super.evaluateExpression(
+      expression,
+      session,
+      stackFrame,
+      context,
+      keepLazyVars: keepLazyVars,
+      location: location,
+      rethrowCancel: rethrowCancel,
+    );
     _available = result;
     return result;
+  }
+
+  @override
+  void adoptLazyResponse(Json response) {
+    _available = true;
   }
 
   @override
@@ -311,12 +325,107 @@ class ReplModel extends ChangeNotifier {
   Future<void> addReplExpression(
     DebugSession session,
     StackFrame? stackFrame,
-    String expression,
-  ) async {
+    String expression, {
+    bool keepLazyVars = false,
+    ({int line, int column, Json source})? location,
+  }) async {
+    if (_disposed) return;
     _addReplElement(ReplEvaluationInput(expression));
     final result = ReplEvaluationResult(expression);
-    await result.evaluateExpression(expression, session, stackFrame, 'repl');
+    await result.evaluateExpression(
+      expression,
+      session,
+      stackFrame,
+      'repl',
+      keepLazyVars: keepLazyVars,
+      location: location,
+    );
+    if (_disposed) return;
     _addReplElement(result);
+  }
+
+  /// Resolves a lazy REPL [expression] (via DAP `variables` when it carries a
+  /// lazy `variablesReference`, or via DAP `evaluate` when re-evaluating a
+  /// deferred [ReplEvaluationResult]) and notifies console listeners.
+  Future<void> evaluateLazy(
+    DebugExpression expression, {
+    DebugSession? session,
+    StackFrame? stackFrame,
+    String context = 'repl',
+  }) async {
+    if (_disposed) return;
+    final activeSession = session ?? expression.getSession();
+    if (expression is ReplEvaluationResult) {
+      final ref = expression.reference;
+      final isLazy = expression.presentationHint?.flag('lazy') ?? false;
+      if (isLazy && ref != null && ref > 0) {
+        expression.session ??= activeSession;
+        final evalSession = expression.session;
+        if (evalSession == null ||
+            evalSession.isDisposed ||
+            evalSession.raw == null) {
+          return;
+        }
+        try {
+          await expression.evaluateLazy();
+        } on DebugCancelledError {
+          return;
+        } on Object catch (e) {
+          expression
+            ..value = errorMessage(e)
+            ..reference = 0
+            ..memoryReference = null
+            .._available = false;
+        }
+      } else if ((isLazy || expression.value.isEmpty) &&
+          activeSession != null &&
+          !activeSession.isDisposed &&
+          activeSession.raw != null &&
+          expression.originalExpression.isNotEmpty) {
+        try {
+          await expression.evaluateExpression(
+            expression.originalExpression,
+            activeSession,
+            stackFrame,
+            context,
+            rethrowCancel: true,
+          );
+        } on DebugCancelledError {
+          return;
+        }
+      } else {
+        return;
+      }
+    } else {
+      if (expression case final ExpressionContainer container) {
+        if (activeSession != null) {
+          container.session ??= activeSession;
+        }
+      }
+      final evalSession = expression.getSession();
+      if (evalSession == null ||
+          evalSession.isDisposed ||
+          evalSession.raw == null) {
+        if (expression is! ExpressionContainer) {
+          await expression.evaluateLazy();
+        }
+        return;
+      }
+      try {
+        await expression.evaluateLazy();
+      } on DebugCancelledError {
+        return;
+      } on Object catch (e) {
+        if (expression case final ExpressionContainer container) {
+          container
+            ..value = errorMessage(e)
+            ..reference = 0
+            ..memoryReference = null;
+        }
+      }
+    }
+    if (_disposed) return;
+    _changed(expression is ReplElement ? expression as ReplElement : null);
   }
 
   void appendToRepl(DebugSession session, NewReplElementData data) {

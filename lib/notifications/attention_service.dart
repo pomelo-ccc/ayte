@@ -123,8 +123,9 @@ class AttentionService {
 
   void _update() {
     var badge = 0;
-    var running = 0;
     final waiting = <AgentThread>[];
+    final running = <AgentThread>[];
+    final unread = <AgentThread>[];
     final threads = workspace.threads;
     for (final thread in threads) {
       final status = thread.status;
@@ -141,8 +142,9 @@ class AttentionService {
           waiting.add(thread);
         case ThreadStatus.unread:
           badge++;
+          unread.add(thread);
         case ThreadStatus.running:
-          running++;
+          running.add(thread);
         case ThreadStatus.idle:
       }
       if (before == null || before == status) continue;
@@ -167,30 +169,82 @@ class AttentionService {
       _badge = badge;
       unawaited(host.setBadge(badge));
     }
-    _updateTray(waiting, running);
+    _updateTray(waiting, running, unread, badge);
   }
 
-  void _updateTray(List<AgentThread> waiting, int running) {
+  void _updateTray(
+    List<AgentThread> waiting,
+    List<AgentThread> running,
+    List<AgentThread> unread,
+    int badge,
+  ) {
     if (!settings().tray) {
       if (_trayShown) unawaited(host.setTray(null));
       _trayShown = false;
       _tray = null;
       return;
     }
+    int byRecent(AgentThread a, AgentThread b) =>
+        b.updatedAt.compareTo(a.updatedAt);
+    waiting.sort(byRecent);
+    running.sort(byRecent);
+    unread.sort(byRecent);
+
     final l10n = this.l10n();
+    final tooltipParts = <String>[
+      if (waiting.isNotEmpty) l10n.trayWaitingCount(waiting.length),
+      if (running.isNotEmpty) l10n.trayRunning(running.length),
+      if (waiting.isEmpty && running.isEmpty && unread.isNotEmpty)
+        l10n.trayUnreadCount(unread.length),
+    ];
+    final tooltip = tooltipParts.isEmpty
+        ? 'Ayte'
+        : 'Ayte · ${tooltipParts.join(' · ')}';
     final tray = TrayState(
-      dot: (_badge ?? 0) > 0,
+      dot: badge > 0,
+      badgeCount: badge,
       waiting: [
         for (final thread in waiting)
-          (id: _id(thread), title: thread.localizedTitle(l10n)),
+          TrayAgent(
+            id: _id(thread),
+            title: thread.localizedTitle(l10n),
+            project: thread.project.name,
+            detail: _waitingDetail(thread, l10n),
+          ),
       ],
-      tooltip: waiting.isEmpty
-          ? 'Ayte'
-          : 'Ayte · ${l10n.trayWaitingCount(waiting.length)}',
+      running: [
+        for (final thread in running)
+          TrayAgent(
+            id: _id(thread),
+            title: thread.localizedTitle(l10n),
+            project: thread.project.name,
+            detail: thread.kernel.label,
+          ),
+      ],
+      unread: [
+        for (final thread in unread)
+          TrayAgent(
+            id: _id(thread),
+            title: thread.localizedTitle(l10n),
+            project: thread.project.name,
+            detail: _lastReply(thread) ?? l10n.attentionFinished,
+          ),
+      ],
+      tooltip: tooltip,
       labels: {
         'show': l10n.trayShow,
         'waiting': l10n.trayWaiting,
-        if (running > 0) 'running': l10n.trayRunning(running),
+        if (waiting.isNotEmpty)
+          'waitingCount': l10n.trayWaitingCount(waiting.length),
+        if (running.isNotEmpty) 'running': l10n.trayRunning(running.length),
+        'runningHeader': l10n.trayRunningHeader,
+        'unread': l10n.attentionFinished,
+        if (unread.isNotEmpty)
+          'unreadCount': l10n.trayUnreadCount(unread.length),
+        'idle': l10n.trayIdle,
+        'idleHint': l10n.trayIdleHint,
+        'newChat': l10n.sidebarNewAgent,
+        'settings': l10n.cmdOpenSettings,
         'quit': l10n.trayQuit,
       },
     );
@@ -198,6 +252,15 @@ class AttentionService {
     _trayShown = true;
     _tray = tray;
     unawaited(host.setTray(tray));
+  }
+
+  static String _waitingDetail(AgentThread thread, AppLocalizations l10n) {
+    final session = thread.session;
+    if (session.pendingInteraction == null && session.canStartPlan) {
+      return l10n.attentionPlanReady;
+    }
+    return _request(session.pendingInteraction, l10n) ??
+        l10n.attentionNeedsInput;
   }
 
   /// Whether the user is looking at [thread]: the window in front, the

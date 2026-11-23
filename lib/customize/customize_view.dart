@@ -145,6 +145,7 @@ class CustomizeViewState extends State<CustomizeView> {
   final _scroll = SmoothScrollController();
 
   List<Customization>? _items;
+  Map<String, Set<String>> _pluginSkillPrefixes = const {};
   Object? _error;
   int _generation = 0;
 
@@ -203,20 +204,128 @@ class CustomizeViewState extends State<CustomizeView> {
     unawaited(_load());
   }
 
+  String _pathKey(String path) {
+    final norm = _paths.normalize(path);
+    return _paths.style == p.Style.windows ? norm.toLowerCase() : norm;
+  }
+
+  bool _isWithin(String root, String child) {
+    final normRoot = _paths.normalize(root);
+    final normChild = _paths.normalize(child);
+    if (_paths.style == p.Style.windows) {
+      return _paths.isWithin(normRoot.toLowerCase(), normChild.toLowerCase());
+    }
+    return _paths.isWithin(normRoot, normChild);
+  }
+
+  bool _sameCustomization(Customization a, Customization b) =>
+      a.kind == b.kind &&
+      a.scope == b.scope &&
+      a.name == b.name &&
+      _pathKey(a.path) == _pathKey(b.path);
+
+  Map<String, Set<String>> _buildPluginSkillPrefixes(
+    List<Customization> skills,
+    List<Customization> plugins,
+  ) {
+    if (plugins.isEmpty) return const {};
+    final out = <String, Set<String>>{};
+    for (final plugin in plugins) {
+      final names = <String>{
+        if (plugin.name.trim().isNotEmpty) plugin.name.trim(),
+      };
+      String? rootDir;
+      if (plugin.detail case final detail? when detail.trim().isNotEmpty) {
+        try {
+          final decoded = jsonDecode(detail);
+          if (decoded is Map<String, Object?>) {
+            if (decoded['installPath'] case final String installPath
+                when installPath.trim().isNotEmpty) {
+              rootDir = installPath.trim();
+            }
+            if (decoded['plugin'] case final String pluginKey
+                when pluginKey.trim().isNotEmpty) {
+              final trimmedKey = pluginKey.trim();
+              names.add(trimmedKey);
+              final at = trimmedKey.indexOf('@');
+              if (at > 0) names.add(trimmedKey.substring(0, at));
+            }
+          }
+        } on Object {
+          // Ignore non-JSON detail.
+        }
+      }
+      if (rootDir == null && _paths.basename(plugin.path) == 'plugin.json') {
+        rootDir = _paths.dirname(plugin.path);
+        final dirName = _paths.basename(rootDir);
+        if (dirName.isNotEmpty) names.add(dirName);
+      }
+      if (rootDir == null || names.isEmpty) continue;
+      for (final skill in skills) {
+        if (skill.scope == CustomizationScope.plugin &&
+            _isWithin(rootDir, skill.path)) {
+          (out[_pathKey(skill.path)] ??= <String>{}).addAll(names);
+        }
+      }
+    }
+    return out;
+  }
+
+  Set<String> _skillPluginNames(Customization item) {
+    if (item.scope != CustomizationScope.plugin) return const {};
+    return {
+      ...?_pluginSkillPrefixes[_pathKey(item.path)],
+      ?ExtensionSwitches.skillPluginDirName(item.path),
+    };
+  }
+
+  bool _skillEnabled(ExtensionSwitches switches, Customization item) =>
+      !switches.matchesSkillDisabled(
+        item.name,
+        folderName: ExtensionSwitches.skillFolderName(item.path),
+        pluginNames: _skillPluginNames(item),
+      );
+
   Future<void> _load() async {
     final generation = ++_generation;
     try {
       final items = await widget.store.list(_kind, project: _projectPath);
+      Map<String, Set<String>> pluginSkillPrefixes = const {};
+      if (_kind == CustomizationKind.skills &&
+          items.any((item) => item.scope == CustomizationScope.plugin)) {
+        try {
+          final plugins = await widget.store.list(
+            CustomizationKind.plugins,
+            project: _projectPath,
+          );
+          pluginSkillPrefixes = _buildPluginSkillPrefixes(items, plugins);
+        } on Object {
+          pluginSkillPrefixes = const {};
+        }
+      }
       if (!mounted || generation != _generation) return;
       setState(() {
         _items = items;
+        _pluginSkillPrefixes = pluginSkillPrefixes;
         _error = null;
+        if (_open case final currentOpen?) {
+          for (final item in items) {
+            if (_sameCustomization(item, currentOpen)) {
+              _open = item;
+              break;
+            }
+          }
+        }
+        if (_kind == CustomizationKind.mcps) {
+          _clearDisabledProbes(_switches, items: items);
+        }
       });
       _probeNew();
     } on Object catch (error) {
       if (!mounted || generation != _generation) return;
       setState(() {
         _items = const [];
+        _pluginSkillPrefixes = const {};
         _error = error;
       });
     }
@@ -241,19 +350,34 @@ class CustomizeViewState extends State<CustomizeView> {
   String _probeKey(Customization item) =>
       jsonEncode([item.scope.name, item.name, item.server, _projectPath]);
 
+  bool _isMcpDisabled(Customization item) =>
+      item.enabled == false || _switches.matchesServerDisabled(item.name);
+
+  void _clearDisabledProbes(
+    ExtensionSwitches switches, {
+    List<Customization>? items,
+  }) {
+    for (final item in items ?? _items ?? const <Customization>[]) {
+      if (item.kind == CustomizationKind.mcps &&
+          (item.enabled == false || switches.matchesServerDisabled(item.name))) {
+        _probing.remove(_probeKey(item));
+      }
+    }
+  }
+
   /// Whether [item], an MCP server, can be asked: one of this machine's
   /// with a command or URL (not a claude.ai connector), turned on.
   bool _probeable(Customization item) =>
       item.kind == CustomizationKind.mcps &&
       item.server != null &&
-      item.enabled != false &&
+      !_isMcpDisabled(item) &&
       widget.store.isLocal &&
       CustomizeView.mcpProber != null;
 
   /// Where [item], an MCP server, stands; null for none to show.
   McpProbeResult? _statusOf(Customization item) {
     if (item.kind != CustomizationKind.mcps) return null;
-    if (item.enabled == false) return McpProbeResult.disabled;
+    if (_isMcpDisabled(item)) return McpProbeResult.disabled;
     if (!_probeable(item)) return null;
     return _probes[_probeKey(item)] ?? McpProbeResult.checking;
   }
@@ -305,13 +429,23 @@ class CustomizeViewState extends State<CustomizeView> {
       _kind == CustomizationKind.skills || _kind == CustomizationKind.mcps;
 
   void _switchesChanged() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    setState(() {
+      _clearDisabledProbes(_switches);
+    });
+    unawaited(_load());
   }
 
   Future<void> _switch(ExtensionSwitches switches) async {
-    setState(() => _switched = switches);
+    setState(() {
+      _switched = switches;
+      _clearDisabledProbes(switches);
+    });
     final save = ExtensionSwitches.save;
-    if (save == null) return;
+    if (save == null) {
+      _probeNew();
+      return;
+    }
     try {
       await save(switches);
     } on Object catch (error) {
@@ -320,6 +454,7 @@ class CustomizeViewState extends State<CustomizeView> {
     if (mounted && identical(_switched, switches)) {
       setState(() => _switched = null);
     }
+    if (mounted) _probeNew();
   }
 
   /// The MCP servers whose tools are shown, by [_groupKey].
@@ -338,8 +473,8 @@ class CustomizeViewState extends State<CustomizeView> {
     final switches = _switches;
     final l10n = context.l10n;
     final on = item.kind == CustomizationKind.mcps
-        ? switches.serverEnabled(item.name)
-        : switches.skillEnabled(item.name);
+        ? !switches.matchesServerDisabled(item.name)
+        : _skillEnabled(switches, item);
     return _RowSwitch(
       value: on,
       label: item.name,
@@ -348,7 +483,12 @@ class CustomizeViewState extends State<CustomizeView> {
         _switch(
           item.kind == CustomizationKind.mcps
               ? switches.withServer(item.name, enabled)
-              : switches.withSkills([item.name], enabled),
+              : switches.withSkillMatched(
+                  item.name,
+                  enabled,
+                  folderName: ExtensionSwitches.skillFolderName(item.path),
+                  pluginNames: _skillPluginNames(item),
+                ),
         ),
       ),
     );
@@ -405,7 +545,9 @@ class CustomizeViewState extends State<CustomizeView> {
     } on Object catch (error) {
       if (mounted) setState(() => _error = error);
     }
-    if (mounted && identical(_open, item)) setState(() => _open = null);
+    if (mounted && _open != null && _sameCustomization(_open!, item)) {
+      setState(() => _open = null);
+    }
     await _load();
   }
 
@@ -420,7 +562,12 @@ class CustomizeViewState extends State<CustomizeView> {
           child: _onIsland(
             open != null
                 ? _CustomizationEditor(
-                    key: ObjectKey(open),
+                    key: ValueKey((
+                      open.kind,
+                      open.scope,
+                      _pathKey(open.path),
+                      open.name,
+                    )),
                     item: open,
                     store: widget.store,
                     onBack: () {
@@ -541,6 +688,10 @@ class CustomizeViewState extends State<CustomizeView> {
               _kind == CustomizationKind.hooks)
             CustomizationScope.local,
         ],
+        if (_kind == CustomizationKind.skills ||
+            _kind == CustomizationKind.mcps ||
+            _kind == CustomizationKind.rules)
+          CustomizationScope.plugin,
       ],
     ];
     return ListView(
@@ -651,7 +802,9 @@ class CustomizeViewState extends State<CustomizeView> {
         configurable ||
         _kind == CustomizationKind.plugins ||
         _kind == CustomizationKind.memory ||
-        (_kind == CustomizationKind.mcps && scope != CustomizationScope.synced);
+        (_kind == CustomizationKind.mcps &&
+            scope != CustomizationScope.synced &&
+            scope != CustomizationScope.plugin);
     final searching = _query.text.trim().isNotEmpty;
     if (items.isEmpty && (searching || !shownEmpty)) return const [];
     return [
@@ -786,8 +939,8 @@ class CustomizeViewState extends State<CustomizeView> {
         ? _probes[_probeKey(item)]?.tools
         : null;
     final on = switch (item.kind) {
-      CustomizationKind.mcps => _switches.serverEnabled(item.name),
-      CustomizationKind.skills => _switches.skillEnabled(item.name),
+      CustomizationKind.mcps => !_switches.matchesServerDisabled(item.name),
+      CustomizationKind.skills => _skillEnabled(_switches, item),
       _ => true,
     };
     return _ItemRow(
@@ -812,7 +965,7 @@ class CustomizeViewState extends State<CustomizeView> {
   List<Widget> _toolRows(Customization server) {
     final l10n = context.l10n;
     final switches = _switches;
-    final serverOn = switches.serverEnabled(server.name);
+    final serverOn = !switches.matchesServerDisabled(server.name);
     return [
       for (final tool in _probes[_probeKey(server)]?.tools ?? const [])
         _ToolRow(
@@ -1380,6 +1533,17 @@ class _CustomizationEditorState extends State<_CustomizationEditor> {
       _load(detail);
     } else {
       unawaited(_read());
+    }
+  }
+
+  @override
+  void didUpdateWidget(_CustomizationEditor oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.item, widget.item) &&
+        !_item.editable &&
+        _item.detail != null &&
+        _item.detail != oldWidget.item.detail) {
+      _load(_item.detail!);
     }
   }
 

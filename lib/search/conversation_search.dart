@@ -82,6 +82,9 @@ ConversationHit? findIn(
   return snippetAt(sessionId, text, at, needle.length);
 }
 
+bool _isHighSurrogate(int unit) => unit >= 0xD800 && unit <= 0xDBFF;
+bool _isLowSurrogate(int unit) => unit >= 0xDC00 && unit <= 0xDFFF;
+
 /// The hit at [start] of [text], [length] long: a little before it, more
 /// after, on one line.
 ConversationHit snippetAt(
@@ -92,13 +95,42 @@ ConversationHit snippetAt(
   int before = 32,
   int after = 96,
 }) {
-  final end = (start + length).clamp(start, text.length);
-  final from = (start - before).clamp(0, start);
-  final to = (end + after).clamp(end, text.length);
+  var safeStart = start.clamp(0, text.length);
+  if (safeStart > 0 &&
+      safeStart < text.length &&
+      _isLowSurrogate(text.codeUnitAt(safeStart)) &&
+      _isHighSurrogate(text.codeUnitAt(safeStart - 1))) {
+    safeStart--;
+  }
+  var end = (safeStart + length).clamp(safeStart, text.length);
+  if (end > safeStart &&
+      end < text.length &&
+      _isHighSurrogate(text.codeUnitAt(end - 1)) &&
+      _isLowSurrogate(text.codeUnitAt(end))) {
+    end++;
+  }
+  var from = (safeStart - before).clamp(0, safeStart);
+  if (from > 0 &&
+      from < text.length &&
+      _isLowSurrogate(text.codeUnitAt(from)) &&
+      _isHighSurrogate(text.codeUnitAt(from - 1))) {
+    from--;
+  }
+  var to = (end + after).clamp(end, text.length);
+  if (to > 0 &&
+      to < text.length &&
+      _isHighSurrogate(text.codeUnitAt(to - 1)) &&
+      _isLowSurrogate(text.codeUnitAt(to))) {
+    if (to > end) {
+      to--;
+    } else {
+      to++;
+    }
+  }
   String flat(String part) => part.replaceAll(RegExp(r'\s+'), ' ');
-  final head = '${from > 0 ? '…' : ''}${flat(text.substring(from, start))}'
+  final head = '${from > 0 ? '…' : ''}${flat(text.substring(from, safeStart))}'
       .trimLeft();
-  final match = flat(text.substring(start, end));
+  final match = flat(text.substring(safeStart, end));
   final tail = '${flat(text.substring(end, to))}${to < text.length ? '…' : ''}';
   return ConversationHit(
     sessionId: sessionId,
