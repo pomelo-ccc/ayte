@@ -435,10 +435,10 @@ final class StashChannel {
 
   init(messenger: FlutterBinaryMessenger) {
     channel = FlutterMethodChannel(name: "baocode/stash", binaryMessenger: messenger)
+    voiceChannel = FlutterMethodChannel(name: "baocode/voice", binaryMessenger: messenger)
     channel.setMethodCallHandler { [weak self] call, result in
       self?.handle(call, result: result) ?? result(nil)
     }
-    voiceChannel = FlutterMethodChannel(name: "baocode/voice", binaryMessenger: messenger)
     voiceChannel.setMethodCallHandler { [weak self] call, result in
       self?.handleVoice(call, result: result) ?? result(nil)
     }

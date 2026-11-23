@@ -54,6 +54,8 @@ PLIST="$STAGE_DIR/Ayte.app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_VER" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :NSHumanReadableCopyright 'Copyright © 2026 Ayte. All rights reserved.'" "$PLIST" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Set :NSAppleEventsUsageDescription 'A program run in Ayte wants to control another app.'" "$PLIST" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Set :NSMicrophoneUsageDescription 'Ayte uses your microphone for voice input and hands-free voice conversation.'" "$PLIST" 2>/dev/null || \
+  /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string 'Ayte uses your microphone for voice input and hands-free voice conversation.'" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :NSLocalNetworkUsageDescription 'Ayte lets the phones paired with it find it on the local network.'" "$PLIST" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLName dev.ayte.desktop" "$PLIST" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 ayte" "$PLIST" 2>/dev/null || true
