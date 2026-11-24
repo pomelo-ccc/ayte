@@ -26,7 +26,7 @@ import '../ide/ide_hover.dart';
 import '../ide/ide_list.dart';
 import '../ide/ide_speed_search.dart';
 import '../ide/ide_spinning.dart';
-import '../kernel/agent_kernel.dart' show KernelChoiceKind;
+import '../kernel/agent_kernel.dart' show KernelChoiceKind, KernelDescriptor;
 import '../keybindings/chat_keybindings.dart';
 import '../keybindings/default_keybindings.dart' show openSettingsCommandId;
 import '../keybindings/keybinding_service.dart';
@@ -59,6 +59,7 @@ import '../theme/svg_icons.dart';
 
 enum SidebarGrouping {
   project('Project', Icons.folder_outlined),
+  kernel('Kernel', Icons.hub_outlined),
   time('Date', Icons.schedule_rounded),
   status('Status', Icons.radio_button_checked_rounded);
 
@@ -70,6 +71,7 @@ enum SidebarGrouping {
 
   String localizedLabel(AppLocalizations l10n) => switch (this) {
     project => l10n.sidebarGroupingProject,
+    kernel => l10n.sidebarGroupingKernel,
     time => l10n.sidebarGroupingDate,
     status => l10n.sidebarGroupingStatus,
   };
@@ -77,6 +79,7 @@ enum SidebarGrouping {
   /// `By project`, as the list's heading says how it is grouped.
   String localizedBy(AppLocalizations l10n) => switch (this) {
     project => l10n.sidebarByProject,
+    kernel => l10n.sidebarByKernel,
     time => l10n.sidebarByDate,
     status => l10n.sidebarByStatus,
   };
@@ -102,6 +105,7 @@ class _Group {
     this.label,
     this.threads, {
     this.project,
+    this.kernel,
     this.archivedOf,
   });
 
@@ -111,6 +115,9 @@ class _Group {
 
   /// Set for a project group, which can start a new agent there.
   final Project? project;
+
+  /// Set for a kernel group (e.g. Antigravity, CodeBuddy, Claude Code, Codex).
+  final KernelDescriptor? kernel;
 
   /// Set for a group of a folder's archived agents.
   final Project? archivedOf;
@@ -566,7 +573,8 @@ class _SidebarState extends State<Sidebar>
   _Rows _rows(_Group group) {
     if (_collapsed(group)) return (threads: const [], more: 0, less: false);
     final all = group.threads;
-    if (group.project == null || all.length <= _recent) {
+    if ((group.project == null && group.kernel == null) ||
+        all.length <= _recent) {
       return (threads: all, more: 0, less: false);
     }
     if (_workspace.isExpanded(group.id)) {
@@ -585,13 +593,16 @@ class _SidebarState extends State<Sidebar>
 
   /// A new agent nothing was sent to is listed only while it shows: one
   /// left for another is not worth a row.
-  bool _listed(AgentThread thread) =>
-      !_workspace.isHidden(thread.project) &&
-      _workspace.listsHost(thread.project.host) &&
-      TagStore.instance.matchesFilter(thread) &&
-      (!thread.untouched ||
-          identical(thread, _current) ||
-          _workspace.grid.contains(thread));
+  bool _listed(AgentThread thread) {
+    final kernelFilter = _workspace.sidebarKernelFilter;
+    return !_workspace.isHidden(thread.project) &&
+        _workspace.listsHost(thread.project.host) &&
+        (kernelFilter == null || thread.kernel.id == kernelFilter) &&
+        TagStore.instance.matchesFilter(thread) &&
+        (!thread.untouched ||
+            identical(thread, _current) ||
+            _workspace.grid.contains(thread));
+  }
 
   AgentThread? get _current => widget.current ?? _workspace.current;
 
@@ -998,6 +1009,19 @@ class _SidebarState extends State<Sidebar>
       return today.difference(DateTime(time.year, time.month, time.day)).inDays;
     }
 
+    final kernelFilter = _workspace.sidebarKernelFilter;
+    List<KernelDescriptor> orderedKernels() {
+      final seen = <String>{};
+      final result = <KernelDescriptor>[];
+      for (final k in _workspace.kernels) {
+        if (seen.add(k.id)) result.add(k);
+      }
+      for (final t in rest) {
+        if (seen.add(t.kernel.id)) result.add(t.kernel);
+      }
+      return result;
+    }
+
     return [
       // While an agent is dragged, a place to pin it, if none is yet.
       if (pinned.isNotEmpty || _pinZone)
@@ -1005,20 +1029,34 @@ class _SidebarState extends State<Sidebar>
       ...switch (_grouping) {
         SidebarGrouping.project => [
           for (final project in _workspace.sidebarProjectsHere)
-            _Group(
-              Workspace.projectGroup(project.path),
-              // Every host's together: a remote one's says where it is.
-              switch (project.host) {
-                final host? when _workspace.sidebarAllHosts =>
-                  '${project.name} · ${_workspace.hostLabel(host)}',
-                _ => project.name,
-              },
-              _workspace.inProjectOrder(
-                project,
-                where((thread) => thread.project == project),
+            if (kernelFilter == null ||
+                rest.any((t) => t.project == project) ||
+                pinned.any((t) => t.project == project))
+              _Group(
+                Workspace.projectGroup(project.path),
+                // Every host's together: a remote one's says where it is.
+                switch (project.host) {
+                  final host? when _workspace.sidebarAllHosts =>
+                    '${project.name} · ${_workspace.hostLabel(host)}',
+                  _ => project.name,
+                },
+                _workspace.inProjectOrder(
+                  project,
+                  where((thread) => thread.project == project),
+                ),
+                project: project,
               ),
-              project: project,
-            ),
+        ],
+        SidebarGrouping.kernel => [
+          for (final kernel in orderedKernels())
+            if (where((t) => t.kernel.id == kernel.id) case final list
+                when list.isNotEmpty)
+              _Group(
+                'kernel:${kernel.id}',
+                kernel.label,
+                list,
+                kernel: kernel,
+              ),
         ],
         SidebarGrouping.time => [
           _Group('today', l10n.sidebarToday, where((t) => daysAgo(t) <= 0)),
@@ -1532,6 +1570,29 @@ class _SidebarState extends State<Sidebar>
     final allCollapsed =
         canCollapseAll && collapsibleGroups.every(_workspace.isCollapsed);
 
+    final activeKernelId = _workspace.sidebarKernelFilter;
+    final activeKernel = activeKernelId == null
+        ? null
+        : _workspace.kernels.where((k) => k.id == activeKernelId).firstOrNull;
+    Map<String, int> kernelCounts() {
+      final counts = <String, int>{};
+      for (final t in _workspace.threads) {
+        if (t.archived) continue;
+        if (_workspace.isHidden(t.project) ||
+            !_workspace.listsHost(t.project.host) ||
+            !_workspace.listsInSidebar(t)) {
+          continue;
+        }
+        if (t.untouched &&
+            !identical(t, _current) &&
+            !_workspace.grid.contains(t)) {
+          continue;
+        }
+        counts[t.kernel.id] = (counts[t.kernel.id] ?? 0) + 1;
+      }
+      return counts;
+    }
+
     final hasPinnedAbove = _listGroups.any((g) => g.pinned);
     return SizedBox(
       height: hasPinnedAbove ? 42 : 30,
@@ -1559,19 +1620,85 @@ class _SidebarState extends State<Sidebar>
                     )
                   else
                     Expanded(
-                      child: Align(
-                        alignment: Alignment.centerLeft,
-                        child: Text(
-                          sectionLabel,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            color: AppColors.textMuted,
-                            fontSize: 11,
-                            fontWeight: FontWeight.w600,
-                            letterSpacing: 0.2,
+                      child: Row(
+                        children: [
+                          Flexible(
+                            child: Text(
+                              sectionLabel,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: AppColors.textMuted,
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                letterSpacing: 0.2,
+                              ),
+                            ),
                           ),
-                        ),
+                          if (activeKernel != null) ...[
+                            const SizedBox(width: 6),
+                            Tooltip(
+                              message: isZh
+                                  ? '点击清除「${activeKernel.label}」筛选'
+                                  : 'Clear "${activeKernel.label}" filter',
+                              child: GestureDetector(
+                                key: const ValueKey(
+                                  'sidebar-kernel-filter-chip',
+                                ),
+                                behavior: HitTestBehavior.opaque,
+                                onTap: () =>
+                                    _workspace.sidebarKernelFilter = null,
+                                child: MouseRegion(
+                                  cursor: SystemMouseCursors.click,
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 5.5,
+                                      vertical: 1.5,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: AppColors.accent.withValues(
+                                        alpha: 0.14,
+                                      ),
+                                      borderRadius: BorderRadius.circular(5),
+                                    ),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(
+                                          activeKernel.icon,
+                                          size: 10.5,
+                                          color: AppColors.accent,
+                                        ),
+                                        const SizedBox(width: 3),
+                                        ConstrainedBox(
+                                          constraints: const BoxConstraints(
+                                            maxWidth: 74,
+                                          ),
+                                          child: Text(
+                                            activeKernel.label,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: TextStyle(
+                                              fontSize: 10,
+                                              fontWeight: FontWeight.w600,
+                                              color: AppColors.accent,
+                                            ),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 2.5),
+                                        Icon(
+                                          Codicons.close,
+                                          size: 9,
+                                          color: AppColors.accent,
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
                       ),
                     ),
             if (canCollapseAll)
@@ -1589,62 +1716,90 @@ class _SidebarState extends State<Sidebar>
                 ),
               ),
             SidebarMenu(
-              width: 184,
+              width: 196,
               placement: (side: FloatingSide.bottom, align: FloatingAlign.end),
-              items: () => [
-                if (_archivedCount > 0)
-                  ..._archivedItems(l10n)
-                else
-                  SidebarMenuItem(
-                    isZh ? '显示已归档对话' : 'Show Archived',
-                    icon: Icons.inventory_2_outlined,
-                    checked: _showArchived,
-                    onSelected: _toggleArchived,
-                  ),
-                const SidebarMenuItem.divider(),
-                for (final grouping in SidebarGrouping.values)
-                  SidebarMenuItem(
-                    grouping.localizedLabel(l10n),
-                    icon: grouping.icon,
-                    checked: grouping == _grouping,
-                    onSelected: () =>
-                        _workspace.sidebarGrouping = grouping.name,
-                  ),
-                if (_grouping == SidebarGrouping.project) ...[
-                  const SidebarMenuItem.divider(),
-                  for (final (sort, label, icon) in [
-                    (
-                      ProjectSort.recent,
-                      l10n.sidebarProjectSortRecent,
-                      Icons.update_rounded,
-                    ),
-                    (
-                      ProjectSort.manual,
-                      l10n.sidebarProjectSortManual,
-                      Icons.drag_indicator_rounded,
-                    ),
-                  ])
+              items: () {
+                final counts = _workspace.kernels.length >= 2
+                    ? kernelCounts()
+                    : const <String, int>{};
+                final totalCount = counts.values.fold<int>(0, (a, b) => a + b);
+                return [
+                  if (_archivedCount > 0)
+                    ..._archivedItems(l10n)
+                  else
                     SidebarMenuItem(
-                      label,
-                      icon: icon,
-                      checked: sort == _workspace.projectSort,
-                      onSelected: () => _workspace.projectSort = sort,
+                      isZh ? '显示已归档对话' : 'Show Archived',
+                      icon: Icons.inventory_2_outlined,
+                      checked: _showArchived,
+                      onSelected: _toggleArchived,
                     ),
-                ],
-                if (canCollapseAll) ...[
                   const SidebarMenuItem.divider(),
-                  SidebarMenuItem(
-                    allCollapsed ? l10n.sidebarExpandAll : l10n.sidebarCollapseAll,
-                    icon: allCollapsed
-                        ? Codicons.expandAll
-                        : Codicons.collapseAll,
-                    onSelected: () => _workspace.setCollapsed(
-                      collapsibleGroups,
-                      !allCollapsed,
+                  for (final grouping in SidebarGrouping.values)
+                    SidebarMenuItem(
+                      grouping.localizedLabel(l10n),
+                      icon: grouping.icon,
+                      checked: grouping == _grouping,
+                      onSelected: () =>
+                          _workspace.sidebarGrouping = grouping.name,
                     ),
-                  ),
-                ],
-              ],
+                  if (_workspace.kernels.length >= 2) ...[
+                    const SidebarMenuItem.divider(),
+                    SidebarMenuItem(
+                      isZh ? '全部内核' : 'All kernels',
+                      icon: Icons.filter_alt_off_outlined,
+                      checked: activeKernelId == null,
+                      detail: totalCount > 0 ? '$totalCount' : null,
+                      onSelected: () => _workspace.sidebarKernelFilter = null,
+                    ),
+                    for (final k in _workspace.kernels)
+                      SidebarMenuItem(
+                        k.label,
+                        icon: k.icon,
+                        checked: activeKernelId == k.id,
+                        detail: (counts[k.id] ?? 0) > 0
+                            ? '${counts[k.id]}'
+                            : null,
+                        onSelected: () => _workspace.sidebarKernelFilter = k.id,
+                      ),
+                  ],
+                  if (_grouping == SidebarGrouping.project) ...[
+                    const SidebarMenuItem.divider(),
+                    for (final (sort, label, icon) in [
+                      (
+                        ProjectSort.recent,
+                        l10n.sidebarProjectSortRecent,
+                        Icons.update_rounded,
+                      ),
+                      (
+                        ProjectSort.manual,
+                        l10n.sidebarProjectSortManual,
+                        Icons.drag_indicator_rounded,
+                      ),
+                    ])
+                      SidebarMenuItem(
+                        label,
+                        icon: icon,
+                        checked: sort == _workspace.projectSort,
+                        onSelected: () => _workspace.projectSort = sort,
+                      ),
+                  ],
+                  if (canCollapseAll) ...[
+                    const SidebarMenuItem.divider(),
+                    SidebarMenuItem(
+                      allCollapsed
+                          ? l10n.sidebarExpandAll
+                          : l10n.sidebarCollapseAll,
+                      icon: allCollapsed
+                          ? Codicons.expandAll
+                          : Codicons.collapseAll,
+                      onSelected: () => _workspace.setCollapsed(
+                        collapsibleGroups,
+                        !allCollapsed,
+                      ),
+                    ),
+                  ],
+                ];
+              },
               builder: (context, menu) => IdeHover(
                 message: _grouping.localizedBy(l10n),
                 excludeFromSemantics: true,
@@ -2393,6 +2548,8 @@ class _SidebarState extends State<Sidebar>
       // delete them all.
       menu: project != null
           ? () => _projectItems(project)
+          : group.kernel != null
+          ? () => _kernelItems(group.kernel!, group.threads)
           : group.archivedOf != null
           ? () => _archivedItems(context.l10n, project: group.archivedOf)
           : null,
@@ -2432,6 +2589,36 @@ class _SidebarState extends State<Sidebar>
       onEnd: () => _endProjectDrag(projects),
       child: header,
     );
+  }
+
+  List<SidebarMenuItem> _kernelItems(
+    KernelDescriptor kernel,
+    List<AgentThread> threads,
+  ) {
+    final isZh = Localizations.localeOf(context).languageCode == 'zh';
+    final filtered = _workspace.sidebarKernelFilter == kernel.id;
+    return [
+      SidebarMenuItem(
+        filtered
+            ? (isZh ? '显示全部内核' : 'Show All Kernels')
+            : (isZh ? '仅查看「${kernel.label}」' : 'Filter to ${kernel.label}'),
+        icon: filtered
+            ? Icons.filter_alt_off_outlined
+            : Icons.filter_alt_outlined,
+        onSelected: () =>
+            _workspace.sidebarKernelFilter = filtered ? null : kernel.id,
+      ),
+      if (threads.isNotEmpty) ...[
+        const SidebarMenuItem.divider(),
+        SidebarMenuItem(
+          isZh
+              ? '归档「${kernel.label}」全部对话 (${threads.length})'
+              : 'Archive All ${kernel.label} (${threads.length})',
+          icon: Codicons.archive,
+          onSelected: () => _workspace.setArchivedAll(threads, true),
+        ),
+      ],
+    ];
   }
 
   Widget _buildRow(AgentThread thread, _Group group, {bool aside = false}) =>
@@ -3813,6 +4000,21 @@ class _GroupHeader extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(width: 6),
+                ] else if (group.kernel case final kernel?) ...[
+                  SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: Center(
+                      child: Icon(
+                        kernel.icon,
+                        size: 13.5,
+                        color: active
+                            ? AppColors.textPrimary
+                            : AppColors.textMuted,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
                 ],
                 // The dot right after the name, the rest of the row after.
                 Expanded(
@@ -3832,7 +4034,7 @@ class _GroupHeader extends StatelessWidget {
                       if (!light &&
                           group.threads.isNotEmpty &&
                           !collapsed &&
-                          active) ...[
+                          (active || group.kernel != null)) ...[
                         const SizedBox(width: 5),
                         Text(
                           '${group.threads.length}',

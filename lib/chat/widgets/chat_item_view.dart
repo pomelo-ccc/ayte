@@ -27,6 +27,7 @@ class ChatItemView extends StatelessWidget {
   const ChatItemView({
     super.key,
     required this.item,
+    this.itemIndex,
     this.session,
     this.expanded = false,
     this.onToggle,
@@ -38,6 +39,7 @@ class ChatItemView extends StatelessWidget {
   });
 
   final ChatItem item;
+  final int? itemIndex;
   final ChatSession? session;
   final bool expanded;
   final VoidCallback? onToggle;
@@ -144,7 +146,11 @@ class ChatItemView extends StatelessWidget {
         onStop: onStop,
         onMoveToBackground: onMoveToBackground,
       ),
-      final NoticeItem notice => NoticeRow(item: notice, session: session),
+      final NoticeItem notice => NoticeRow(
+        item: notice,
+        session: session,
+        itemIndex: itemIndex,
+      ),
       final PlanItem plan => PlanCard(item: plan),
       TerminalItem(
         :final command,

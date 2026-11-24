@@ -24,6 +24,9 @@ class AntigravityAccountPicker extends StatefulWidget {
 
   final String? modelId;
 
+  static bool supports(String? modelId) =>
+      AntigravityModels.isAntigravityModel(modelId);
+
   @override
   State<AntigravityAccountPicker> createState() =>
       _AntigravityAccountPickerState();
@@ -152,9 +155,14 @@ class _AntigravityAccountPickerState extends State<AntigravityAccountPicker> {
 
         final busy = _store.switchingId != null;
         final dark = themeColors.dark;
-        final hoverBg = (dark ? Colors.white : Colors.black).withValues(
-          alpha: dark ? 0.08 : 0.05,
+        final resolvedFraction = (strictestFraction ?? 1.0).clamp(0.0, 1.0);
+        final resolvedPct = (resolvedFraction * 100).round();
+        final ringColor = AntigravityQuotaRing.colorForPercentage(
+          resolvedPct,
+          dark: dark,
         );
+        final criticalQuota = strictestFraction != null && resolvedPct < 15;
+        final accountCount = _store.accounts.length;
         final tooltip = active == null
             ? '添加或管理 Antigravity 账号'
             : [
@@ -163,49 +171,212 @@ class _AntigravityAccountPickerState extends State<AntigravityAccountPicker> {
                 '点击查看详情或切换账号',
               ].join(' · ');
 
+        String accountInitial(AntigravityAccount account) {
+          final label = account.shortLabel.trim();
+          if (label.isEmpty) return 'A';
+          return String.fromCharCode(label.runes.first).toUpperCase();
+        }
+
+        Widget? buildHoverCard() {
+          if (active == null) return null;
+          final resetHint = switch ((fiveHour, weekly)) {
+            (final f?, _) when f.percentage < 100 => formatUsageResetIn(
+              f.resetTime,
+            ),
+            (_, final w?) when w.percentage < 100 => formatUsageResetIn(
+              w.resetTime,
+            ),
+            _ => '',
+          };
+          return ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 260),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Flexible(
+                      child: Text(
+                        active.email,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontWeight: FontWeight.w600,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ),
+                    if (active.tier != AntigravityTier.unknown) ...[
+                      const SizedBox(width: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 4.5,
+                          vertical: 0.5,
+                        ),
+                        decoration: BoxDecoration(
+                          color: (dark ? Colors.white : Colors.black)
+                              .withValues(alpha: dark ? 0.12 : 0.08),
+                          borderRadius: BorderRadius.circular(3.5),
+                        ),
+                        child: Text(
+                          active.tier.badge,
+                          style: TextStyle(
+                            fontSize: 9.5,
+                            fontWeight: FontWeight.w600,
+                            color: AppColors.textMuted,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+                if (quotaSummary != null) ...[
+                  const SizedBox(height: 3),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        width: 6,
+                        height: 6,
+                        decoration: BoxDecoration(
+                          color: ringColor,
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                      const SizedBox(width: 5),
+                      Flexible(
+                        child: Text(
+                          resetHint.isEmpty
+                              ? '剩余配额 $quotaSummary'
+                              : '剩余 $quotaSummary · $resetHint',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            color: AppColors.text,
+                            fontFeatures: const [FontFeature.tabularFigures()],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+                const SizedBox(height: 2),
+                Text(
+                  accountCount > 1
+                      ? '共 $accountCount 个账号 · 点击查看详情或一键切号'
+                      : '点击查看配额明细或管理账号',
+                  style: TextStyle(fontSize: 11, color: AppColors.textMuted),
+                ),
+              ],
+            ),
+          );
+        }
+
         return Builder(
           builder: (pillCtx) => IdeHover(
             position: IdeHoverPosition.above,
             message: tooltip,
+            content: buildHoverCard(),
             child: HoverBuilder(
               cursor: SystemMouseCursors.click,
-              builder: (context, hovered) => GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTapDown: (_) {},
-                onTap: () => _openUsagePopover(pillCtx),
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 120),
-                  width: 26,
-                  height: 26,
-                  alignment: Alignment.center,
-                  decoration: BoxDecoration(
-                    color: hovered ? hoverBg : Colors.transparent,
-                    shape: BoxShape.circle,
+              builder: (context, hovered) {
+                final hoverBase = active == null
+                    ? (dark ? Colors.white : Colors.black)
+                    : Color.lerp(
+                        dark ? Colors.white : Colors.black,
+                        ringColor,
+                        0.45,
+                      )!;
+                final hoverAlpha = active == null
+                    ? (dark ? 0.10 : 0.06)
+                    : (dark ? 0.16 : 0.11);
+                final coreFill = ringColor.withValues(
+                  alpha: hovered ? (dark ? 0.22 : 0.16) : (dark ? 0.14 : 0.10),
+                );
+                final coreTextColor = criticalQuota
+                    ? ringColor
+                    : resolvedPct < 25
+                    ? ringColor
+                    : (dark
+                          ? const Color(0xFFD1FAE5)
+                          : const Color(0xFF0A663F));
+                return GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTapDown: (_) {},
+                  onTap: () => _openUsagePopover(pillCtx),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 130),
+                    width: 26,
+                    height: 26,
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      color: hovered
+                          ? hoverBase.withValues(alpha: hoverAlpha)
+                          : Colors.transparent,
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: hovered && active != null
+                            ? ringColor.withValues(alpha: dark ? 0.34 : 0.26)
+                            : Colors.transparent,
+                        width: 0.85,
+                      ),
+                    ),
+                    child: busy
+                        ? IdeSpinning(
+                            Icon(
+                              Codicons.loading,
+                              size: 13.5,
+                              color: AppColors.textMuted,
+                            ),
+                          )
+                        : active == null
+                        ? Icon(
+                            Codicons.account,
+                            size: 14,
+                            color: hovered
+                                ? AppColors.text
+                                : AppColors.textMuted,
+                          )
+                        : AntigravityQuotaRing(
+                            fraction: resolvedFraction,
+                            size: 18,
+                            strokeWidth: 1.7,
+                            dark: dark,
+                            child: Container(
+                              width: 12,
+                              height: 12,
+                              alignment: Alignment.center,
+                              decoration: BoxDecoration(
+                                color: coreFill,
+                                shape: BoxShape.circle,
+                              ),
+                              child: Text(
+                                criticalQuota
+                                    ? '$resolvedPct'
+                                    : accountInitial(active),
+                                textHeightBehavior: const TextHeightBehavior(
+                                  applyHeightToFirstAscent: false,
+                                  applyHeightToLastDescent: false,
+                                ),
+                                style: TextStyle(
+                                  fontSize: criticalQuota ? 7.0 : 8.0,
+                                  fontWeight: FontWeight.w700,
+                                  height: 1.0,
+                                  letterSpacing: -0.2,
+                                  color: coreTextColor,
+                                  fontFeatures: const [
+                                    FontFeature.tabularFigures(),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
                   ),
-                  child: busy
-                      ? IdeSpinning(
-                          Icon(
-                            Codicons.loading,
-                            size: 13.5,
-                            color: AppColors.textMuted,
-                          ),
-                        )
-                      : active == null
-                      ? Icon(
-                          Codicons.account,
-                          size: 14,
-                          color: hovered ? AppColors.text : AppColors.textMuted,
-                        )
-                      : Opacity(
-                          opacity: hovered ? 1.0 : 0.88,
-                          child: AntigravityQuotaRing(
-                            fraction: strictestFraction ?? 1.0,
-                            size: 14.5,
-                            strokeWidth: 1.9,
-                          ),
-                        ),
-                ),
-              ),
+                );
+              },
             ),
           ),
         );

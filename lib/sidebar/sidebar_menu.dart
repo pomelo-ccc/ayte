@@ -150,20 +150,25 @@ class SidebarMenuState extends State<SidebarMenu> {
           ),
         ],
       ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          for (final item in items)
-            if (item.divider)
-              Container(
-                height: 1,
-                margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 4),
-                color: colors['menu.separatorBackground'],
-              )
-            else
-              _MenuRow(item: item, onTap: () => _select(item)),
-        ],
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            for (final item in items)
+              if (item.divider)
+                Container(
+                  height: 1,
+                  margin: const EdgeInsets.symmetric(
+                    vertical: 4,
+                    horizontal: 4,
+                  ),
+                  color: colors['menu.separatorBackground'],
+                )
+              else
+                _MenuRow(item: item, onTap: () => _select(item)),
+          ],
+        ),
       ),
     );
   }

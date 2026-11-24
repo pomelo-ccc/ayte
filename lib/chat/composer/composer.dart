@@ -25,6 +25,7 @@ import '../stop_confirmation.dart';
 import '../floating/floating_layer.dart';
 import '../floating/floating_placement.dart';
 import '../floating/floating_registry.dart';
+import '../panels/context_usage_panel.dart';
 import '../../diagnostics/input_lag.dart';
 import '../../workspace/window_controls.dart';
 import '../widgets/context_meter.dart';
@@ -2430,6 +2431,8 @@ class ChatComposerState extends State<ChatComposer>
       _showsStop,
       session.health.noModel,
       session.context?.fraction,
+      session.context?.used,
+      session.context?.window,
       for (final choice in [
         session.kernelChoice,
         session.modes,
@@ -3004,17 +3007,98 @@ class ChatComposerState extends State<ChatComposer>
         : localizedPermission.description.isEmpty
         ? localizedPermission.label
         : '${localizedPermission.label} · ${localizedPermission.description}';
+    final hasLeftPicker = kernel != null || mode != null || hasModel;
+    final Widget? contextMeter = switch ((
+      widget.onToggleContextPanel,
+      context,
+    )) {
+      (final onToggle?, final usage?) => FloatingLayer(
+        visible: widget.contextPanelOpen,
+        placement: (side: FloatingSide.top, align: FloatingAlign.start),
+        gap: 8,
+        tapRegionGroupId: ContextMeter.tapRegionGroupId,
+        outerTapRegionGroupId: widget.tapRegionGroupId,
+        onTapOutside: () {
+          if (widget.contextPanelOpen) onToggle();
+        },
+        builder: (_) => ListenableBuilder(
+          listenable: session,
+          builder: (context, _) => switch (session.context) {
+            final liveUsage? => ContextUsagePanel(
+              usage: liveUsage,
+              stats: session.stats,
+              session: session,
+              popover: true,
+              onClose: onToggle,
+            ),
+            null => const SizedBox.shrink(),
+          },
+        ),
+        child: ContextMeter(
+          usage: usage,
+          active: widget.contextPanelOpen,
+          compactPercent: true,
+          tooltip: _hovers.ring,
+          onTap: onToggle,
+        ),
+      ),
+      _ => null,
+    };
+    final showContextDivider = contextMeter != null && hasLeftPicker;
+    final trailingCount = hasModel && contextMeter != null
+        ? (showContextDivider ? 2 : 1)
+        : 0;
+    final dark = themeColors.dark;
+    final rightTools = <Widget>[
+      if (permission != null && localizedPermission != null)
+        ComposerPicker(
+          iconOnly: true,
+          options: [
+            for (final option in permission.options) localized(option),
+          ],
+          selected: localizedPermission,
+          tooltip: permissionTooltip,
+          title: l10n.composerApprovalTitle(session.kernel.label),
+          menuWidth: 290,
+          tapRegionGroupId: widget.tapRegionGroupId,
+          focusNode: _focusNode,
+          onSelected: permission.onSelected,
+        ),
+      if (ComposerPolishSetting.current())
+        _PolishButton(
+          busy: _polishing,
+          enabled: _polishing || _shownBuilt!.polishable,
+          onTap: () => unawaited(_polish()),
+        ),
+      if (VoiceSettingsStore.instance.config.enabled) ...[
+        _VoiceConversationModeButton(),
+        _VoiceInputButton(
+          owner: this,
+          onTap: () => unawaited(_toggleVoiceInput()),
+        ),
+      ],
+    ];
+    final selectedModelId = model?.selected.id;
+    final Widget? accountPicker = selectedModelId == null
+        ? null
+        : AntigravityAccountPicker.supports(selectedModelId)
+        ? AntigravityAccountPicker(modelId: selectedModelId)
+        : CodeBuddyAccountPicker.supports(selectedModelId)
+        ? CodeBuddyAccountPicker(modelId: selectedModelId)
+        : null;
     return Padding(
       padding: const EdgeInsets.fromLTRB(8, 2, 8, 7),
       child: Row(
         children: [
-          // Left toolbar: strictly clean Agent + Model ghost buttons.
+          // Left toolbar: Agent + Model ghost buttons, followed immediately by
+          // the session context usage meter so it pairs with the model window.
           Expanded(
             child: LayoutBuilder(
               builder: (context, constraints) => SingleChildScrollView(
                 scrollDirection: Axis.horizontal,
                 child: PickersRow(
                   maxWidth: constraints.maxWidth,
+                  trailingCount: trailingCount,
                   children: [
                     if (kernel != null) ...[
                       ComposerPicker(
@@ -3048,63 +3132,35 @@ class ChatComposerState extends State<ChatComposer>
                         tapRegionGroupId: widget.tapRegionGroupId,
                         focusNode: _focusNode,
                       ),
+                    if (showContextDivider)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                        child: SizedBox(
+                          width: 1,
+                          height: 12,
+                          child: ColoredBox(
+                            color: (dark ? Colors.white : Colors.black)
+                                .withValues(alpha: dark ? 0.14 : 0.10),
+                          ),
+                        ),
+                      ),
+                    ?contextMeter,
                   ],
                 ),
               ),
             ),
           ),
           const SizedBox(width: 6),
-          if (permission != null && localizedPermission != null) ...[
-            ComposerPicker(
-              iconOnly: true,
-              options: [
-                for (final option in permission.options) localized(option),
-              ],
-              selected: localizedPermission,
-              tooltip: permissionTooltip,
-              title: l10n.composerApprovalTitle(session.kernel.label),
-              menuWidth: 290,
-              tapRegionGroupId: widget.tapRegionGroupId,
-              focusNode: _focusNode,
-              onSelected: permission.onSelected,
-            ),
-            const SizedBox(width: 2),
+          for (var i = 0; i < rightTools.length; i++) ...[
+            if (i > 0) const SizedBox(width: 2),
+            rightTools[i],
           ],
-          if (ComposerPolishSetting.current()) ...[
-            _PolishButton(
-              busy: _polishing,
-              enabled: _polishing || _shownBuilt!.polishable,
-              onTap: () => unawaited(_polish()),
-            ),
-            const SizedBox(width: 2),
-          ],
-          if (VoiceSettingsStore.instance.config.enabled) ...[
-            _VoiceConversationModeButton(),
-            const SizedBox(width: 2),
-            _VoiceInputButton(
-              owner: this,
-              onTap: () => unawaited(_toggleVoiceInput()),
-            ),
-            const SizedBox(width: 2),
-          ],
-          if (model != null) ...[
-            AntigravityAccountPicker(modelId: model.selected.id),
-            CodeBuddyAccountPicker(modelId: model.selected.id),
-            const SizedBox(width: 3),
-          ],
-          if ((widget.onToggleContextPanel, context) case (
-            final onToggle?,
-            final usage?,
-          )) ...[
-            ContextMeter(
-              usage: usage,
-              active: widget.contextPanelOpen,
-              // Toggle Context Panel's, which has none by default.
-              tooltip: _hovers.ring,
-              onTap: onToggle,
-            ),
-            const SizedBox(width: 3),
-          ],
+          if (accountPicker != null) ...[
+            if (rightTools.isNotEmpty) const SizedBox(width: 3),
+            accountPicker,
+            const SizedBox(width: 6),
+          ] else if (rightTools.isNotEmpty)
+            const SizedBox(width: 4),
           _SendButton(
             streaming: _showsStop,
             enabled: _canSend,

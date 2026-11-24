@@ -14,6 +14,8 @@ class CodeBuddyQuotaRing extends StatelessWidget {
     this.strokeWidth = 2.1,
     this.trackColor,
     this.accentColor,
+    this.dark,
+    this.child,
   });
 
   final double fraction;
@@ -21,28 +23,45 @@ class CodeBuddyQuotaRing extends StatelessWidget {
   final double strokeWidth;
   final Color? trackColor;
   final Color? accentColor;
+  final bool? dark;
 
-  static Color colorForPercentage(int pct) => pct >= 25
-      ? const Color(0xFF0EA5E9)
+  /// Optional centered badge rendered inside the ring (e.g. account initial).
+  final Widget? child;
+
+  static Color colorForPercentage(int pct, {bool dark = false}) => pct >= 25
+      ? (dark ? const Color(0xFF22D3EE) : const Color(0xFF0891B2))
       : pct >= 10
-      ? const Color(0xFFD98B1C)
-      : const Color(0xFFDC3E3E);
+      ? (dark ? const Color(0xFFF59E0B) : const Color(0xFFD98B1C))
+      : (dark ? const Color(0xFFF87171) : const Color(0xFFDC3E3E));
 
   @override
   Widget build(BuildContext context) {
     final clamped = fraction.clamp(0.0, 1.0);
     final pct = (clamped * 100).round();
+    final isDark =
+        dark ?? (Theme.of(context).brightness == Brightness.dark);
+    final resolvedTrack =
+        trackColor ??
+        (isDark ? Colors.white : Colors.black).withValues(
+          alpha: isDark ? 0.18 : 0.12,
+        );
+    final activeColor = accentColor ?? colorForPercentage(pct, dark: isDark);
     return SizedBox.square(
       dimension: size,
-      child: CustomPaint(
-        painter: _CodeBuddyRingPainter(
-          fraction: clamped,
-          strokeWidth: strokeWidth,
-          activeColor: accentColor ?? colorForPercentage(pct),
-          trackColor:
-              trackColor ??
-              Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.16),
+      child: TweenAnimationBuilder<double>(
+        tween: Tween(end: clamped),
+        duration: const Duration(milliseconds: 360),
+        curve: Curves.easeOutCubic,
+        builder: (context, value, child) => CustomPaint(
+          painter: _CodeBuddyRingPainter(
+            fraction: value,
+            strokeWidth: strokeWidth,
+            activeColor: activeColor,
+            trackColor: resolvedTrack,
+          ),
+          child: child,
         ),
+        child: child == null ? null : Center(child: child),
       ),
     );
   }

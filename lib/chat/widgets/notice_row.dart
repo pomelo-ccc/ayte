@@ -13,10 +13,16 @@ import 'markdown_view.dart';
 /// A line from the runtime rather than the agent: a compaction divider, a
 /// retry or error, a hint, or the output of a command run in the session.
 class NoticeRow extends StatelessWidget {
-  const NoticeRow({super.key, required this.item, this.session});
+  const NoticeRow({
+    super.key,
+    required this.item,
+    this.session,
+    this.itemIndex,
+  });
 
   final NoticeItem item;
   final ChatSession? session;
+  final int? itemIndex;
 
   @override
   Widget build(BuildContext context) {
@@ -100,7 +106,12 @@ class NoticeRow extends StatelessWidget {
                 ],
               ),
               if (item.kind == NoticeKind.error && session != null)
-                _ErrorRecoveryActions(session: session!, errorText: text),
+                _ErrorRecoveryActions(
+                  item: item,
+                  itemIndex: itemIndex,
+                  session: session!,
+                  errorText: text,
+                ),
             ],
           ),
         );
@@ -110,15 +121,44 @@ class NoticeRow extends StatelessWidget {
 
 class _ErrorRecoveryActions extends StatelessWidget {
   const _ErrorRecoveryActions({
+    required this.item,
     required this.session,
     required this.errorText,
+    this.itemIndex,
   });
 
+  final NoticeItem item;
+  final int? itemIndex;
   final ChatSession session;
   final String errorText;
 
-  UserMessageItem? _lastUserPrompt() {
-    for (var i = session.itemCount - 1; i >= 0; i--) {
+  int? _noticeIndex() {
+    final count = session.itemCount;
+    final hint = itemIndex;
+    if (hint != null &&
+        hint >= 0 &&
+        hint < count &&
+        identical(session.itemAt(hint), item)) {
+      return hint;
+    }
+    for (var i = count - 1; i >= 0; i--) {
+      if (identical(session.itemAt(i), item)) {
+        return i;
+      }
+    }
+    if (hint != null && hint >= 0 && hint < count) {
+      if (session.itemAt(hint) case final NoticeItem current
+          when current.kind == item.kind && current.text == item.text) {
+        return hint;
+      }
+    }
+    return null;
+  }
+
+  UserMessageItem? _targetUserPrompt() {
+    final noticeIndex = _noticeIndex();
+    if (noticeIndex == null) return null;
+    for (var i = noticeIndex - 1; i >= 0; i--) {
       if (session.itemAt(i) case final UserMessageItem msg
           when msg.fromAgent == null) {
         return msg;
@@ -128,13 +168,13 @@ class _ErrorRecoveryActions extends StatelessWidget {
   }
 
   void _retry({KernelOption? switchModel}) {
-    final last = _lastUserPrompt();
-    if (last == null || session.isStreaming) return;
+    final target = _targetUserPrompt();
+    if (target == null || session.isStreaming) return;
     if (switchModel != null) {
       session.models?.onSelected(switchModel);
     }
     session.send(
-      ComposerMessage(text: last.text, images: last.images),
+      ComposerMessage(text: target.text, images: target.images),
     );
   }
 
@@ -143,7 +183,7 @@ class _ErrorRecoveryActions extends StatelessWidget {
     return ListenableBuilder(
       listenable: Listenable.merge([session, ProviderHealthMonitor.instance]),
       builder: (context, _) {
-        if (session.isStreaming || _lastUserPrompt() == null) {
+        if (session.isStreaming || _targetUserPrompt() == null) {
           return const SizedBox.shrink();
         }
         final candidates = ProviderHealthMonitor.instance

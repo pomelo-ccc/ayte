@@ -36,6 +36,7 @@ import 'package:baocode/chat/composer/composer_controller.dart';
 import 'package:baocode/chat/composer/composer_embeds.dart';
 import 'package:baocode/chat/composer/composer_files.dart';
 import 'package:baocode/chat/composer/composer_picker.dart';
+import 'package:baocode/chat/composer/session_model_picker.dart';
 import 'package:baocode/chat/floating/floating_layer.dart';
 import 'package:baocode/chat/composer/suggestion_menu.dart';
 import 'package:baocode/chat/panels/activity_strip.dart';
@@ -491,13 +492,25 @@ void main() {
       ),
       findsNothing,
     );
-    // The ring shows no number, even while its panel is open.
+    // The compact ring shows a subtle percentage right next to the model picker.
     expect(
       find.descendant(
-        of: find.byType(ChatComposer),
+        of: ring,
         matching: find.textContaining('%'),
       ),
-      findsNothing,
+      findsOneWidget,
+    );
+    final modelPicker = find.descendant(
+      of: find.byType(ChatComposer),
+      matching: find.byType(SessionModelPicker),
+    );
+    expect(
+      tester.getTopLeft(ring).dx,
+      greaterThanOrEqualTo(tester.getTopRight(modelPicker).dx),
+    );
+    expect(
+      tester.getTopLeft(ring).dx - tester.getTopRight(modelPicker).dx,
+      lessThan(24),
     );
 
     await tester.tap(ring);

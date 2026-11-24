@@ -3356,6 +3356,12 @@ abstract class AppLocalizations {
   /// **'Project'**
   String get sidebarGroupingProject;
 
+  /// No description provided for @sidebarGroupingKernel.
+  ///
+  /// In en, this message translates to:
+  /// **'Kernel'**
+  String get sidebarGroupingKernel;
+
   /// No description provided for @sidebarGroupingDate.
   ///
   /// In en, this message translates to:
@@ -3373,6 +3379,12 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'By project'**
   String get sidebarByProject;
+
+  /// No description provided for @sidebarByKernel.
+  ///
+  /// In en, this message translates to:
+  /// **'By kernel'**
+  String get sidebarByKernel;
 
   /// No description provided for @sidebarByDate.
   ///

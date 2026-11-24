@@ -1424,6 +1424,17 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
     notifyListeners();
   }
 
+  /// Active kernel filter in the sidebar, by kernel id; null shows all kernels.
+  String? get sidebarKernelFilter => _sidebarKernelFilter;
+  String? _sidebarKernelFilter;
+  set sidebarKernelFilter(String? kernelId) {
+    final normalized = kernelId == null || kernelId.isEmpty ? null : kernelId;
+    if (normalized == _sidebarKernelFilter) return;
+    _sidebarKernelFilter = normalized;
+    _save();
+    notifyListeners();
+  }
+
   /// Whether the sidebar group [group] (by key) is folded.
   bool isCollapsed(String group) => _collapsedGroups.contains(group);
   final Set<String> _collapsedGroups = {};
@@ -2952,6 +2963,10 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
       if (sidebar['grouping'] case final String grouping) {
         _sidebarGrouping = grouping;
       }
+      if (sidebar['kernelFilter'] case final String kernelFilter
+          when kernelFilter.isNotEmpty) {
+        _sidebarKernelFilter = kernelFilter;
+      }
       if (sidebar['projectSort'] case final String sort) {
         _projectSort = ProjectSort.values.asNameMap()[sort];
       }
@@ -3110,6 +3125,7 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
       'ignoredRecommendations': [..._ignoredRecommendations],
       'sidebar': {
         'grouping': ?_sidebarGrouping,
+        'kernelFilter': ?_sidebarKernelFilter,
         'projectSort': ?_projectSort?.name,
         'collapsed': [..._collapsedGroups],
         'showArchived': _showArchived,

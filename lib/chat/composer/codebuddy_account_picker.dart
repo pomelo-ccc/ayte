@@ -17,13 +17,16 @@ import '../../theme/workbench_theme.dart' show themeColors;
 import '../../workspace/editor_launcher.dart' show openExternal;
 import '../widgets/hover_builder.dart';
 
-/// Compact composer-toolbar pill showing the active CodeBuddy account's
-/// real-time remaining credits (`剩余 5,897.6 积分`) and opening the 1-click
-/// CodeBuddy Account Switcher & Credits Popover.
+/// Compact composer-toolbar badge showing the active CodeBuddy account's
+/// remaining quota ring + initial (matching [AntigravityAccountPicker]), and
+/// opening the 1-click CodeBuddy Account Switcher & Credits Popover.
 class CodeBuddyAccountPicker extends StatefulWidget {
   const CodeBuddyAccountPicker({super.key, required this.modelId});
 
   final String? modelId;
+
+  static bool supports(String? modelId) =>
+      CodeBuddyModels.isCodeBuddyModel(modelId);
 
   @override
   State<CodeBuddyAccountPicker> createState() => _CodeBuddyAccountPickerState();
@@ -102,91 +105,274 @@ class _CodeBuddyAccountPickerState extends State<CodeBuddyAccountPicker> {
       listenable: _store,
       builder: (context, _) {
         final active = _store.currentAccount;
+        final quota = active?.quota;
         final busy =
             _store.switchingId != null ||
             (active != null &&
                 _store.isRefreshing(active.id) &&
-                active.quota?.remainingCredits == null);
+                quota?.remainingCredits == null);
         final dark = themeColors.dark;
-        final hoverBg = (dark ? Colors.white : Colors.black).withValues(
-          alpha: dark ? 0.08 : 0.05,
+        final exhausted = quota?.quotaExhausted == true;
+        final resolvedFraction = exhausted
+            ? 0.0
+            : (quota?.remainingFraction ?? 1.0).clamp(0.0, 1.0);
+        final resolvedPct = exhausted ? 0 : (quota?.percentage ?? 100);
+        final hasFiniteQuota =
+            quota != null &&
+            !quota.unlimited &&
+            (exhausted || quota.totalCredits != null);
+        final criticalQuota = hasFiniteQuota && (exhausted || resolvedPct < 15);
+        final ringColor = CodeBuddyQuotaRing.colorForPercentage(
+          resolvedPct,
+          dark: dark,
         );
-        final subtleBg = (dark ? Colors.white : Colors.black).withValues(
-          alpha: dark ? 0.035 : 0.025,
-        );
-        final pillText = active == null
-            ? 'CodeBuddy 账号'
-            : (active.quota?.pillCreditsLabel ?? active.edition.label);
+        final accountCount = _store.accounts.length;
+        final planTag = quota?.subscriptionPackageName?.trim().isNotEmpty == true
+            ? quota!.subscriptionPackageName!.trim()
+            : active?.edition.label;
         final tooltip = active == null
             ? 'CodeBuddy 账号（当前复用 CLI 默认登录态 · 点击添加账号查看剩余积分）'
             : [
-                '${active.displayName} (${active.region.shortBadge} · ${active.quota?.subscriptionPackageName ?? active.edition.label})',
-                active.quota?.summaryLabel,
+                '${active.displayName} (${active.region.shortBadge} · ${planTag ?? active.edition.label})',
+                quota?.summaryLabel,
                 '点击查看积分明细或切换账号',
               ].whereType<String>().join(' · ');
+
+        String accountInitial(CodeBuddyAccount account) {
+          final label = account.displayName.trim();
+          if (label.isEmpty) return 'C';
+          return String.fromCharCode(label.runes.first).toUpperCase();
+        }
+
+        Widget buildHoverCard() {
+          if (active == null) {
+            return ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 260),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'CodeBuddy 账号',
+                    style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    '当前复用 CLI 默认登录态 · 点击添加账号查看剩余积分',
+                    style: TextStyle(fontSize: 11.5, color: AppColors.textMuted),
+                  ),
+                ],
+              ),
+            );
+          }
+          final badgeBg = (dark ? Colors.white : Colors.black).withValues(
+            alpha: dark ? 0.12 : 0.08,
+          );
+          return ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 270),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Flexible(
+                      child: Text(
+                        active.displayName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontWeight: FontWeight.w600,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 4.5,
+                        vertical: 0.5,
+                      ),
+                      decoration: BoxDecoration(
+                        color: badgeBg,
+                        borderRadius: BorderRadius.circular(3.5),
+                      ),
+                      child: Text(
+                        active.region.shortBadge,
+                        style: TextStyle(
+                          fontSize: 9.5,
+                          fontWeight: FontWeight.w600,
+                          color: AppColors.textMuted,
+                        ),
+                      ),
+                    ),
+                    if (planTag != null && planTag.isNotEmpty) ...[
+                      const SizedBox(width: 4),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 4.5,
+                          vertical: 0.5,
+                        ),
+                        decoration: BoxDecoration(
+                          color: badgeBg,
+                          borderRadius: BorderRadius.circular(3.5),
+                        ),
+                        child: Text(
+                          planTag,
+                          style: TextStyle(
+                            fontSize: 9.5,
+                            fontWeight: FontWeight.w600,
+                            color: AppColors.textMuted,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+                if (quota?.summaryLabel case final summary?) ...[
+                  const SizedBox(height: 3),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        width: 6,
+                        height: 6,
+                        decoration: BoxDecoration(
+                          color: ringColor,
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                      const SizedBox(width: 5),
+                      Flexible(
+                        child: Text(
+                          summary,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            color: exhausted
+                                ? ringColor
+                                : AppColors.text,
+                            fontFeatures: const [FontFeature.tabularFigures()],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+                const SizedBox(height: 2),
+                Text(
+                  accountCount > 1
+                      ? '共 $accountCount 个账号 · 点击查看积分明细或一键切号'
+                      : '点击查看积分明细或管理账号',
+                  style: TextStyle(fontSize: 11, color: AppColors.textMuted),
+                ),
+              ],
+            ),
+          );
+        }
 
         return Builder(
           builder: (pillCtx) => IdeHover(
             position: IdeHoverPosition.above,
             message: tooltip,
+            content: buildHoverCard(),
             child: HoverBuilder(
               cursor: SystemMouseCursors.click,
-              builder: (context, hovered) => GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTapDown: (_) {},
-                onTap: () => _openPopover(pillCtx),
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 120),
-                  height: 24,
-                  padding: const EdgeInsets.symmetric(horizontal: 7.5),
-                  decoration: BoxDecoration(
-                    color: hovered ? hoverBg : subtleBg,
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(
-                      color: (dark ? Colors.white : Colors.black).withValues(
-                        alpha: hovered ? 0.12 : 0.06,
+              builder: (context, hovered) {
+                final hoverBase = active == null
+                    ? (dark ? Colors.white : Colors.black)
+                    : Color.lerp(
+                        dark ? Colors.white : Colors.black,
+                        ringColor,
+                        0.45,
+                      )!;
+                final hoverAlpha = active == null
+                    ? (dark ? 0.10 : 0.06)
+                    : (dark ? 0.16 : 0.11);
+                final coreFill = ringColor.withValues(
+                  alpha: hovered ? (dark ? 0.22 : 0.16) : (dark ? 0.14 : 0.10),
+                );
+                final coreTextColor = criticalQuota || resolvedPct < 25
+                    ? ringColor
+                    : (dark
+                          ? const Color(0xFFCFFAFE)
+                          : const Color(0xFF0E6478));
+                return GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTapDown: (_) {},
+                  onTap: () => _openPopover(pillCtx),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 130),
+                    width: 26,
+                    height: 26,
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      color: hovered
+                          ? hoverBase.withValues(alpha: hoverAlpha)
+                          : Colors.transparent,
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: hovered && active != null
+                            ? ringColor.withValues(alpha: dark ? 0.34 : 0.26)
+                            : Colors.transparent,
+                        width: 0.85,
                       ),
                     ),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      if (busy)
-                        IdeSpinning(
-                          Icon(
-                            Codicons.loading,
-                            size: 12.5,
-                            color: AppColors.textMuted,
+                    child: busy
+                        ? IdeSpinning(
+                            Icon(
+                              Codicons.loading,
+                              size: 13.5,
+                              color: AppColors.textMuted,
+                            ),
+                          )
+                        : active == null
+                        ? Icon(
+                            Codicons.account,
+                            size: 14,
+                            color: hovered
+                                ? AppColors.text
+                                : AppColors.textMuted,
+                          )
+                        : CodeBuddyQuotaRing(
+                            fraction: resolvedFraction,
+                            size: 18,
+                            strokeWidth: 1.7,
+                            dark: dark,
+                            child: Container(
+                              width: 12,
+                              height: 12,
+                              alignment: Alignment.center,
+                              decoration: BoxDecoration(
+                                color: coreFill,
+                                shape: BoxShape.circle,
+                              ),
+                              child: Text(
+                                criticalQuota
+                                    ? '$resolvedPct'
+                                    : accountInitial(active),
+                                textHeightBehavior: const TextHeightBehavior(
+                                  applyHeightToFirstAscent: false,
+                                  applyHeightToLastDescent: false,
+                                ),
+                                style: TextStyle(
+                                  fontSize: criticalQuota ? 7.0 : 8.0,
+                                  fontWeight: FontWeight.w700,
+                                  height: 1.0,
+                                  letterSpacing: -0.2,
+                                  color: coreTextColor,
+                                  fontFeatures: const [
+                                    FontFeature.tabularFigures(),
+                                  ],
+                                ),
+                              ),
+                            ),
                           ),
-                        )
-                      else if (active == null)
-                        Icon(
-                          Codicons.account,
-                          size: 13,
-                          color: hovered ? AppColors.text : AppColors.textMuted,
-                        )
-                      else
-                        CodeBuddyQuotaRing(
-                          fraction: active.quota?.remainingFraction ?? 1.0,
-                          size: 13.5,
-                          strokeWidth: 1.9,
-                        ),
-                      const SizedBox(width: 5.5),
-                      Text(
-                        pillText,
-                        style: TextStyle(
-                          fontSize: 11.5,
-                          fontWeight: FontWeight.w500,
-                          color: active?.quota?.quotaExhausted == true
-                              ? const Color(0xFFDC3E3E)
-                              : (hovered ? AppColors.text : AppColors.textMuted),
-                          fontFeatures: const [FontFeature.tabularFigures()],
-                        ),
-                      ),
-                    ],
                   ),
-                ),
-              ),
+                );
+              },
             ),
           ),
         );
@@ -250,7 +436,10 @@ class _CodeBuddyUsagePopover extends StatelessWidget {
                 final remain = quota?.effectiveRemainingCredits;
                 final total = quota?.totalCredits;
                 final pct = quota?.percentage ?? 100;
-                final barColor = CodeBuddyQuotaRing.colorForPercentage(pct);
+                final barColor = CodeBuddyQuotaRing.colorForPercentage(
+                  pct,
+                  dark: dark,
+                );
 
                 return Container(
                   decoration: BoxDecoration(

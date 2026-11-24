@@ -53,8 +53,10 @@ bool isAntigravityLaunch(ClaudeLaunch launch) =>
 ///    the 4–7s silent-auth cold start on subsequent turns.
 /// 2. **Permission Mode Mapping**: Maps `permissionMode` to `--mode`
 ///    (`accept-edits`, `auto`, `plan`) and passes `--dangerously-skip-permissions`
-///    only when `bypassPermissions` is selected, while bridging interactive SDK
-///    tool confirmations (`can_use_tool`) and edit hooks over the control stream.
+///    when `bypassPermissions` is selected or when `plan` mode runs with
+///    `autoApproveInPlan` (`useAutoModeDuringPlan`), while bridging interactive
+///    SDK tool confirmations (`can_use_tool`) and edit hooks over the control
+///    stream.
 /// 3. **JSON Parameter Unquoting**: Unwraps JSON-encoded string values in
 ///    `tool_info.parameters` (`"\"/path\""` → `"/path"`, `"100"` → `100`).
 /// 4. **Session Persistence**: Mirrors every user/assistant/tool message to
@@ -73,6 +75,10 @@ class AntigravityTransport implements ClaudeCodeTransport {
            : null,
        _model = AntigravityModels.cliModelIdOf(launch.model),
        _permissionMode = launch.permissionMode ?? 'default',
+       _autoModeDuringPlan =
+           launch.autoModeDuringPlan ??
+           (launch.permissionMode == 'bypassPermissions' ||
+               launch.permissionMode == 'auto'),
        _effort = _resolveInitialEffort(launch.model, launch.effort),
        _maxContextTokens = _resolveInitialContextTokens(
          launch.model,
@@ -193,6 +199,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
 
   String _model;
   String _permissionMode;
+  bool _autoModeDuringPlan;
   String? _effort;
   int _maxContextTokens;
   Set<String> _disabledSkills;
@@ -218,6 +225,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
   final Map<String, List<({RegExp? matcher, List<String> callbackIds})>>
   _registeredHooks = {};
   final Map<String, McpProbeResult> _mcpProbeCache = {};
+  Directory? _tempImageRootDir;
   Directory? _tempImageDir;
   final Map<String, Directory> _tempImageDirs = {};
   final Set<Future<void>> _inFlightImageWrites = {};
@@ -635,6 +643,9 @@ class AntigravityTransport implements ClaudeCodeTransport {
           return;
         }
         _permissionMode = mode;
+        if (mode != 'plan') {
+          _autoModeDuringPlan = mode == 'bypassPermissions' || mode == 'auto';
+        }
         if (_activeTurn == null &&
             _process != null &&
             _spawnedModeFlag != _effectiveModeFlag) {
@@ -688,6 +699,9 @@ class AntigravityTransport implements ClaudeCodeTransport {
                 ? info.resolveContextWindow(requested)
                 : requested;
           }
+          if (settings['useAutoModeDuringPlan'] case final bool useAuto) {
+            _autoModeDuringPlan = useAuto;
+          }
           if (settings.containsKey('skillOverrides')) {
             final nextDisabled = <String>{};
             if (settings['skillOverrides'] case final Map overrides) {
@@ -724,8 +738,10 @@ class AntigravityTransport implements ClaudeCodeTransport {
             buildSessionSettings(launch, switches: _switches),
           );
           if (_activeTurn == null &&
+              _process != null &&
               (_spawnedEffort != _effort ||
                   _spawnedContextTokens != _maxContextTokens ||
+                  _spawnedModeFlag != _effectiveModeFlag ||
                   (_spawnedSettingsJson != null &&
                       _spawnedSettingsJson != currentSettingsJson))) {
             unawaited(_stopProcess(notifyActiveTurn: false));
@@ -1533,15 +1549,22 @@ class AntigravityTransport implements ClaudeCodeTransport {
     }
   }
 
-  static String _modeFlagFor(String permissionMode) => switch (permissionMode) {
-    'plan' => '--mode=plan',
+  static String _modeFlagFor(
+    String permissionMode, {
+    bool autoApproveInPlan = false,
+  }) => switch (permissionMode) {
+    'plan' =>
+      autoApproveInPlan
+          ? '--mode=plan --dangerously-skip-permissions'
+          : '--mode=plan',
     'acceptEdits' => '--mode=accept-edits',
     'auto' => '--mode=auto',
     'bypassPermissions' => '--dangerously-skip-permissions',
     _ => 'default',
   };
 
-  String get _effectiveModeFlag => _modeFlagFor(_permissionMode);
+  String get _effectiveModeFlag =>
+      _modeFlagFor(_permissionMode, autoApproveInPlan: _autoModeDuringPlan);
 
   static ExtensionSwitches _switchesFromDenyRules(
     List<String> deny, {
@@ -1657,9 +1680,15 @@ class AntigravityTransport implements ClaudeCodeTransport {
     return joined.isEmpty ? null : joined;
   }
 
-  /// Translates [ClaudeLaunch] (`allowed`, `readable`, `switches`, `tools`)
-  /// into `agy --settings` `permissions` entries, returning an empty map when
-  /// no permission rules apply.
+  /// Translates [ClaudeLaunch] (`allowed`, `switches`, `tools`) into
+  /// `agy --settings` `permissions` entries, returning an empty map when no
+  /// permission rules apply.
+  ///
+  /// Note: [ClaudeLaunch.readable] folders are exposed via `--add-dir` in
+  /// [buildCliArguments] rather than Claude Code's `Read(...)` grant syntax:
+  /// `agy` rejects `"Read(...)"` (`unknown action "Read"`) and passing a
+  /// non-empty `permissions.allow` via `--settings` replaces the user's
+  /// `~/.gemini/antigravity-cli/settings.json` allowlist.
   static Map<String, Object?> buildSessionSettings(
     ClaudeLaunch launch, {
     ExtensionSwitches? switches,
@@ -1667,13 +1696,8 @@ class AntigravityTransport implements ClaudeCodeTransport {
     final activeSwitches = switches ?? launch.switches;
     final allow = <String>[];
     final seenAllow = <String>{};
-    for (final folder in launch.readable) {
-      if (folder.isEmpty) continue;
-      final rule = ClaudeLaunch.readRule(p.normalize(folder));
-      final key = Platform.isWindows ? rule.toLowerCase() : rule;
-      if (seenAllow.add(key)) allow.add(rule);
-    }
     for (final rule in launch.allowed) {
+      if (rule.isEmpty) continue;
       if (seenAllow.add(rule)) allow.add(rule);
     }
     final deny = <String>[];
@@ -1732,6 +1756,8 @@ class AntigravityTransport implements ClaudeCodeTransport {
     List<String> directories = const [],
     List<String> readable = const [],
     String? sessionConfigDir,
+    String? tempImageRootDir,
+    bool autoApproveInPlan = false,
     Map<String, Object?>? extraSettings,
   }) {
     final info = AntigravityModels.of(model);
@@ -1766,6 +1792,11 @@ class AntigravityTransport implements ClaudeCodeTransport {
     if (sessionConfigDir != null && sessionConfigDir.isNotEmpty) {
       addDir(sessionConfigDir);
     }
+    if (tempImageRootDir != null &&
+        tempImageRootDir.isNotEmpty &&
+        Directory(tempImageRootDir).existsSync()) {
+      addDir(tempImageRootDir);
+    }
 
     return <String>[
       '--input-format=stream-json',
@@ -1781,7 +1812,8 @@ class AntigravityTransport implements ClaudeCodeTransport {
       if (permissionMode == 'acceptEdits') '--mode=accept-edits',
       if (permissionMode == 'auto') '--mode=auto',
       if (permissionMode == 'plan') '--mode=plan',
-      if (permissionMode == 'bypassPermissions')
+      if (permissionMode == 'bypassPermissions' ||
+          (permissionMode == 'plan' && autoApproveInPlan))
         '--dangerously-skip-permissions',
       for (final dir in addDirs) '--add-dir=$dir',
       '-p=',
@@ -1816,11 +1848,13 @@ class AntigravityTransport implements ClaudeCodeTransport {
     model: _model,
     effort: _effort,
     permissionMode: _permissionMode,
+    autoApproveInPlan: _autoModeDuringPlan,
     maxContextTokens: _maxContextTokens,
     conversationId: _agyConversationId,
     directories: launch.directories,
     readable: launch.readable,
     sessionConfigDir: _sessionConfigDir?.path,
+    tempImageRootDir: _tempImageRootDir?.path,
     extraSettings: buildSessionSettings(launch, switches: _switches),
   );
 
@@ -2071,6 +2105,27 @@ class AntigravityTransport implements ClaudeCodeTransport {
     await _stopProcess(notifyActiveTurn: false);
     if (_closed) return null;
     await _ensureBridgeAndConfig();
+    if (_closed) {
+      await _cleanupSessionArtifactsOnClose();
+      return null;
+    }
+
+    // Ensure the shared `agy-img` cache root exists and is passed via
+    // `--add-dir` so images attached on later turns can be read by `read_file`
+    // without triggering non-workspace permission denials.
+    final imgRoot = Directory(
+      p.join(DataDirectory.current.cacheDir, 'agy-img'),
+    );
+    try {
+      if (!imgRoot.existsSync()) {
+        await imgRoot.create(recursive: true);
+      }
+      if (imgRoot.existsSync()) {
+        _tempImageRootDir = imgRoot;
+      }
+    } on Object {
+      // Best-effort temp image root creation.
+    }
     if (_closed) {
       await _cleanupSessionArtifactsOnClose();
       return null;
@@ -3126,6 +3181,7 @@ class _ActiveTurn {
   bool hadStepUsage = false;
   Map<String, Object?>? pendingSilentStepUsage;
   String? lastToolError;
+  String? unansweredPermissionError;
   bool sawExitPlanMode = false;
   String? lastPlanPath;
   String? lastPlanContent;
@@ -3425,6 +3481,7 @@ class _ActiveTurn {
 
       if (textDelta.isNotEmpty) {
         streamedAnyResponse = true;
+        unansweredPermissionError = null;
         ensureMessageStarted(stepIndex);
         if (stepThinkingStarted[stepIndex] == true &&
             stepThinkingStopped[stepIndex] != true) {
@@ -3503,6 +3560,9 @@ class _ActiveTurn {
       );
       if (isError && cleanedOutput.isNotEmpty) {
         lastToolError = cleanedOutput;
+        if (_isPermissionDenialError(cleanedOutput)) {
+          unansweredPermissionError = cleanedOutput;
+        }
       }
 
       final mapped = AntigravityTransport.mapTool(
@@ -3724,6 +3784,12 @@ class _ActiveTurn {
     }, persist: true);
   }
 
+  static bool _isPermissionDenialError(String text) {
+    final lower = text.toLowerCase();
+    return lower.contains('permission check failed') ||
+        lower.contains('user denied permission');
+  }
+
   void _emitResultAndComplete({
     required bool isError,
     required String responseText,
@@ -3759,6 +3825,28 @@ class _ActiveTurn {
           },
         }, persist: true);
       }
+    } else if (!transport._interrupted &&
+        responseText.isEmpty &&
+        unansweredPermissionError != null) {
+      _emitAndLog({
+        'type': 'assistant',
+        'uuid': 'agy-perm-abort-$turnId',
+        'message': {
+          'id': 'agy-perm-abort-$turnId',
+          'model': transport._model,
+          'role': 'assistant',
+          'content': [
+            {
+              'type': 'text',
+              'text':
+                  '当前工具调用被 Antigravity CLI 非交互权限检查拒绝并中止了本轮执行'
+                  '（如需在计划模式或常规模式下自动放行，请将权限策略设为「完全访问 / 自动批准」）：\n'
+                  '```\n$unansweredPermissionError\n```',
+            },
+          ],
+          'usage': ?usage,
+        },
+      }, persist: true);
     }
 
     transport._emit({

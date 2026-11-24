@@ -1163,6 +1163,131 @@ void main() {
       );
     },
   );
+
+  test(
+    'skips unsynced Ayte-bridged shadows, deleted Ayte sessions, and agy subagent workers',
+    () async {
+      final validUri = Uri.directory(projectDir).toString();
+      final projectSlug = AgentPaths.projectDirName(projectDir);
+      final slugDir = p.join(ayteConfig, 'projects', projectSlug);
+
+      File(p.join(agyRoot, 'jetbox_summaries_proto.pb'))
+        ..parent.createSync(recursive: true)
+        ..writeAsBytesSync(
+          _encodeSummariesProto([
+            (
+              id: 'shadow-bridge-1',
+              title: '<CONVERSATION_CONTEXT>',
+              seconds: 1763800001,
+              workspaceUri: validUri,
+            ),
+            (
+              id: 'deleted-ayte-1',
+              title: 'Deleted Ayte Chat',
+              seconds: 1763800002,
+              workspaceUri: validUri,
+            ),
+            (
+              id: 'subagent-worker-1',
+              title: 'Worker task',
+              seconds: 1763800003,
+              workspaceUri: validUri,
+            ),
+            (
+              id: 'kept-ayte-1',
+              title: 'Kept Ayte Chat',
+              seconds: 1763800004,
+              workspaceUri: validUri,
+            ),
+            (
+              id: 'native-cli-1',
+              title: 'Native CLI Chat',
+              seconds: 1763800005,
+              workspaceUri: validUri,
+            ),
+          ]),
+        );
+
+      void writeBrain(String id, String content) {
+        writeFile(
+          p.join(
+            agyRoot,
+            'brain',
+            id,
+            '.system_generated',
+            'logs',
+            'transcript.jsonl',
+          ),
+          '${jsonEncode({
+            'step_index': 0,
+            'type': 'USER_INPUT',
+            'created_at': '2026-11-23T06:00:00Z',
+            'content': content,
+          })}\n',
+        );
+      }
+
+      // 1. Ayte-bridged shadow session (no .jsonl under this UUID) -> skip
+      writeBrain(
+        'shadow-bridge-1',
+        '<USER_REQUEST>\n'
+        '<CONVERSATION_CONTEXT>\n'
+        'Previous turns in this session before switching to Antigravity CLI:\n'
+        'User: old question\n'
+        '</CONVERSATION_CONTEXT>\n\n'
+        'Follow up\n'
+        '</USER_REQUEST>',
+      );
+      // 2. Deleted Ayte session (leftover brain dir with BaoCode reminder, no .jsonl) -> skip
+      writeBrain(
+        'deleted-ayte-1',
+        '<USER_REQUEST>\n'
+        '<system-reminder>Reply suggestions are on: the user turned them on in BaoCode.</system-reminder>\n'
+        'Old deleted chat\n'
+        '</USER_REQUEST>',
+      );
+      // 3. agy subagent / run_workflow worker child session -> skip
+      writeBrain(
+        'subagent-worker-1',
+        '<USER_REQUEST>\n'
+        'Inspect UMC pages\n\n'
+        'When you are done, call the finish tool with your result.\n'
+        '</USER_REQUEST>',
+      );
+      // 4. Existing Ayte session WITH .jsonl (even with BaoCode reminder) -> keep
+      writeBrain(
+        'kept-ayte-1',
+        '<USER_REQUEST>\n'
+        '<system-reminder>Reply suggestions are on: the user turned them on in BaoCode.</system-reminder>\n'
+        'Active Ayte chat\n'
+        '</USER_REQUEST>',
+      );
+      writeFile(
+        p.join(slugDir, 'kept-ayte-1.jsonl'),
+        '${jsonEncode({
+          'type': 'user',
+          'uuid': 'agy-u-1',
+          'cwd': projectDir,
+          'sessionId': 'kept-ayte-1',
+          'timestamp': '2026-11-23T06:00:00Z',
+          'message': {'role': 'user', 'content': 'Active Ayte chat'},
+        })}\n',
+      );
+      // 5. Legitimate standalone native agy CLI session -> keep
+      writeBrain(
+        'native-cli-1',
+        '<USER_REQUEST>\nHelp me install atoll\n</USER_REQUEST>',
+      );
+
+      final catalog = createCatalog();
+      final projects = await catalog.projects();
+      expect(projects, hasLength(1));
+      expect(
+        projects.single.sessions.map((s) => s.id).toSet(),
+        equals({'kept-ayte-1', 'native-cli-1'}),
+      );
+    },
+  );
 }
 
 Uint8List _encodeSummariesProto(

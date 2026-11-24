@@ -15,6 +15,7 @@ import 'package:baocode/ide/ide_hover.dart';
 import 'package:baocode/ide/ide_commands.dart' show ideUsesMacKeys;
 import 'package:baocode/ide/ide_list.dart';
 import 'package:baocode/keybindings/keybinding_service.dart';
+import 'package:baocode/l10n/l10n.dart';
 import 'package:bao_editor/monaco/flutter/keybinding_entry.dart';
 import 'package:baocode/main.dart';
 import 'package:baocode/search/search_palette.dart';
@@ -2628,6 +2629,79 @@ void main() {
         workspace.threads.map((thread) => thread.record?.id),
         isNot(contains('a3')),
       );
+    },
+  );
+
+  testWidgets(
+    'groups conversations by kernel and filters projects by kernel',
+    (tester) async {
+      tester.view.physicalSize = const Size(1400, 900);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+
+      final workspace = Workspace.mock();
+      final kernels = workspace.kernels;
+      expect(kernels.length, greaterThanOrEqualTo(2));
+      final firstKernel = kernels.first;
+      final secondKernel = kernels.last;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Scaffold(
+            body: SizedBox(
+              width: 280,
+              height: 760,
+              child: Sidebar(workspace: workspace, onCollapse: () {}),
+            ),
+          ),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 250));
+
+      // 1. Switch to By Kernel grouping via the sidebar menu.
+      await tester.tap(inSidebar(find.text('By project')));
+      await tester.pump(const Duration(milliseconds: 250));
+      await tester.tap(find.text('Kernel'));
+      await tester.pump(const Duration(milliseconds: 400));
+
+      expect(workspace.sidebarGrouping, SidebarGrouping.kernel.name);
+      expect(
+        inSidebar(find.text(firstKernel.label, findRichText: true)),
+        findsAtLeastNWidgets(1),
+      );
+      expect(
+        inSidebar(find.text(secondKernel.label, findRichText: true)),
+        findsAtLeastNWidgets(1),
+      );
+
+      // 2. Switch back to By Project and filter to the second kernel only.
+      workspace.sidebarGrouping = SidebarGrouping.project.name;
+      await tester.pump(const Duration(milliseconds: 250));
+
+      await tester.tap(inSidebar(find.text('By project')));
+      await tester.pump(const Duration(milliseconds: 250));
+      await tester.tap(find.text(secondKernel.label).last);
+      await tester.pump(const Duration(milliseconds: 400));
+
+      expect(workspace.sidebarKernelFilter, secondKernel.id);
+      // Removable active-filter chip displays the active kernel label.
+      final chip = find.byKey(const ValueKey('sidebar-kernel-filter-chip'));
+      expect(chip, findsOneWidget);
+      expect(
+        find.descendant(of: chip, matching: find.text(secondKernel.label)),
+        findsOneWidget,
+      );
+
+      // Clicking the active kernel chip clears the filter back to all kernels.
+      await tester.tap(chip);
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(workspace.sidebarKernelFilter, isNull);
+      expect(chip, findsNothing);
+
+      // Flush background account-env init timeout from BaoCodeApp composer.
+      await tester.pump(const Duration(seconds: 9));
     },
   );
 }

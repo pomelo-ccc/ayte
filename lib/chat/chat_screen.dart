@@ -49,7 +49,6 @@ import 'panels/activity_strip.dart';
 import 'panels/health_banner.dart';
 import 'panels/interaction_panel.dart';
 import 'panels/limit_reset_panel.dart';
-import 'panels/context_usage_panel.dart';
 import 'panels/goal_panel.dart';
 import 'panels/queue_panel.dart';
 import 'panels/reply_suggestion_bar.dart';
@@ -63,7 +62,6 @@ import 'widgets/chat_toc_and_pins.dart';
 import 'widgets/code_citation.dart';
 import 'widgets/hover_builder.dart';
 import 'widgets/hover_scroll_text.dart';
-import 'widgets/context_meter.dart';
 import 'widgets/inline_rename_field.dart';
 import 'widgets/pixel_loader.dart';
 import 'widgets/plan_start.dart';
@@ -1430,145 +1428,73 @@ class _ChatScreenState extends State<ChatScreen>
       backgroundColor: island == null && !IslandSurface.on(context)
           ? widget.island
           : Colors.transparent,
-      body: Stack(
+      body: Column(
         children: [
-          Column(
-            children: [
-              // The row the window's header leaves it (macOS draws a title bar
-              // of its own over it; see AppMetrics): its title there, but on a
-              // card, which has it along its top. Under Windows' header, none
-              // over a card.
-              if (titled &&
-                  (island == null ||
-                      !WindowControls.drawsHeader && widget.rowOverCard))
-                _buildTitleBar(title: island == null),
-              // Its card even with no row under it (the terminal's then).
-              if (island == null && footer == 0)
-                ...conversation
-              else ...[
-                Expanded(
-                  child: island == null
-                      ? Column(children: conversation)
-                      : Island(
-                          color: island,
-                          borderColor: widget.islandBorder,
-                          child: Column(
-                            children: [
-                              if (titled) _buildCardHeader(),
-                              ...conversation,
-                            ],
-                          ),
-                        ),
-                ),
-                if (footer > 0)
-                  // Under the card, at the composer's width: the row there with
-                  // nothing in it too, the card's foot where the side panel's is.
-                  // What the place it is in has after it (the IDE's status
-                  // bar's right items) is told how wide it is.
-                  SizedBox(
-                    height: footer,
-                    child: _ConversationColumn(
-                      maxWidth: _maxContentWidth,
-                      minimap: false,
-                      inset: Islands.inset,
-                      bottom: 0,
-                      child: Align(
-                        alignment: Alignment.centerLeft,
-                        child: IslandFootTrailing.leading(
-                          context,
-                          _buildFoot(),
-                        ),
+          // The row the window's header leaves it (macOS draws a title bar
+          // of its own over it; see AppMetrics): its title there, but on a
+          // card, which has it along its top. Under Windows' header, none
+          // over a card.
+          if (titled &&
+              (island == null ||
+                  !WindowControls.drawsHeader && widget.rowOverCard))
+            _buildTitleBar(title: island == null),
+          // Its card even with no row under it (the terminal's then).
+          if (island == null && footer == 0)
+            ...conversation
+          else ...[
+            Expanded(
+              child: island == null
+                  ? Column(children: conversation)
+                  : Island(
+                      color: island,
+                      borderColor: widget.islandBorder,
+                      child: Column(
+                        children: [
+                          if (titled) _buildCardHeader(),
+                          ...conversation,
+                        ],
                       ),
                     ),
-                  ),
-              ],
-            ],
-          ),
-          if (_contextPanelOpen && _agentShown == null)
-            if (_session.context case final usage?)
-              Positioned(
-                right: 12,
-                bottom: footer > 0
-                    ? footer + 6
-                    : (_footOnCard ? Islands.belowHeight + 6 : 56),
-                child: TapRegion(
-                  groupId: ContextMeter.tapRegionGroupId,
-                  onTapOutside: (_) {
-                    if (_contextPanelOpen) _toggleContextPanel();
-                  },
-                  child: ContextUsagePanel(
-                    usage: usage,
-                    stats: _session.stats,
-                    session: _session,
-                    popover: true,
-                    onClose: _toggleContextPanel,
+            ),
+            if (footer > 0)
+              // Under the card, at the composer's width: the row there with
+              // nothing in it too, the card's foot where the side panel's is.
+              // What the place it is in has after it (the IDE's status
+              // bar's right items) is told how wide it is.
+              SizedBox(
+                height: footer,
+                child: _ConversationColumn(
+                  maxWidth: _maxContentWidth,
+                  minimap: false,
+                  inset: Islands.inset,
+                  bottom: 0,
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: IslandFootTrailing.leading(
+                      context,
+                      _buildFoot(),
+                    ),
                   ),
                 ),
               ),
+          ],
         ],
       ),
     );
   }
 
-  /// The row under the card: [ChatScreen.below] (where the agent works),
-  /// and how full the context is, at the row's end; right after the other
-  /// where the row has more after it (the IDE's status bar's items).
+  /// The row under the card: [ChatScreen.below] (where the agent works).
   Widget _buildFoot() {
     final below = _agentShown == null ? widget.below : null;
-    final meter = _agentShown == null
-        ? ListenableBuilder(
-            listenable: _session,
-            builder: (context, _) => switch (_session.context) {
-              final usage? => ContextMeter(
-                usage: usage,
-                active: _contextPanelOpen,
-                tooltip: [
-                  ChatKeys.titleWithKey(
-                    context.l10n.composerContextUsage,
-                    ChatCommandIds.toggleContextPanel,
-                    const {ChatContextKeys.inChat: true},
-                  ),
-                  usage.window == 0
-                      ? ContextMeter.format(usage.used)
-                      : '${(usage.fraction * 100).round()}% (${ContextMeter.format(usage.used)} / ${ContextMeter.format(usage.window)})',
-                ].join(' · '),
-                onTap: _toggleContextPanel,
-              ),
-              null => const SizedBox.shrink(),
-            },
-          )
-        : null;
-    if (IslandFootTrailing.hosts(context)) {
-      return LayoutBuilder(
-        builder: (context, constraints) => Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (below != null) Flexible(child: below),
-            if (meter != null && constraints.maxWidth >= 180) meter,
-          ],
-        ),
-      );
-    }
-    return LayoutBuilder(
-      builder: (context, constraints) => Row(
-        children: [
-          Expanded(
-            child: Align(alignment: Alignment.centerLeft, child: below),
-          ),
-          if (meter != null && constraints.maxWidth >= 180) meter,
-        ],
-      ),
-    );
+    return below ?? const SizedBox.shrink();
   }
 
-  /// Whether the context's meter is in the row under the card (or on it,
-  /// [_footOnCard]), not in the composer.
-  bool get _meterInFoot => _footer > 0 || _footOnCard;
-
   /// Whether the row under the card is on it, under the composer (see
-  /// [ChatScreen.footOnCard]): not where what is around it shows it.
+  /// [ChatScreen.footOnCard]): only when [ChatScreen.below] has content and
+  /// what is around it does not host the foot.
   bool get _footOnCard =>
       widget.footOnCard &&
+      widget.below != null &&
       _island != null &&
       !IslandFootHosted.of(context);
 
@@ -1577,12 +1503,12 @@ class _ChatScreenState extends State<ChatScreen>
   bool get _onCard =>
       _island != null || IslandSurface.colorOf(context) != null;
 
-  /// The row under the card, on the window's color: its own card's, or the
-  /// one it is on's (the IDE's), if that leaves one; else 0, [ChatScreen.below]
-  /// under the input.
+  /// The row under the card, on the window's color: its own card's (when
+  /// [ChatScreen.below] is shown), or the one it is on's (the IDE's), if that
+  /// leaves one; else 0.
   double get _footer => IslandFootHosted.of(context) || _footOnCard
       ? 0
-      : widget.island != null
+      : widget.island != null && widget.below != null
       ? Islands.belowHeight
       : IslandSurface.footerOf(context);
 
@@ -1925,7 +1851,7 @@ class _ChatScreenState extends State<ChatScreen>
             _ => null,
           },
           contextPanelOpen: _contextPanelOpen,
-          onToggleContextPanel: _meterInFoot ? null : _toggleContextPanel,
+          onToggleContextPanel: _toggleContextPanel,
           onIntercept: widget.onSideQuestion == null && widget.onFork == null
               ? null
               : _intercept,
@@ -1935,7 +1861,13 @@ class _ChatScreenState extends State<ChatScreen>
         if (_footOnCard)
           Padding(
             padding: const EdgeInsets.only(top: 4),
-            child: SizedBox(height: Islands.belowHeight, child: _buildFoot()),
+            child: SizedBox(
+              height: Islands.belowHeight,
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: _buildFoot(),
+              ),
+            ),
           )
         else if (_footer == 0 && !IslandFootHosted.of(context))
           ?widget.below,

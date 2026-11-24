@@ -1800,6 +1800,9 @@ class AppLocalizationsZh extends AppLocalizations {
   String get sidebarGroupingProject => '项目';
 
   @override
+  String get sidebarGroupingKernel => '内核';
+
+  @override
   String get sidebarGroupingDate => '日期';
 
   @override
@@ -1807,6 +1810,9 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get sidebarByProject => '按项目';
+
+  @override
+  String get sidebarByKernel => '按内核';
 
   @override
   String get sidebarByDate => '按日期';

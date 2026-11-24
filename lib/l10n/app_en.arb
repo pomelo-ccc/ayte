@@ -914,9 +914,11 @@
     "description": "Button that starts a new agent."
   },
   "sidebarGroupingProject": "Project",
+  "sidebarGroupingKernel": "Kernel",
   "sidebarGroupingDate": "Date",
   "sidebarGroupingStatus": "Status",
   "sidebarByProject": "By project",
+  "sidebarByKernel": "By kernel",
   "sidebarByDate": "By date",
   "sidebarByStatus": "By status",
   "sidebarProjectSortRecent": "Recent activity",

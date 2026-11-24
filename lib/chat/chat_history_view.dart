@@ -2523,6 +2523,7 @@ class _ChatHistoryViewState extends State<ChatHistoryView>
       final view = ChatItemView(
         key: item is LiveStatusItem ? _statusKey : ValueKey(index),
         item: item,
+        itemIndex: index,
         session: switch (_feed) {
           final ChatSession s => s,
           _ => null,

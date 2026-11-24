@@ -20,6 +20,7 @@ class ContextMeter extends StatelessWidget {
     required this.tooltip,
     required this.onTap,
     this.labeled = false,
+    this.compactPercent = false,
   });
 
   final ContextUsage usage;
@@ -32,6 +33,10 @@ class ContextMeter extends StatelessWidget {
   /// With how many tokens of how many after the ring (`100K / 200K`),
   /// in [AppColors.caution] once [warnAt] of it is used.
   final bool labeled;
+
+  /// Compact ghost-pill style next to the composer's model picker: a crisp
+  /// 13px ring paired with a subtle tabular percentage (e.g. `34%`).
+  final bool compactPercent;
 
   /// Thresholds for caution (amber) and critical (coral-red) states.
   static const cautionAt = 0.65;
@@ -59,14 +64,19 @@ class ContextMeter extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final colors = themeColors;
+    final dark = colors.dark;
     final fraction = usage.fraction;
     final warn = fraction >= warnAt;
+    final caution = fraction >= cautionAt;
     final arcColor = _arcColorFor(fraction);
-    final trackColor = (colors.dark ? Colors.white : Colors.black).withValues(
-      alpha: colors.dark ? 0.24 : 0.16,
+    final trackColor = (dark ? Colors.white : Colors.black).withValues(
+      alpha: dark ? 0.22 : 0.14,
     );
+    final showPercent = compactPercent && !labeled;
+    final ringDim = showPercent ? 13.0 : 16.0;
+    final strokeWidth = showPercent ? 1.9 : 2.35;
     final ring = SizedBox.square(
-      dimension: 16,
+      dimension: ringDim,
       child: TweenAnimationBuilder<double>(
         tween: Tween(end: fraction),
         duration: const Duration(milliseconds: 400),
@@ -75,59 +85,114 @@ class ContextMeter extends StatelessWidget {
             value,
             track: trackColor,
             arc: arcColor,
+            strokeWidth: strokeWidth,
           ),
         ),
       ),
     );
+    final pct = (fraction * 100).round().clamp(0, 100);
+    final summary = usage.window == 0
+        ? format(usage.used)
+        : '$pct% (${format(usage.used)} / ${format(usage.window)})';
+    final hoverContent = tooltip.contains(' · ')
+        ? null
+        : Text('$tooltip · $summary');
+    final ghostBgActive = (dark ? Colors.white : Colors.black).withValues(
+      alpha: dark ? 0.10 : 0.065,
+    );
+    final ghostBgHover = (dark ? Colors.white : Colors.black).withValues(
+      alpha: dark ? 0.07 : 0.045,
+    );
     return TapRegion(
       groupId: tapRegionGroupId,
       child: IdeHover(
+        position: IdeHoverPosition.above,
         message: tooltip,
+        content: hoverContent,
         child: HoverBuilder(
           cursor: SystemMouseCursors.click,
-          builder: (context, hovered) => GestureDetector(
-            onTap: onTap,
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 120),
-              width: labeled ? null : 26,
-              height: 26,
-              padding: labeled
-                  ? const EdgeInsets.symmetric(horizontal: 6)
-                  : EdgeInsets.zero,
-              // The ring keeps its square: the box is taller than it.
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: active
-                    ? colors['toolbar.activeBackground']
-                    : hovered
-                    ? colors['toolbar.hoverBackground']
-                    : Colors.transparent,
-                borderRadius: BorderRadius.circular(labeled ? 5 : 13),
-              ),
-              child: labeled
-                  ? Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        ring,
-                        const SizedBox(width: 5),
-                        Text(
-                          usage.window == 0
-                              ? format(usage.used)
-                              : '${format(usage.used)} / ${format(usage.window)}',
-                          maxLines: 1,
-                          style: TextStyle(
-                            color: warn
-                                ? AppColors.caution
-                                : AppColors.textFaint,
-                            fontSize: 12,
-                            fontFeatures: const [FontFeature.tabularFigures()],
+          builder: (context, hovered) {
+            final compactTextColor = warn
+                ? const Color(0xFFDC3E3E)
+                : caution
+                ? const Color(0xFFD98B1C)
+                : (active || hovered ? AppColors.textMuted : AppColors.textFaint);
+            return GestureDetector(
+              // Keeps editor focus while opening the popover.
+              onTapDown: (_) {},
+              onTap: onTap,
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 120),
+                width: (labeled || showPercent) ? null : 26,
+                height: showPercent ? 25 : 26,
+                padding: (labeled || showPercent)
+                    ? const EdgeInsets.symmetric(horizontal: 6)
+                    : EdgeInsets.zero,
+                // The ring keeps its square: the box is taller than it.
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: showPercent
+                      ? (active
+                            ? ghostBgActive
+                            : hovered
+                            ? ghostBgHover
+                            : Colors.transparent)
+                      : (active
+                            ? colors['toolbar.activeBackground']
+                            : hovered
+                            ? colors['toolbar.hoverBackground']
+                            : Colors.transparent),
+                  borderRadius: BorderRadius.circular(
+                    showPercent ? 7 : (labeled ? 5 : 13),
+                  ),
+                ),
+                child: labeled
+                    ? Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          ring,
+                          const SizedBox(width: 5),
+                          Text(
+                            usage.window == 0
+                                ? format(usage.used)
+                                : '${format(usage.used)} / ${format(usage.window)}',
+                            maxLines: 1,
+                            style: TextStyle(
+                              color: warn
+                                  ? AppColors.caution
+                                  : AppColors.textFaint,
+                              fontSize: 12,
+                              fontFeatures: const [
+                                FontFeature.tabularFigures(),
+                              ],
+                            ),
                           ),
-                        ),
-                      ],
-                    )
-                  : ring,
-            ),
-          ),
+                        ],
+                      )
+                    : showPercent
+                    ? Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          ring,
+                          const SizedBox(width: 5),
+                          Text(
+                            usage.window == 0 ? format(usage.used) : '$pct%',
+                            maxLines: 1,
+                            style: TextStyle(
+                              color: compactTextColor,
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w500,
+                              fontFeatures: const [
+                                FontFeature.tabularFigures(),
+                              ],
+                            ),
+                          ),
+                        ],
+                      )
+                    : ring,
+              ),
+            );
+          },
         ),
       ),
     );
@@ -137,15 +202,20 @@ class ContextMeter extends StatelessWidget {
 /// As upstream's context usage widget: the track `disabledForeground`, the
 /// arc `icon.foreground`.
 class _RingPainter extends CustomPainter {
-  _RingPainter(this.fraction, {required this.track, required this.arc});
+  _RingPainter(
+    this.fraction, {
+    required this.track,
+    required this.arc,
+    this.strokeWidth = 2.35,
+  });
 
   final double fraction;
   final Color track;
   final Color arc;
+  final double strokeWidth;
 
   @override
   void paint(Canvas canvas, Size size) {
-    const strokeWidth = 2.35;
     final center = Offset(size.width / 2, size.height / 2);
     final radius = (math.min(size.width, size.height) - strokeWidth) / 2;
     final rect = Rect.fromCircle(center: center, radius: radius);
@@ -178,5 +248,6 @@ class _RingPainter extends CustomPainter {
   bool shouldRepaint(_RingPainter oldDelegate) =>
       oldDelegate.fraction != fraction ||
       oldDelegate.track != track ||
-      oldDelegate.arc != arc;
+      oldDelegate.arc != arc ||
+      oldDelegate.strokeWidth != strokeWidth;
 }

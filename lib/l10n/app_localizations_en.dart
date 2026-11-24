@@ -1840,6 +1840,9 @@ class AppLocalizationsEn extends AppLocalizations {
   String get sidebarGroupingProject => 'Project';
 
   @override
+  String get sidebarGroupingKernel => 'Kernel';
+
+  @override
   String get sidebarGroupingDate => 'Date';
 
   @override
@@ -1847,6 +1850,9 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get sidebarByProject => 'By project';
+
+  @override
+  String get sidebarByKernel => 'By kernel';
 
   @override
   String get sidebarByDate => 'By date';

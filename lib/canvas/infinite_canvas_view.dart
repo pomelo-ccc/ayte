@@ -1607,9 +1607,13 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView>
                             children: [
                               // Multi-Workflow Document Switcher
                               PopupMenuButton<String>(
-                                tooltip: isZh
-                                    ? '切换或管理多条工作流画布'
-                                    : 'Switch or manage workflow documents',
+                                tooltip: _ctrl.activeWorkflowName.isEmpty
+                                    ? (isZh
+                                          ? '切换或管理多条工作流画布'
+                                          : 'Switch or manage workflow documents')
+                                    : (isZh
+                                          ? '${_ctrl.activeWorkflowName}（点击切换或管理工作流）'
+                                          : '${_ctrl.activeWorkflowName} (Switch or manage workflows)'),
                                 offset: const Offset(0, 38),
                                 color: menuBg,
                                 surfaceTintColor: Colors.transparent,
@@ -1789,17 +1793,13 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView>
                                       ),
                                     ),
                                 ],
-                                child: ConstrainedBox(
-                                  constraints: const BoxConstraints(
-                                    maxWidth: 158,
-                                  ),
-                                  child: _ToolbarPill(
-                                    icon: Codicons.layers,
-                                    label: _ctrl.activeWorkflowName.isEmpty
-                                        ? (isZh ? '默认工作流' : 'Workflow')
-                                        : _ctrl.activeWorkflowName,
-                                    chevron: true,
-                                  ),
+                                child: _ToolbarPill(
+                                  icon: Codicons.layers,
+                                  label: _ctrl.activeWorkflowName.isEmpty
+                                      ? (isZh ? '默认工作流' : 'Workflow')
+                                      : _ctrl.activeWorkflowName,
+                                  chevron: true,
+                                  maxWidth: 184,
                                 ),
                               ),
                               const SizedBox(width: 6),
@@ -2354,6 +2354,7 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView>
                                     icon: Codicons.hubot,
                                     label: _workflowModelBadgeLabel(isZh),
                                     chevron: true,
+                                    maxWidth: 200,
                                     active:
                                         _ctrl.defaultModel.isNotEmpty ||
                                         _ctrl.nodes.any(
@@ -5225,19 +5226,36 @@ class _ToolbarPill extends StatelessWidget {
     required this.label,
     this.chevron = false,
     this.active = false,
+    this.maxWidth,
   });
 
   final IconData icon;
   final String label;
   final bool chevron;
   final bool active;
+  final double? maxWidth;
 
   @override
   Widget build(BuildContext context) {
     final colors = themeColors;
     final dark = colors.dark;
+    final labelText = Text(
+      label,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      softWrap: false,
+      style: TextStyle(
+        fontSize: 11.5,
+        fontWeight: FontWeight.w500,
+        color: colors['foreground'],
+      ),
+    );
     return Container(
       height: 30,
+      constraints: maxWidth != null
+          ? BoxConstraints(maxWidth: maxWidth!)
+          : null,
+      clipBehavior: Clip.hardEdge,
       padding: const EdgeInsets.symmetric(horizontal: 10),
       decoration: BoxDecoration(
         color: active
@@ -5263,14 +5281,7 @@ class _ToolbarPill extends StatelessWidget {
             color: active ? colors['button.background'] : colors['foreground'],
           ),
           const SizedBox(width: 5),
-          Text(
-            label,
-            style: TextStyle(
-              fontSize: 11.5,
-              fontWeight: FontWeight.w500,
-              color: colors['foreground'],
-            ),
-          ),
+          if (maxWidth != null) Flexible(child: labelText) else labelText,
           if (chevron) ...[
             const SizedBox(width: 3),
             Icon(

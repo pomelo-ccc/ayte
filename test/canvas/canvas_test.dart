@@ -364,6 +364,44 @@ Linux: /tmp/run_1/trace.md
     );
 
     testWidgets(
+      'InfiniteCanvasView truncates long workflow names in toolbar pill without overflow',
+      (tester) async {
+        final ctrl = CanvasController.instance;
+        ctrl.clearBoard();
+        ctrl.renameActiveWorkflow(
+          'Jenkins 69-sts 极速精准部署（LC → BC → 目标应用）',
+        );
+        ctrl.addNode(
+          kind: CanvasNodeKind.command,
+          title: 'Deploy',
+          x: 120,
+          y: 120,
+          content: 'echo deploy',
+        );
+
+        tester.view.physicalSize = const Size(1280, 760);
+        tester.view.devicePixelRatio = 1.0;
+        await tester.pumpWidget(
+          const MaterialApp(
+            locale: Locale('zh'),
+            home: Scaffold(body: InfiniteCanvasView()),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(
+          find.text('Jenkins 69-sts 极速精准部署（LC → BC → 目标应用）'),
+          findsOneWidget,
+        );
+        expect(tester.takeException(), isNull);
+
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+        ctrl.clearBoard();
+      },
+    );
+
+    testWidgets(
       'WorkflowCelebrationOverlay displays inspect CTA and dismisses cleanly',
       (tester) async {
         final ctrl = CanvasController.forTest();

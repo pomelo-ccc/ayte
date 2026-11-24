@@ -216,6 +216,14 @@ class AntigravityCatalog implements SessionCatalog, MovesSessions {
         final pb = pbEntries[id];
         final existing = byId[id];
 
+        // Skip Ayte-bridged shadow sessions (which duplicate an existing Ayte
+        // `.jsonl` session under a different UUID and would resurrect archived
+        // sessions), deleted Ayte sessions left behind in `brain/`, and `agy`
+        // subagent/workflow worker child sessions.
+        if (existing == null && parsed.skipUnsynced) {
+          continue;
+        }
+
         final promptTitle = parsed.title;
         final pbTitle = _cleanTitle(pb?.title);
         final resolvedTitle = (promptTitle != null && promptTitle.isNotEmpty)
@@ -389,6 +397,7 @@ class AntigravityCatalog implements SessionCatalog, MovesSessions {
       }
 
       final parsed = _parseTranscriptSummary(transcriptFile);
+      if (parsed.skipUnsynced) continue;
       final pb = pbEntries[id];
       final promptTitle = parsed.title;
       final pbTitle = _cleanTitle(pb?.title);
@@ -571,11 +580,40 @@ class AntigravityCatalog implements SessionCatalog, MovesSessions {
     return '${text.substring(0, cut)}…';
   }
 
-  static ({String? title, String? cwd, DateTime? updatedAt})
+  static bool _isShadowOrSubagentUserInput(String raw) {
+    if (raw.isEmpty) return false;
+    // 1. Ayte-bridged shadow conversation created when an existing Ayte
+    //    session (tracked under a different UUID in `~/.ayte/projects/*.jsonl`)
+    //    switches to Antigravity CLI. Listing it would duplicate the primary
+    //    session and resurrect archived sessions as unarchived.
+    if (raw.contains(
+      'Previous turns in this session before switching to Antigravity CLI:',
+    )) {
+      return true;
+    }
+    // 2. Ayte/BaoCode-originated session whose `.jsonl` no longer exists in
+    //    `~/.ayte/projects/` (e.g. deleted before `AntigravityCatalog.delete`
+    //    also cleaned `brain/`).
+    if (raw.contains('Reply suggestions are on:') ||
+        raw.contains('Reply suggestions still on:')) {
+      return true;
+    }
+    // 3. `agy` subagent / `run_workflow` worker child session.
+    if (raw.contains(
+      'When you are done, call the finish tool with your result.',
+    )) {
+      return true;
+    }
+    return false;
+  }
+
+  static ({String? title, String? cwd, DateTime? updatedAt, bool skipUnsynced})
   _parseTranscriptSummary(File file) {
     String? title;
     String? cwd;
     DateTime? updatedAt;
+    var sawUserInput = false;
+    var skipUnsynced = false;
 
     void inspectLine(String rawLine, {required bool lookForTitle}) {
       final line = rawLine.trim();
@@ -596,10 +634,13 @@ class AntigravityCatalog implements SessionCatalog, MovesSessions {
         }
       }
 
-      if (lookForTitle && title == null && step['type'] == 'USER_INPUT') {
+      if (lookForTitle &&
+          (!sawUserInput || title == null) &&
+          step['type'] == 'USER_INPUT') {
         final content = step['content'];
+        String? rawText;
         if (content is String) {
-          title = _extractUserInputTitle(content);
+          rawText = content;
         } else if (content is List) {
           final textParts = [
             for (final block in content)
@@ -607,8 +648,17 @@ class AntigravityCatalog implements SessionCatalog, MovesSessions {
                 block['text'] as String,
           ].join('\n');
           if (textParts.isNotEmpty) {
-            title = _extractUserInputTitle(textParts);
+            rawText = textParts;
           }
+        }
+        if (rawText != null) {
+          if (!sawUserInput) {
+            sawUserInput = true;
+            if (_isShadowOrSubagentUserInput(rawText)) {
+              skipUnsynced = true;
+            }
+          }
+          title ??= _extractUserInputTitle(rawText);
         }
       }
 
@@ -689,7 +739,12 @@ class AntigravityCatalog implements SessionCatalog, MovesSessions {
       // Return whatever partial metadata was decoded safely.
     }
 
-    return (title: title, cwd: cwd, updatedAt: updatedAt);
+    return (
+      title: title,
+      cwd: cwd,
+      updatedAt: updatedAt,
+      skipUnsynced: skipUnsynced,
+    );
   }
 
   static bool _hasNonWhitespace(Uint8List bytes, int start) {

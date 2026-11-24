@@ -618,10 +618,22 @@ printf '%s\\n' '{"event":"result","result":{"status":"SUCCESS","response":"done"
       expect(ownPromptInstr, contains('Do not invoke user-configured MCP'));
     });
 
-    test('buildSessionSettings builds allow/deny rules and omits empty map', () {
+    test('buildSessionSettings builds allow/deny rules without invalid Claude Read rules', () {
       expect(
         AntigravityTransport.buildSessionSettings(
           const ClaudeLaunch(cwd: '/app'),
+        ),
+        isEmpty,
+      );
+
+      // `readable` folders are passed via `--add-dir`, never as Claude `Read(...)`
+      // allow entries (which `agy` rejects and which would overwrite user allowlists).
+      expect(
+        AntigravityTransport.buildSessionSettings(
+          const ClaudeLaunch(
+            cwd: '/app',
+            readable: [r'C:\data\pastes'],
+          ),
         ),
         isEmpty,
       );
@@ -630,7 +642,7 @@ printf '%s\\n' '{"event":"result","result":{"status":"SUCCESS","response":"done"
         ClaudeLaunch(
           cwd: '/app',
           readable: const [r'C:\data\pastes'],
-          allowed: const ['WebFetch'],
+          allowed: const ['command(ls)', 'command(ls)', 'WebFetch'],
           tools: const ['Read'],
           switches: const ExtensionSwitches(
             disabledServers: {'srv'},
@@ -641,18 +653,11 @@ printf '%s\\n' '{"event":"result","result":{"status":"SUCCESS","response":"done"
         ),
       );
       final perms = settings['permissions'] as Map;
-      expect(perms['allow'], containsAll(['Read(//c/data/pastes/**)', 'WebFetch']));
-      expect(perms['deny'], containsAll(['mcp__srv', 'mcp__baocode__foo', 'run_command', 'edit_file']));
-
-      final dedupSettings = AntigravityTransport.buildSessionSettings(
-        const ClaudeLaunch(
-          cwd: '/app',
-          readable: [r'C:\Data\Pastes', r'c:\data\pastes'],
-        ),
+      expect(perms['allow'], ['command(ls)', 'WebFetch']);
+      expect(
+        perms['deny'],
+        containsAll(['mcp__srv', 'mcp__baocode__foo', 'run_command', 'edit_file']),
       );
-      final dedupAllow =
-          (dedupSettings['permissions'] as Map)['allow'] as List;
-      expect(dedupAllow, hasLength(Platform.isWindows ? 1 : 2));
     });
 
     test(
@@ -1315,6 +1320,16 @@ printf '%s\\n' '{"event":"result","result":{"status":"SUCCESS","response":"done"
 
       expect(argsFor('plan'), contains('--mode=plan'));
       expect(argsFor('plan'), isNot(contains('--dangerously-skip-permissions')));
+
+      final planWithAutoApprove = AntigravityTransport.buildCliArguments(
+        model: 'gemini-3.8-flash',
+        effort: 'high',
+        permissionMode: 'plan',
+        autoApproveInPlan: true,
+        maxContextTokens: 256000,
+      );
+      expect(planWithAutoApprove, contains('--mode=plan'));
+      expect(planWithAutoApprove, contains('--dangerously-skip-permissions'));
 
       expect(argsFor('bypassPermissions'), contains('--dangerously-skip-permissions'));
       expect(argsFor('bypassPermissions').any((a) => a.startsWith('--mode=')), isFalse);
@@ -3255,6 +3270,351 @@ Future<void> main(List<String> args) async {
         await tr.exited;
         await AntigravityTransport.stopAll();
         await tester.pump();
+      },
+    );
+
+    test(
+      'plan mode preserves --dangerously-skip-permissions with autoModeDuringPlan, responds to useAutoModeDuringPlan toggles, and adds agy-img via --add-dir',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp('agy_plan_bypass_');
+        addTearDown(() => _deleteWithRetry(tmp));
+        final prevDataDir = DataDirectory.current;
+        DataDirectory.current = DataDirectory(p.join(tmp.path, 'app_data'));
+        addTearDown(() => DataDirectory.current = prevDataDir);
+
+        final fakeAgy = FakeCliExecutable.create(
+          tmp,
+          name: 'fake_agy_plan_bypass',
+          dartBody: r'''
+Future<void> main(List<String> args) async {
+  recordEvent({'type': 'launch', 'args': args});
+  await for (final line in stdin.transform(utf8.decoder).transform(const LineSplitter())) {
+    if (line.trim().isEmpty) continue;
+    stdout.writeln(jsonEncode({'event': 'init', 'conversation_id': 'conv-plan-bypass'}));
+    stdout.writeln(jsonEncode({
+      'event': 'result',
+      'result': {'conversation_id': 'conv-plan-bypass', 'status': 'SUCCESS', 'response': 'ok'},
+    }));
+    await stdout.flush();
+  }
+}
+''',
+        );
+
+        final transport = AntigravityTransport.forTesting(
+          executable: fakeAgy.executablePath,
+          environment: {'HOME': tmp.path},
+          launch: ClaudeLaunch(
+            cwd: tmp.path,
+            permissionMode: 'bypassPermissions',
+            autoModeDuringPlan: true,
+            persist: false,
+          ),
+        );
+        addTearDown(() async {
+          transport.close();
+          await transport.exited;
+        });
+
+        var results = 0;
+        final sub = transport.messages.listen((m) {
+          if (m['type'] == 'result') results++;
+        });
+        addTearDown(sub.cancel);
+
+        // Switch into Plan mode before turn 1 (same order as ClaudeCodeKernel).
+        transport.write({
+          'type': 'control_request',
+          'request_id': 'm1',
+          'request': {'subtype': 'set_permission_mode', 'mode': 'plan'},
+        });
+        transport.write({
+          'type': 'user',
+          'uuid': 'u1',
+          'message': {'role': 'user', 'content': 'plan with full access'},
+        });
+        while (results < 1) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+
+        // Toggle useAutoModeDuringPlan -> false while still in plan mode.
+        transport.write({
+          'type': 'control_request',
+          'request_id': 'f1',
+          'request': {
+            'subtype': 'apply_flag_settings',
+            'settings': {'useAutoModeDuringPlan': false},
+          },
+        });
+        await Future<void>.delayed(const Duration(milliseconds: 40));
+        transport.write({
+          'type': 'user',
+          'uuid': 'u2',
+          'message': {'role': 'user', 'content': 'plan without auto approve'},
+        });
+        while (results < 2) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+
+        // Toggle useAutoModeDuringPlan -> true while still in plan mode.
+        transport.write({
+          'type': 'control_request',
+          'request_id': 'f2',
+          'request': {
+            'subtype': 'apply_flag_settings',
+            'settings': {'useAutoModeDuringPlan': true},
+          },
+        });
+        await Future<void>.delayed(const Duration(milliseconds: 40));
+        transport.write({
+          'type': 'user',
+          'uuid': 'u3',
+          'message': {'role': 'user', 'content': 'plan with auto approve again'},
+        });
+        while (results < 3) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+
+        final launches = fakeAgy
+            .readCaptures()
+            .where((e) => e['type'] == 'launch')
+            .map((e) => (e['args'] as List).cast<String>())
+            .toList();
+        expect(launches, hasLength(3));
+
+        final expectedImgRoot = p.join(DataDirectory.current.cacheDir, 'agy-img');
+        expect(launches[0], contains('--mode=plan'));
+        expect(launches[0], contains('--dangerously-skip-permissions'));
+        expect(launches[0], contains('--add-dir=$expectedImgRoot'));
+
+        expect(launches[1], contains('--mode=plan'));
+        expect(launches[1], isNot(contains('--dangerously-skip-permissions')));
+        expect(launches[1], contains('--add-dir=$expectedImgRoot'));
+
+        expect(launches[2], contains('--mode=plan'));
+        expect(launches[2], contains('--dangerously-skip-permissions'));
+      },
+    );
+
+    test(
+      'surfaces explicit notice when non-interactive permission denial aborts turn after prelude text, and stays quiet when model recovers',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp('agy_perm_abort_');
+        addTearDown(() => _deleteWithRetry(tmp));
+
+        final fakeAgy = FakeCliExecutable.create(
+          tmp,
+          name: 'fake_agy_perm_abort',
+          dartBody: r'''
+Future<void> main(List<String> args) async {
+  var turn = 0;
+  await for (final line in stdin.transform(utf8.decoder).transform(const LineSplitter())) {
+    if (line.trim().isEmpty) continue;
+    turn++;
+    stdout.writeln(jsonEncode({'event': 'init', 'conversation_id': 'conv-perm'}));
+    if (turn == 1) {
+      stdout.writeln(jsonEncode({
+        'event': 'step_update',
+        'step_update': {
+          'step_index': 1,
+          'step_type': 'agent_response',
+          'state': 'DONE',
+          'text_delta': 'I will inspect Swagger first.',
+        },
+      }));
+      stdout.writeln(jsonEncode({
+        'event': 'step_update',
+        'step_update': {
+          'step_index': 2,
+          'step_type': 'tool',
+          'state': 'ERROR',
+          'tool_info': {
+            'name': 'run_command',
+            'parameters': {'CommandLine': '"curl http://example.com"'},
+            'error': 'permission check failed for unsandboxed "curl http://example.com": user denied permission',
+          },
+        },
+      }));
+      stdout.writeln(jsonEncode({
+        'event': 'result',
+        'result': {
+          'conversation_id': 'conv-perm',
+          'status': 'SUCCESS',
+          'response': '',
+        },
+      }));
+    } else {
+      stdout.writeln(jsonEncode({
+        'event': 'step_update',
+        'step_update': {
+          'step_index': 3,
+          'step_type': 'agent_response',
+          'state': 'DONE',
+          'text_delta': 'Checking file.',
+        },
+      }));
+      stdout.writeln(jsonEncode({
+        'event': 'step_update',
+        'step_update': {
+          'step_index': 4,
+          'step_type': 'tool',
+          'state': 'ERROR',
+          'tool_info': {
+            'name': 'read_file',
+            'parameters': {'Path': '"/secret"'},
+            'error': 'permission check failed for read_file "/secret": user denied permission',
+          },
+        },
+      }));
+      stdout.writeln(jsonEncode({
+        'event': 'step_update',
+        'step_update': {
+          'step_index': 5,
+          'step_type': 'agent_response',
+          'state': 'DONE',
+          'text_delta': 'No problem, moving on without reading /secret.',
+        },
+      }));
+      stdout.writeln(jsonEncode({
+        'event': 'result',
+        'result': {
+          'conversation_id': 'conv-perm',
+          'status': 'SUCCESS',
+          'response': '',
+        },
+      }));
+    }
+    await stdout.flush();
+  }
+}
+''',
+        );
+
+        final transport = AntigravityTransport.forTesting(
+          executable: fakeAgy.executablePath,
+          environment: {'HOME': tmp.path},
+          launch: ClaudeLaunch(cwd: tmp.path, persist: false),
+        );
+        addTearDown(() async {
+          transport.close();
+          await transport.exited;
+        });
+
+        final emitted = <Map<String, Object?>>[];
+        var results = 0;
+        final sub = transport.messages.listen((m) {
+          emitted.add(m);
+          if (m['type'] == 'result') results++;
+        });
+        addTearDown(sub.cancel);
+
+        transport.write({
+          'type': 'user',
+          'uuid': 't1',
+          'message': {'role': 'user', 'content': 'turn 1'},
+        });
+        while (results < 1) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+
+        final abortMsgs = emitted
+            .where((m) => m['type'] == 'assistant' && '${m['uuid']}'.startsWith('agy-perm-abort-'))
+            .toList();
+        expect(abortMsgs, hasLength(1));
+        final abortContent =
+            (((abortMsgs.single['message'] as Map)['content'] as List).first as Map)['text']
+                as String;
+        expect(abortContent, contains('permission check failed'));
+
+        transport.write({
+          'type': 'user',
+          'uuid': 't2',
+          'message': {'role': 'user', 'content': 'turn 2'},
+        });
+        while (results < 2) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+
+        final abortMsgsAfterTurn2 = emitted
+            .where((m) => m['type'] == 'assistant' && '${m['uuid']}'.startsWith('agy-perm-abort-'))
+            .toList();
+        expect(
+          abortMsgsAfterTurn2,
+          hasLength(1),
+          reason: 'No abort notice when model already responded after tool denial',
+        );
+      },
+    );
+
+    test(
+      'ClaudeCodeKernel with Full access + Plan mode launches agy with both --mode=plan and --dangerously-skip-permissions and no invalid Read() settings',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp('agy_kernel_plan_');
+        addTearDown(() => _deleteWithRetry(tmp));
+        final prevDataDir = DataDirectory.current;
+        DataDirectory.current = DataDirectory(p.join(tmp.path, 'app_data'));
+        addTearDown(() => DataDirectory.current = prevDataDir);
+
+        final fakeAgy = FakeCliExecutable.create(
+          tmp,
+          name: 'fake_agy_kernel_plan',
+          dartBody: r'''
+Future<void> main(List<String> args) async {
+  recordEvent({'type': 'launch', 'args': args});
+  await for (final line in stdin.transform(utf8.decoder).transform(const LineSplitter())) {
+    if (line.trim().isEmpty) continue;
+    stdout.writeln(jsonEncode({'event': 'init', 'conversation_id': 'conv-kp'}));
+    stdout.writeln(jsonEncode({
+      'event': 'result',
+      'result': {'conversation_id': 'conv-kp', 'status': 'SUCCESS', 'response': 'planned'},
+    }));
+    await stdout.flush();
+  }
+}
+''',
+        );
+
+        final kernel = ClaudeCodeKernel(
+          KernelRegistry.antigravity,
+          KernelContext(cwd: tmp.path),
+          start: (launch) async => AntigravityTransport.forTesting(
+            executable: fakeAgy.executablePath,
+            environment: {'HOME': tmp.path},
+            launch: launch,
+          ),
+        );
+        addTearDown(kernel.dispose);
+
+        var turnsEnded = 0;
+        final sub = kernel.events.listen((e) {
+          if (e is TurnEnded) turnsEnded++;
+        });
+        addTearDown(sub.cancel);
+
+        kernel.permission.select('bypassPermissions');
+        kernel.mode.select('plan');
+        kernel.send(const KernelTurn(id: 'kp1', text: 'design the plan'));
+        while (turnsEnded < 1) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+
+        final launches = fakeAgy
+            .readCaptures()
+            .where((e) => e['type'] == 'launch')
+            .map((e) => (e['args'] as List).cast<String>())
+            .toList();
+        expect(launches, hasLength(1));
+        final args = launches.single;
+        expect(args, contains('--mode=plan'));
+        expect(args, contains('--dangerously-skip-permissions'));
+        expect(
+          args.where((a) => a.startsWith('--settings=') && a.contains('Read(')),
+          isEmpty,
+        );
+        expect(
+          args,
+          contains('--add-dir=${p.join(DataDirectory.current.cacheDir, 'agy-img')}'),
+        );
       },
     );
   });

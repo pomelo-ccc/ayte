@@ -4,24 +4,29 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter/widgets.dart';
 
 /// The composer's pickers in a row, centered on it: each as wide as it is
-/// but the last (the model, whose label is the long one), which is given
-/// what is left of [maxWidth] and cuts its label short there, down to
-/// [minLast]. Past that the row is wider than [maxWidth], for its parent to
-/// scroll.
+/// except the flexible picker (by default the last child, or [trailingCount]
+/// from the end when fixed trailing badges such as the context meter follow
+/// the model picker), which is given what is left of [maxWidth] and cuts its
+/// label short there, down to [minLast]. Past that the row is wider than
+/// [maxWidth], for its parent to scroll.
 class PickersRow extends MultiChildRenderObjectWidget {
   const PickersRow({
     super.key,
     required this.maxWidth,
     this.minLast = 64,
+    this.trailingCount = 0,
     super.children,
   });
 
   final double maxWidth;
   final double minLast;
 
+  /// Number of fixed-width trailing children after the flexible picker.
+  final int trailingCount;
+
   @override
   RenderObject createRenderObject(BuildContext context) =>
-      RenderPickersRow(maxWidth, minLast);
+      RenderPickersRow(maxWidth, minLast, trailingCount);
 
   @override
   void updateRenderObject(
@@ -29,7 +34,8 @@ class PickersRow extends MultiChildRenderObjectWidget {
     RenderPickersRow renderObject,
   ) => renderObject
     ..maxWidth = maxWidth
-    ..minLast = minLast;
+    ..minLast = minLast
+    ..trailingCount = trailingCount;
 }
 
 class _PickerParentData extends ContainerBoxParentData<RenderBox> {}
@@ -38,7 +44,7 @@ class RenderPickersRow extends RenderBox
     with
         ContainerRenderObjectMixin<RenderBox, _PickerParentData>,
         RenderBoxContainerDefaultsMixin<RenderBox, _PickerParentData> {
-  RenderPickersRow(this._maxWidth, this._minLast);
+  RenderPickersRow(this._maxWidth, this._minLast, [this._trailingCount = 0]);
 
   double get maxWidth => _maxWidth;
   double _maxWidth;
@@ -56,6 +62,14 @@ class RenderPickersRow extends RenderBox
     markNeedsLayout();
   }
 
+  int get trailingCount => _trailingCount;
+  int _trailingCount;
+  set trailingCount(int value) {
+    if (value == _trailingCount) return;
+    _trailingCount = value;
+    markNeedsLayout();
+  }
+
   @override
   void setupParentData(RenderBox child) {
     if (child.parentData is! _PickerParentData) {
@@ -63,25 +77,46 @@ class RenderPickersRow extends RenderBox
     }
   }
 
-  /// The width the last child may take, the others [before] wide.
-  double _lastWidth(double before) => math.max(_minLast, _maxWidth - before);
+  /// The width the flexible picker may take, the others [fixed] wide.
+  double _flexWidth(double fixed) => math.max(_minLast, _maxWidth - fixed);
 
   Size _layout(BoxConstraints constraints, {required bool dry}) {
     final height = constraints.maxHeight;
-    var width = 0.0;
-    var tallest = 0.0;
+    final children = <RenderBox>[];
     for (var child = firstChild; child != null; child = childAfter(child)) {
+      children.add(child);
+    }
+    if (children.isEmpty) return constraints.constrain(Size.zero);
+    final flexIndex = children.length - 1 - _trailingCount;
+    var fixedWidth = 0.0;
+    var tallest = 0.0;
+    for (var i = 0; i < children.length; i++) {
+      if (i == flexIndex) continue;
       final limits = BoxConstraints(
-        maxWidth: child == lastChild ? _lastWidth(width) : double.infinity,
+        maxWidth: double.infinity,
         maxHeight: height,
       );
+      final child = children[i];
       final size = dry
           ? child.getDryLayout(limits)
           : (child..layout(limits, parentUsesSize: true)).size;
-      width += size.width;
+      fixedWidth += size.width;
       tallest = math.max(tallest, size.height);
     }
-    return constraints.constrain(Size(width, tallest));
+    var flexWidth = 0.0;
+    if (flexIndex >= 0 && flexIndex < children.length) {
+      final limits = BoxConstraints(
+        maxWidth: _flexWidth(fixedWidth),
+        maxHeight: height,
+      );
+      final child = children[flexIndex];
+      final size = dry
+          ? child.getDryLayout(limits)
+          : (child..layout(limits, parentUsesSize: true)).size;
+      flexWidth = size.width;
+      tallest = math.max(tallest, size.height);
+    }
+    return constraints.constrain(Size(fixedWidth + flexWidth, tallest));
   }
 
   @override
