@@ -448,7 +448,7 @@ final class Attention:
   }
 
   /// Full-color Ayte App Icon aligned with the app's bundled AppIcon squircle,
-  /// rendered crisply at 1x/2x/3x scales (used in both the menu bar and popover).
+  /// rendered crisply at 1x/2x/3x scales (used in the tray popover header).
   static func appBrandIcon(size: NSSize, inset: CGFloat = 0) -> NSImage {
     let image = NSImage(size: size)
     let source: NSImage? = NSApp?.applicationIconImage ?? NSImage(named: NSImage.applicationIconName)
@@ -480,79 +480,119 @@ final class Attention:
     return image
   }
 
-  /// Menu bar icon aligned with Ayte's full-color app icon, with a crisp
-  /// corner status indicator when agents wait on input, finish unread, or run.
+  /// Optical 18x18pt menu bar icon: bold geometric 'a' + 4-point AI spark.
+  ///
+  /// - Idle: pure monochrome template (`isTemplate = true`), adapting natively
+  ///   to light/dark menu bars, wallpaper tinting, and inactive displays.
+  /// - Running: monochrome 'a' (dynamically tinted via current drawing
+  ///   appearance) with an emerald 4-point spark.
+  /// - Waiting / Attention: monochrome 'a' with a coral-red beacon replacing
+  ///   the top-right spark so status never collides with the brand mark.
   static func trayImage(
     waitingCount: Int = 0,
     runningCount: Int = 0,
     hasAttention: Bool = false
   ) -> NSImage {
-    let size = NSSize(width: 18, height: 18)
-    let image = NSImage(size: size)
-    let source: NSImage? = NSApp?.applicationIconImage ?? NSImage(named: NSImage.applicationIconName)
-    for scale in [1, 2, 3] {
-      let pixels = 18 * scale
-      guard let rep = NSBitmapImageRep(
-        bitmapDataPlanes: nil, pixelsWide: pixels, pixelsHigh: pixels,
-        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
-      else { continue }
-      NSGraphicsContext.saveGraphicsState()
-      if let ctx = NSGraphicsContext(bitmapImageRep: rep) {
-        NSGraphicsContext.current = ctx
-        ctx.imageInterpolation = .high
-        let unit = CGFloat(scale)
-        let targetRect = NSRect(
-          x: 0.5 * unit, y: 0.5 * unit,
-          width: 17.0 * unit, height: 17.0 * unit)
-        drawBrandIcon(source: source, in: ctx.cgContext, rect: targetRect)
+    let needsAttention = waitingCount > 0 || hasAttention
+    let isRunning = !needsAttention && runningCount > 0
+    let isIdle = !needsAttention && !isRunning
 
-        // Priority status badge: waiting/unread (top-right coral red) > running (bottom-right emerald).
-        let cg = ctx.cgContext
-        if waitingCount > 0 || hasAttention {
-          let center = CGPoint(x: CGFloat(pixels) - 3.1 * unit, y: CGFloat(pixels) - 3.1 * unit)
-          drawStatusDot(
-            in: cg,
-            center: center,
-            cutoutRadius: 3.1 * unit,
-            dotRadius: 2.35 * unit,
-            color: NSColor(srgbRed: 1.0, green: 0.23, blue: 0.19, alpha: 1.0))
-        } else if runningCount > 0 {
-          let center = CGPoint(x: CGFloat(pixels) - 3.1 * unit, y: 3.1 * unit)
-          drawStatusDot(
-            in: cg,
-            center: center,
-            cutoutRadius: 3.0 * unit,
-            dotRadius: 2.25 * unit,
-            color: NSColor(srgbRed: 0.13, green: 0.77, blue: 0.37, alpha: 1.0))
-        }
+    let size = NSSize(width: 18, height: 18)
+    let image = NSImage(size: size, flipped: true) { rect in
+      guard let cg = NSGraphicsContext.current?.cgContext else { return false }
+      let side = min(rect.width, rect.height)
+      let u = side / 18.0
+      let ox = rect.minX + (rect.width - side) * 0.5
+      let oy = rect.minY + (rect.height - side) * 0.5
+
+      cg.saveGState()
+      cg.translateBy(x: ox, y: oy)
+      cg.setAllowsAntialiasing(true)
+      cg.setShouldAntialias(true)
+
+      let glyphColor: NSColor
+      if isIdle {
+        glyphColor = .black
+      } else {
+        let isDark = NSAppearance.currentDrawing().bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        glyphColor = isDark
+          ? NSColor(white: 1.0, alpha: 0.94)
+          : NSColor(white: 0.0, alpha: 0.88)
       }
-      NSGraphicsContext.restoreGraphicsState()
-      rep.size = size
-      image.addRepresentation(rep)
+
+      // Optical-balanced geometric 'a': even-odd ring + flush rounded stem.
+      let ringCenter = CGPoint(x: 7.65 * u, y: 10.35 * u)
+      let outerR = 5.25 * u
+      let innerR = 2.52 * u
+      let ring = CGMutablePath()
+      ring.addEllipse(in: CGRect(
+        x: ringCenter.x - outerR, y: ringCenter.y - outerR,
+        width: outerR * 2, height: outerR * 2))
+      ring.addEllipse(in: CGRect(
+        x: ringCenter.x - innerR, y: ringCenter.y - innerR,
+        width: innerR * 2, height: innerR * 2))
+
+      cg.setFillColor(glyphColor.cgColor)
+      cg.addPath(ring)
+      cg.fillPath(using: .evenOdd)
+
+      let stemRect = CGRect(x: 10.22 * u, y: 5.10 * u, width: 2.75 * u, height: 10.50 * u)
+      let stemRadius = stemRect.width * 0.5
+      cg.addPath(CGPath(
+        roundedRect: stemRect,
+        cornerWidth: stemRadius,
+        cornerHeight: stemRadius,
+        transform: nil))
+      cg.fillPath()
+
+      // Top-right 4-point AI spark doubles cleanly as the live status beacon.
+      let sparkCenter = CGPoint(x: 14.55 * u, y: 3.65 * u)
+      if needsAttention {
+        let dotR = 2.25 * u
+        cg.setFillColor(NSColor(srgbRed: 1.0, green: 0.23, blue: 0.19, alpha: 1.0).cgColor)
+        cg.fillEllipse(in: CGRect(
+          x: sparkCenter.x - dotR, y: sparkCenter.y - dotR,
+          width: dotR * 2, height: dotR * 2))
+      } else if isRunning {
+        cg.setFillColor(NSColor(srgbRed: 0.06, green: 0.76, blue: 0.44, alpha: 1.0).cgColor)
+        cg.addPath(fourPointSparkPath(center: sparkCenter, outerRadius: 2.95 * u, innerRatio: 0.33))
+        cg.fillPath()
+      } else {
+        cg.setFillColor(glyphColor.cgColor)
+        cg.addPath(fourPointSparkPath(center: sparkCenter, outerRadius: 2.70 * u, innerRatio: 0.28))
+        cg.fillPath()
+      }
+
+      cg.restoreGState()
+      return true
     }
-    image.isTemplate = false
+
+    image.isTemplate = isIdle
     return image
   }
 
-  private static func drawStatusDot(
-    in context: CGContext,
+  private static func fourPointSparkPath(
     center: CGPoint,
-    cutoutRadius: CGFloat,
-    dotRadius: CGFloat,
-    color: NSColor
-  ) {
-    context.saveGState()
-    context.setBlendMode(.clear)
-    context.fillEllipse(in: CGRect(
-      x: center.x - cutoutRadius, y: center.y - cutoutRadius,
-      width: cutoutRadius * 2, height: cutoutRadius * 2))
-    context.setBlendMode(.normal)
-    context.setFillColor(color.cgColor)
-    context.fillEllipse(in: CGRect(
-      x: center.x - dotRadius, y: center.y - dotRadius,
-      width: dotRadius * 2, height: dotRadius * 2))
-    context.restoreGState()
+    outerRadius r: CGFloat,
+    innerRatio: CGFloat
+  ) -> CGPath {
+    let c = r * innerRatio
+    let path = CGMutablePath()
+    path.move(to: CGPoint(x: center.x, y: center.y - r))
+    path.addQuadCurve(
+      to: CGPoint(x: center.x + r, y: center.y),
+      control: CGPoint(x: center.x + c, y: center.y - c))
+    path.addQuadCurve(
+      to: CGPoint(x: center.x, y: center.y + r),
+      control: CGPoint(x: center.x + c, y: center.y + c))
+    path.addQuadCurve(
+      to: CGPoint(x: center.x - r, y: center.y),
+      control: CGPoint(x: center.x - c, y: center.y + c))
+    path.addQuadCurve(
+      to: CGPoint(x: center.x, y: center.y - r),
+      control: CGPoint(x: center.x - c, y: center.y - c))
+    path.closeSubpath()
+    return path
   }
 
   /// Draws the bundled AppIcon cropped tightly to the standard macOS 824/1024
