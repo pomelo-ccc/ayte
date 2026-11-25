@@ -1,10 +1,11 @@
 import 'dart:async';
 import 'dart:convert' show jsonEncode;
-import 'dart:ui' show AppExitResponse;
+import 'dart:ui' show AppExitResponse, AppExitType;
 
 import 'package:flutter/foundation.dart'
     show kDebugMode, kIsWeb, visibleForTesting;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show ServicesBinding;
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:path/path.dart' as p;
 import 'package:bao_editor/textmate/textmate_syntax.dart';
@@ -97,6 +98,7 @@ import 'models/model_runtime.dart';
 import 'models/model_welcome.dart';
 import 'notifications/notch_dropzone.dart';
 import 'network/network_proxy.dart';
+import 'notifications/attention_host.dart' show ChannelAttentionHost;
 import 'notifications/attention_service.dart' show AttentionVoiceSetting;
 import 'notifications/attention_settings.dart';
 import 'voice/local_sensevoice.dart';
@@ -148,6 +150,10 @@ import 'theme/window_blur.dart';
 import 'theme/workbench_theme.dart';
 import 'theme/theme_transition.dart';
 import 'update/update_controller.dart';
+import 'update/update_platform.dart';
+import 'update/update_service.dart';
+import 'update/update_settings.dart';
+import 'update/update_store.dart';
 import 'update/version.dart';
 import 'usage/usage_ledger.dart';
 import 'usage/usage_prices.dart';
@@ -724,9 +730,41 @@ void followSettingsFiles(SettingsFiles files) {
 }
 
 /// The app's updates (lib/update/): looked for as settings.json's
-/// `update.mode` says, from baocode.dev, installed as the app quits. None
-/// where the build does not update itself.
-UpdateController? _startUpdates(SettingsFiles files) => null;
+/// `update.mode` says, from GitHub Releases, installed as the app quits.
+/// None where the build does not update itself (a debug build, unless
+/// `BAOCODE_UPDATE_URL` is set, or the web).
+UpdateController? _startUpdates(SettingsFiles files) {
+  final platform = platformUpdates(
+    updatesDirectory: DataDirectory.current.updatesDir,
+  );
+  if (platform == null) return null;
+  final service = UpdateService(
+    current: currentAppVersion,
+    platform: platform.platform,
+    manifestUrl: platform.manifestUrl,
+    backend: platform.backend,
+    installer: platform.installer,
+    mode: () => UpdateMode.parse(files.settings[UpdateMode.settingKey]),
+    settingsChanges: files.settings,
+    store: GlobalUpdateStore(files.storage),
+  )..start();
+  return UpdateController(
+    service: service,
+    quit: () async {
+      // On Windows, exitApplication() ends the message loop with windows
+      // still up; ChannelAttentionHost.quit() goes through the tray/window
+      // quit path, which still asks onExitRequested first.
+      if (AppPlatform.isWindows) return ChannelAttentionHost.instance.quit();
+      await ServicesBinding.instance.exitApplication(AppExitType.cancelable);
+    },
+    openUrl: (url) async {
+      await openExternal('$url');
+    },
+    openFile: (path) async {
+      await openExternal(path);
+    },
+  );
+}
 
 /// The channel build's first start (lib/channel/): to set up while it is
 /// pending, for the windows to show. The install's id made now, to give

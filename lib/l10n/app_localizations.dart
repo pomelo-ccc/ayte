@@ -12168,7 +12168,7 @@ abstract class AppLocalizations {
   /// No description provided for @updatesSettingsDescription.
   ///
   /// In en, this message translates to:
-  /// **'Ayte looks for new versions on kestrel.dev.'**
+  /// **'Ayte looks for new versions on GitHub Releases.'**
   String get updatesSettingsDescription;
 
   /// No description provided for @updateCurrentVersion.
@@ -12288,7 +12288,7 @@ abstract class AppLocalizations {
   /// No description provided for @updateManual.
   ///
   /// In en, this message translates to:
-  /// **'Ayte can\'t update itself here ({reason}). Download the new version from kestrel.dev.'**
+  /// **'Ayte can\'t update itself here ({reason}). Download the new version from GitHub Releases.'**
   String updateManual(String reason);
 
   /// No description provided for @updateOpenDownloadPage.
@@ -12300,7 +12300,7 @@ abstract class AppLocalizations {
   /// No description provided for @updateUnfinished.
   ///
   /// In en, this message translates to:
-  /// **'Ayte {version} wasn\'t installed: this is still {current}. Try again from Settings > Updates, or download it from kestrel.dev.'**
+  /// **'Ayte {version} wasn\'t installed: this is still {current}. Try again from Settings > Updates, or download it from GitHub Releases.'**
   String updateUnfinished(String version, String current);
 
   /// No description provided for @updateShowLog.

@@ -4,7 +4,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 FLUTTER="${FLUTTER:-$(command -v flutter || echo "$HOME/flutter/bin/flutter")}"
 SDK_ROOT="$(xcrun --sdk macosx --show-sdk-path)"
-CLANG="${CLANG:-/Library/Developer/CommandLineTools/usr/bin/clang}"
+CLANG="${CLANG:-$(xcrun --find clang 2>/dev/null || echo /Library/Developer/CommandLineTools/usr/bin/clang)}"
 BASE_APP="${BASE_APP:-/Applications/Ayte.app}"
 if [[ ! -d "$BASE_APP" ]]; then
   BASE_APP="/Applications/Byte.app"

@@ -407,7 +407,7 @@ Future<(String, int)> _runCodeBuddy(
   };
   final args = <String>[
     '-p',
-    if (cliModel.isNotEmpty && cliModel != 'default') ...['--model', cliModel],
+    if (!CodeBuddyModels.isPlaceholderModel(cliModel)) ...['--model', cliModel],
     '--output-format',
     'json',
     '--no-session-persistence',

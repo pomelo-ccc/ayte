@@ -189,6 +189,7 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
 
   String? _sessionId;
   String _model;
+  String? _cliDefaultModel;
   String _permissionMode;
   String? _pendingPermissionMode;
   String? _effort;
@@ -312,7 +313,7 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
       if (permissionMode == 'bypassPermissions') '-y',
       '--permission-mode',
       permissionMode,
-      if (model.isNotEmpty && model != 'default') ...['--model', model],
+      if (!CodeBuddyModels.isPlaceholderModel(model)) ...['--model', model],
       if (cliEffort != null) ...['--effort', cliEffort],
       '--autocompact',
       '$clampedAutocompact',
@@ -591,13 +592,8 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
     }
     if (old != null) {
       unawaited(registry.remove(old.pid));
-      if (Platform.isWindows) {
-        await _trackCleanup(_endTree(old, immediate: true));
-        unawaited(old.stdin.close().catchError((Object _) {}));
-      } else {
-        unawaited(old.stdin.close().catchError((Object _) {}));
-        old.kill();
-      }
+      await _trackCleanup(_endTree(old, immediate: true));
+      unawaited(old.stdin.close().catchError((Object _) {}));
       await old.exitCode.timeout(
         const Duration(seconds: 2),
         onTimeout: () {
@@ -856,6 +852,10 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
       if (resp['subtype'] != 'success') return message;
       final payload =
           (resp['response'] as Map?)?.cast<String, Object?>() ?? const {};
+      if (payload['currentModelId'] case final String cur
+          when !CodeBuddyModels.isPlaceholderModel(cur)) {
+        _cliDefaultModel = cur;
+      }
       if (payload['account'] case final Map rawAcc) {
         unawaited(
           _accounts.syncFromCliInitializeAccount(
@@ -1408,6 +1408,7 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
         respondSuccess();
       case 'set_model':
         if (request['model'] case final String rawModel) {
+          final previousModel = _model;
           _model = CodeBuddyModels.cliModelIdOf(rawModel);
           final info = CodeBuddyModels.of(rawModel);
           if (info != null) {
@@ -1420,13 +1421,34 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
               _effort = info.initialEffort;
             }
           }
+          // Before the first turn, codebuddy has no active session yet and
+          // rejects `set_model` without a `session_id` ("Session not found:
+          // current"). Recycle the idle pre-warmed process with the new
+          // `--model` instead so the very first turn uses the selected model.
+          if (_sessionId == null || _sessionId!.isEmpty) {
+            if (_process != null &&
+                !_hasSentTurnOnProcess &&
+                _model != previousModel) {
+              unawaited(_recycleProcess());
+            }
+            respondSuccess({'model': _model});
+            return;
+          }
+          final effectiveModel = CodeBuddyModels.isPlaceholderModel(_model)
+              ? (_cliDefaultModel ?? CodeBuddyModels.firstConcreteCliModel())
+              : _model;
+          if (effectiveModel == null ||
+              CodeBuddyModels.isPlaceholderModel(effectiveModel)) {
+            respondSuccess({'model': _model});
+            return;
+          }
           _writeRaw({
             'type': 'control_request',
             'request_id': requestId,
             'request': {
               'subtype': 'set_model',
-              if (_sessionId != null) 'session_id': _sessionId,
-              'model': _model,
+              'session_id': _sessionId,
+              'model': effectiveModel,
             },
           });
           return;
@@ -1770,13 +1792,8 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
       return;
     }
     if (proc != null) {
-      if (Platform.isWindows) {
-        unawaited(_trackCleanup(_endTree(proc, immediate: true)));
-        unawaited(proc.stdin.close().catchError((Object _) {}));
-      } else {
-        unawaited(proc.stdin.close().catchError((Object _) {}));
-        proc.kill();
-      }
+      unawaited(_trackCleanup(_endTree(proc, immediate: true)));
+      unawaited(proc.stdin.close().catchError((Object _) {}));
     }
     final closeFuture = _closeCleanupFuture ??= _finalizeClose();
     _trackStop(closeFuture);
@@ -1856,11 +1873,54 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
           .then((_) => true, onError: (Object _) => false);
       if (ended) return;
     }
-    try {
-      await Process.run('taskkill', ['/pid', '${proc.pid}', '/T', '/F']);
-    } on ProcessException {
-      proc.kill();
+    if (Platform.isWindows) {
+      try {
+        await Process.run('taskkill', ['/pid', '${proc.pid}', '/T', '/F']);
+      } on ProcessException {
+        proc.kill();
+      }
+      return;
     }
+    final descendants = await _posixDescendantPids(proc.pid);
+    for (final childPid in descendants.reversed) {
+      Process.killPid(childPid);
+    }
+    proc.kill();
+    final deadline = DateTime.now().add(const Duration(milliseconds: 500));
+    while (DateTime.now().isBefore(deadline)) {
+      if (!Process.killPid(proc.pid, ProcessSignal.sigcont) &&
+          !descendants.any((p) => Process.killPid(p, ProcessSignal.sigcont))) {
+        return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+    }
+    for (final childPid in descendants.reversed) {
+      Process.killPid(childPid, ProcessSignal.sigkill);
+    }
+    proc.kill(ProcessSignal.sigkill);
+  }
+
+  static Future<List<int>> _posixDescendantPids(int rootPid) async {
+    final result = <int>[];
+    final visited = <int>{rootPid};
+    final queue = <int>[rootPid];
+    while (queue.isNotEmpty) {
+      final parent = queue.removeAt(0);
+      try {
+        final out = await Process.run('pgrep', ['-P', '$parent']);
+        if (out.exitCode != 0) continue;
+        for (final line in LineSplitter.split('${out.stdout}')) {
+          final child = int.tryParse(line.trim());
+          if (child != null && visited.add(child)) {
+            result.add(child);
+            queue.add(child);
+          }
+        }
+      } on ProcessException {
+        return result;
+      }
+    }
+    return result;
   }
 }
 

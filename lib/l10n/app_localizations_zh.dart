@@ -7076,7 +7076,7 @@ class AppLocalizationsZh extends AppLocalizations {
   String get updatesSettingsTitle => '更新';
 
   @override
-  String get updatesSettingsDescription => 'Ayte 会在 kestrel.dev 上检查新版本。';
+  String get updatesSettingsDescription => 'Ayte 会在 GitHub Releases 上检查新版本。';
 
   @override
   String get updateCurrentVersion => '当前版本';
@@ -7153,7 +7153,7 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String updateManual(String reason) {
-    return 'Ayte 无法在当前位置自动更新（$reason），请从 kestrel.dev 下载新版本。';
+    return 'Ayte 无法在当前位置自动更新（$reason），请从 GitHub Releases 下载新版本。';
   }
 
   @override
@@ -7161,7 +7161,7 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String updateUnfinished(String version, String current) {
-    return 'Ayte $version 没有装上，当前仍是 $current。可以在“设置 → 更新”里重试，或者从 kestrel.dev 下载安装。';
+    return 'Ayte $version 没有装上，当前仍是 $current。可以在“设置 → 更新”里重试，或者从 GitHub Releases 下载安装。';
   }
 
   @override

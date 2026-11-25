@@ -87,21 +87,20 @@ class CodeBuddyAccounts extends ChangeNotifier {
   }) {
     final direct = _nonEmptyEnv(env[name]);
     if (direct != null) return direct;
-    if (win) {
-      final lower = name.toLowerCase();
-      for (final entry in env.entries) {
-        if (entry.key.toLowerCase() == lower) {
-          final value = _nonEmptyEnv(entry.value);
-          if (value != null) return value;
-        }
+    if (env.containsKey(name)) {
+      return '';
+    }
+    final lower = name.toLowerCase();
+    for (final entry in env.entries) {
+      if (entry.key.toLowerCase() == lower) {
+        final value = _nonEmptyEnv(entry.value);
+        if (value != null) return value;
       }
-      for (final entry in env.entries) {
-        if (entry.key.toLowerCase() == lower) {
-          return '';
-        }
+    }
+    for (final entry in env.entries) {
+      if (entry.key.toLowerCase() == lower) {
+        return '';
       }
-    } else if (env.containsKey(name)) {
-      return _nonEmptyEnv(env[name]) ?? '';
     }
     return null;
   }

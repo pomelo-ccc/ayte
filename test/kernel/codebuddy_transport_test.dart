@@ -214,10 +214,199 @@ void main() {
       );
 
       expect(args, isNot(contains('-y')));
+      expect(args, isNot(contains('--model')));
       expect(args, isNot(contains('--effort')));
       expect(args, containsAll(['--autocompact', '100000']));
       expect(args, contains('--no-session-persistence'));
       expect(args, containsAll(['--system-prompt', 'Custom prompt']));
+    });
+
+    test('set_model before first turn recycles idle process with new --model and never forwards default-model', () async {
+      final tmp = Directory.systemTemp.createTempSync('cb_tr_preturn_model_');
+      final accDir = Directory(p.join(tmp.path, 'cb_accounts'))
+        ..createSync(recursive: true);
+      final accounts = CodeBuddyAccounts(dataDir: accDir.path);
+      await accounts.ensureInitialized();
+      final launchesLog = File(p.join(tmp.path, 'launches.jsonl'));
+      final (:cli, stdinLog: _) = await _createFakeCodeBuddyCli(
+        tmp,
+        dartBody: '''
+Future<void> main(List<String> args) async {
+  File(${jsonEncode(launchesLog.path)}).writeAsStringSync(
+    '\${jsonEncode({"args": args})}\\n',
+    mode: FileMode.append,
+    flush: true,
+  );
+  final modelIdx = args.indexOf('--model');
+  var currentModel =
+      (modelIdx >= 0 && modelIdx + 1 < args.length) ? args[modelIdx + 1] : 'server-default';
+  var hasSession = false;
+  await for (final line in stdin.transform(utf8.decoder).transform(const LineSplitter())) {
+    if (line.trim().isEmpty) continue;
+    final msg = (jsonDecode(line) as Map).cast<String, Object?>();
+    recordStdin(msg);
+    if (msg['type'] == 'control_request') {
+      final reqId = msg['request_id'] as String;
+      final req = (msg['request'] as Map).cast<String, Object?>();
+      final subtype = req['subtype'] as String?;
+      if (subtype == 'initialize') {
+        stdout.writeln(jsonEncode({
+          'type': 'control_response',
+          'response': {
+            'subtype': 'success',
+            'request_id': reqId,
+            'response': {'currentModelId': 'hy4std', 'models': const <Object?>[]},
+          },
+        }));
+      } else if (subtype == 'get_available_models') {
+        stdout.writeln(jsonEncode({
+          'type': 'control_response',
+          'response': {
+            'subtype': 'success',
+            'request_id': reqId,
+            'response': {'rawModels': const <Object?>[]},
+          },
+        }));
+      } else if (subtype == 'set_model') {
+        final sid = req['session_id'] as String?;
+        final next = req['model'] as String? ?? '';
+        if (!hasSession && (sid == null || sid.isEmpty)) {
+          stdout.writeln(jsonEncode({
+            'type': 'control_response',
+            'response': {
+              'subtype': 'error',
+              'request_id': reqId,
+              'error': 'Session not found: current',
+            },
+          }));
+        } else {
+          currentModel = next;
+          stdout.writeln(jsonEncode({
+            'type': 'control_response',
+            'response': {
+              'subtype': 'success',
+              'request_id': reqId,
+              'response': {'model': next},
+            },
+          }));
+        }
+      } else {
+        stdout.writeln(jsonEncode({
+          'type': 'control_response',
+          'response': {
+            'subtype': 'success',
+            'request_id': reqId,
+            'response': const <String, Object?>{},
+          },
+        }));
+      }
+      await stdout.flush();
+    } else if (msg['type'] == 'user') {
+      hasSession = true;
+      stdout.writeln(jsonEncode({
+        'type': 'system',
+        'subtype': 'init',
+        'session_id': 'cb-sess-1',
+      }));
+      stdout.writeln(jsonEncode({
+        'type': 'result',
+        'subtype': 'success',
+        'is_error': false,
+        'session_id': 'cb-sess-1',
+        'result': 'model=\$currentModel',
+      }));
+      await stdout.flush();
+    }
+  }
+}
+''',
+      );
+
+      final transport = CodeBuddyTransport.forTesting(
+        cli: CodeBuddyCli(
+          executable: cli.executable,
+          environment: {'HOME': tmp.path, 'USERPROFILE': tmp.path},
+          throughShell: cli.throughShell,
+        ),
+        launch: ClaudeLaunch(
+          cwd: tmp.path,
+          model: '@$codebuddyBuiltinProviderId/default-model',
+          persist: false,
+        ),
+        accounts: accounts,
+      );
+      addTearDown(() async {
+        transport.close();
+        accounts.dispose();
+        await transport.exited.timeout(
+          const Duration(seconds: 3),
+          onTimeout: () {},
+        );
+        if (tmp.existsSync()) tmp.deleteSync(recursive: true);
+      });
+
+      final channel = ControlChannel(transport.write);
+      final results = <String>[];
+      Completer<String>? nextResult;
+      final sub = transport.messages.listen((msg) {
+        channel.receive(msg);
+        if (msg['type'] == 'result') {
+          final text = '${msg['result']}';
+          results.add(text);
+          if (nextResult case final pending? when !pending.isCompleted) {
+            pending.complete(text);
+          }
+        }
+      });
+      addTearDown(sub.cancel);
+
+      await transport.spawnForTesting();
+      await channel.request('initialize', {}, const Duration(seconds: 10));
+
+      // Switch to a concrete model BEFORE the first turn (no session yet).
+      await channel.request(
+        'set_model',
+        {'model': 'deepseek-v4.1-flash'},
+        const Duration(seconds: 10),
+      );
+      nextResult = Completer<String>();
+      transport.write({
+        'type': 'user',
+        'uuid': 'u1',
+        'message': {'role': 'user', 'content': 'hello'},
+      });
+      final turn1 = await nextResult.future.timeout(
+        const Duration(seconds: 10),
+      );
+      expect(turn1, 'model=deepseek-v4.1-flash');
+
+      final launches = [
+        for (final line in launchesLog.readAsLinesSync())
+          if (line.trim().isNotEmpty)
+            (jsonDecode(line) as Map)['args'] as List,
+      ];
+      expect(launches, hasLength(2));
+      expect(launches[0], isNot(contains('--model')));
+      expect(launches[1], containsAll(['--model', 'deepseek-v4.1-flash']));
+
+      // Switching back to Auto (default-model) after session start must resolve
+      // to the CLI's concrete default (hy4std), never literal default-model.
+      await channel.request(
+        'set_model',
+        {'model': 'default-model'},
+        const Duration(seconds: 10),
+      );
+      nextResult = Completer<String>();
+      transport.write({
+        'type': 'user',
+        'uuid': 'u2',
+        'message': {'role': 'user', 'content': 'second'},
+      });
+      final turn2 = await nextResult.future.timeout(
+        const Duration(seconds: 10),
+      );
+      expect(turn2, 'model=hy4std');
+      expect(results, ['model=deepseek-v4.1-flash', 'model=hy4std']);
     });
   });
 

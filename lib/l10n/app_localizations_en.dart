@@ -7517,7 +7517,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get updatesSettingsDescription =>
-      'Ayte looks for new versions on kestrel.dev.';
+      'Ayte looks for new versions on GitHub Releases.';
 
   @override
   String get updateCurrentVersion => 'Current Version';
@@ -7596,7 +7596,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String updateManual(String reason) {
-    return 'Ayte can\'t update itself here ($reason). Download the new version from kestrel.dev.';
+    return 'Ayte can\'t update itself here ($reason). Download the new version from GitHub Releases.';
   }
 
   @override
@@ -7604,7 +7604,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String updateUnfinished(String version, String current) {
-    return 'Ayte $version wasn\'t installed: this is still $current. Try again from Settings > Updates, or download it from kestrel.dev.';
+    return 'Ayte $version wasn\'t installed: this is still $current. Try again from Settings > Updates, or download it from GitHub Releases.';
   }
 
   @override

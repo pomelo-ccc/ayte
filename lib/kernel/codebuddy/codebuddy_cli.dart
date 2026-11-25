@@ -927,6 +927,27 @@ abstract final class CodeBuddyModels {
     return bare;
   }
 
+  /// Whether [model] is a client-side placeholder (`default`, `default-model`,
+  /// or empty) that must not be passed literally to `codebuddy --model` or
+  /// `set_model`.
+  static bool isPlaceholderModel(String? model) {
+    final bare = stripPrefix(model).trim();
+    return bare.isEmpty ||
+        bare == 'default' ||
+        bare == 'default-model' ||
+        bare.startsWith('default-model');
+  }
+
+  /// First concrete (non-placeholder) CLI model id available as fallback when
+  /// switching back to Auto on an already-started session.
+  static String? firstConcreteCliModel() {
+    for (final m in [..._current, ...cnDefaults, ...globalDefaults]) {
+      final id = m.effectiveCliModel;
+      if (!isPlaceholderModel(id)) return id;
+    }
+    return null;
+  }
+
   static String labelOf(String modelId) =>
       of(modelId)?.label ?? bareModelId(modelId);
 

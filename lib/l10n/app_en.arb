@@ -5379,7 +5379,7 @@
   "modelsAuxiliaryBuiltin": "Claude Code Haiku (this machine's setup)",
   "settingsSectionUpdates": "Updates",
   "updatesSettingsTitle": "Updates",
-  "updatesSettingsDescription": "Ayte looks for new versions on kestrel.dev.",
+  "updatesSettingsDescription": "Ayte looks for new versions on GitHub Releases.",
   "updateCurrentVersion": "Current Version",
   "updateLastChecked": "Last checked {time}",
   "@updateLastChecked": {
@@ -5461,7 +5461,7 @@
   },
   "updateDisabled": "Updates are turned off (update.mode is \"none\").",
   "updateUnsupported": "This build of Ayte doesn't update itself.",
-  "updateManual": "Ayte can't update itself here ({reason}). Download the new version from kestrel.dev.",
+  "updateManual": "Ayte can't update itself here ({reason}). Download the new version from GitHub Releases.",
   "@updateManual": {
     "placeholders": {
       "reason": {
@@ -5470,7 +5470,7 @@
     }
   },
   "updateOpenDownloadPage": "Open Download Page",
-  "updateUnfinished": "Ayte {version} wasn't installed: this is still {current}. Try again from Settings > Updates, or download it from kestrel.dev.",
+  "updateUnfinished": "Ayte {version} wasn't installed: this is still {current}. Try again from Settings > Updates, or download it from GitHub Releases.",
   "@updateUnfinished": {
     "placeholders": {
       "version": {
