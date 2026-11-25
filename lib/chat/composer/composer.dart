@@ -3034,12 +3034,15 @@ class ChatComposerState extends State<ChatComposer>
             null => const SizedBox.shrink(),
           },
         ),
-        child: ContextMeter(
-          usage: usage,
-          active: widget.contextPanelOpen,
-          compactPercent: true,
-          tooltip: _hovers.ring,
-          onTap: onToggle,
+        child: Semantics(
+          container: true,
+          child: ContextMeter(
+            usage: usage,
+            active: widget.contextPanelOpen,
+            compactPercent: true,
+            tooltip: _hovers.ring,
+            onTap: onToggle,
+          ),
         ),
       ),
       _ => null,

@@ -121,4 +121,14 @@ void main() {
       'X-Team: a\nx-baocode-session: s1',
     );
   });
+
+  test('recognizes explicit native CLI model refs', () {
+    expect(isExplicitNativeCliModel('@antigravity-cli/gemini-4-neon'), isTrue);
+    expect(isExplicitNativeCliModel('@codebuddy-cli/glm-5.3'), isTrue);
+    expect(isExplicitNativeCliModel('@claude-code/sonnet'), isTrue);
+    expect(isExplicitNativeCliModel('@codex/gpt-5.4'), isTrue);
+    expect(isExplicitNativeCliModel('@custom-provider/gpt-5'), isFalse);
+    expect(isExplicitNativeCliModel('haiku'), isFalse);
+    expect(isExplicitNativeCliModel(null), isFalse);
+  });
 }

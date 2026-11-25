@@ -172,6 +172,7 @@ class _TurnFooterState extends State<TurnFooter> {
             summary != null &&
             summary.promptText.trim().isNotEmpty)
           ModelPkButton(
+            session: session,
             onPickChallenger: (c) => setState(() => _challenger = c),
           ),
       ];

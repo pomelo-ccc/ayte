@@ -5,11 +5,20 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 
+import '../../channel/channel_setup.dart' show ChannelSetup;
 import '../../ide/ide_hover.dart';
 import '../../ide/ide_menu.dart';
 import '../../ide/ide_notifications.dart';
 import '../../ide/ide_spinning.dart';
+import '../../kernel/antigravity/antigravity_cli.dart';
+import '../../kernel/claude_code/claude_cli_transport.dart';
 import '../../kernel/claude_code/claude_haiku.dart';
+import '../../kernel/codebuddy/codebuddy_cli.dart';
+import '../../kernel/codex/codex_models.dart';
+import '../../kernel/codex/codex_process_transport.dart';
+import '../../kernel/kernel_registry.dart'
+    show claudeCodeKernelId, codexKernelId;
+import '../../kernel/kernel_types.dart' show KernelOption;
 import '../../models/model_provider.dart';
 import '../../models/model_providers.dart';
 import '../../models/provider_health.dart';
@@ -844,55 +853,299 @@ class ModelPkButton extends StatelessWidget {
   const ModelPkButton({
     super.key,
     required this.onPickChallenger,
+    this.session,
   });
 
   final ValueChanged<({String providerName, String modelId, String modelLabel})>
   onPickChallenger;
+  final ChatSession? session;
 
-  Future<void> _openPicker(BuildContext context) async {
-    unawaited(ProviderHealthMonitor.instance.pingAll());
-    final box = context.findRenderObject() as RenderBox?;
-    if (box == null || !box.attached) return;
-    final anchor = box.localToGlobal(Offset.zero) & box.size;
-    final providers = ModelProviders.current.enabled;
-    final entries = <IdeMenuEntry>[];
+  static const _claudeCliDefaults = <({String id, String label})>[
+    (id: 'opus', label: 'Claude Opus'),
+    (id: 'sonnet', label: 'Claude Sonnet'),
+    (id: 'haiku', label: 'Claude Haiku'),
+    (id: 'default', label: 'Default (Claude CLI)'),
+  ];
 
-    for (final provider in providers) {
-      final ping = ProviderHealthMonitor.instance.pingOf(provider.id);
-      final pingBadge = ping.shortLabel.isEmpty ? '' : '  ${ping.shortLabel}';
-      final models = provider.models.isNotEmpty
-          ? provider.models
-          : [const ProviderModel(id: 'haiku')];
-      for (final m in models.take(4)) {
-        final fullId = modelRef(provider.id, m.id);
-        final label = m.label?.trim().isNotEmpty == true ? m.label! : m.id;
-        entries.add(
+  static String _pkModelIdForOption(KernelOption option, String? kernelId) {
+    if (parseModelRef(option.id) != null) return option.id;
+    final groupId = option.group?.id ?? kernelId;
+    if (groupId == claudeCodeKernelId ||
+        groupId == codexKernelId ||
+        groupId == antigravityBuiltinProviderId ||
+        groupId == codebuddyBuiltinProviderId) {
+      return modelRef(groupId!, option.id);
+    }
+    return option.id;
+  }
+
+  static bool _isNativeKernelId(String? id) =>
+      id == antigravityBuiltinProviderId ||
+      id == codebuddyBuiltinProviderId ||
+      id == claudeCodeKernelId ||
+      id == codexKernelId;
+
+  static String _nativeKernelLabel(String id) => switch (id) {
+    antigravityBuiltinProviderId => 'Antigravity CLI',
+    codebuddyBuiltinProviderId => 'CodeBuddy CLI',
+    claudeCodeKernelId => 'Claude Code CLI',
+    codexKernelId => 'Codex CLI',
+    _ => id,
+  };
+
+  /// Builds the challenger picker menu entries from the active session's kernel
+  /// models, other installed native CLIs, and enabled custom providers.
+  @visibleForTesting
+  static List<IdeMenuEntry> buildPickerEntries({
+    required ValueChanged<
+      ({String providerName, String modelId, String modelLabel})
+    >
+    onPickChallenger,
+    ChatSession? session,
+    ModelProviders? providers,
+    ProviderPing Function(String providerId)? pingOf,
+    List<AntigravityModel>? antigravityModels,
+    List<CodeBuddyModel>? codebuddyModels,
+    bool? antigravityInstalled,
+    bool? codebuddyInstalled,
+    bool? claudeCliInstalled,
+    bool? codexInstalled,
+    List<CodexModelInfo> Function()? codexModels,
+  }) {
+    final store = providers ?? ModelProviders.current;
+    final getPing = pingOf ?? ProviderHealthMonitor.instance.pingOf;
+    final agyModels = antigravityModels ?? AntigravityModels.current;
+    final cbModels = codebuddyModels ?? CodeBuddyModels.current;
+    final agyAvail =
+        store.antigravityOffered ||
+        (!ChannelSetup.channelBuild &&
+            !store.antigravityHidden &&
+            (antigravityInstalled ?? LocalAntigravity.installed()));
+    final cbAvail = codebuddyInstalled ?? LocalCodeBuddy.installed();
+    final claudeAvail = claudeCliInstalled ?? ClaudeCliTransport.installed();
+    final codexAvail = codexInstalled ?? ProcessCodexTransport.installed();
+    final enabledProviders = store.enabled;
+
+    final sessionModels = session?.models;
+    final kernelId = session?.kernel.id;
+    final selectedId = sessionModels?.selected.id;
+
+    final currentKernelGroup = <IdeMenuEntry>[];
+    final otherNativeGroup = <IdeMenuEntry>[];
+    final customProviderGroup = <IdeMenuEntry>[];
+    final includedNativeKernels = <String>{};
+
+    // 1. Current session's native kernel models directly at top level.
+    if (sessionModels != null && _isNativeKernelId(kernelId)) {
+      final nativeOptions = [
+        for (final option in sessionModels.options)
+          if (option.group == null || option.group!.id == kernelId) option,
+      ];
+      if (nativeOptions.isNotEmpty) {
+        includedNativeKernels.add(kernelId!);
+        final groupLabel =
+            nativeOptions.first.group?.label ?? _nativeKernelLabel(kernelId);
+        currentKernelGroup.add(IdeMenuAction(groupLabel, enabled: false));
+        for (final option in nativeOptions) {
+          final pkId = _pkModelIdForOption(option, kernelId);
+          currentKernelGroup.add(
+            IdeMenuAction(
+              option.label,
+              checked: option.id == selectedId,
+              onSelected: () => onPickChallenger((
+                providerName: groupLabel,
+                modelId: pkId,
+                modelLabel: option.label,
+              )),
+            ),
+          );
+        }
+      }
+    } else if (agyAvail && agyModels.isNotEmpty) {
+      includedNativeKernels.add(antigravityBuiltinProviderId);
+      const groupLabel = 'Antigravity CLI';
+      currentKernelGroup.add(const IdeMenuAction(groupLabel, enabled: false));
+      for (final m in agyModels) {
+        final pkId = modelRef(antigravityBuiltinProviderId, m.id);
+        currentKernelGroup.add(
           IdeMenuAction(
-            '${provider.name} · $label$pingBadge',
+            m.label,
+            checked: pkId == selectedId,
             onSelected: () => onPickChallenger((
-              providerName: provider.name,
-              modelId: fullId,
-              modelLabel: label,
+              providerName: groupLabel,
+              modelId: pkId,
+              modelLabel: m.label,
             )),
           ),
         );
       }
     }
 
-    if (entries.isEmpty) {
-      entries.add(
+    // 2. Other available native CLI kernels as clean submenus.
+    if (!includedNativeKernels.contains(antigravityBuiltinProviderId) &&
+        agyAvail &&
+        agyModels.isNotEmpty) {
+      const label = 'Antigravity CLI';
+      otherNativeGroup.add(
         IdeMenuAction(
-          'Claude Haiku (默认对照)',
-          onSelected: () => onPickChallenger((
-            providerName: 'Claude',
-            modelId: 'haiku',
-            modelLabel: 'Haiku',
-          )),
+          label,
+          submenu: [
+            for (final m in agyModels)
+              IdeMenuAction(
+                m.label,
+                onSelected: () => onPickChallenger((
+                  providerName: label,
+                  modelId: modelRef(antigravityBuiltinProviderId, m.id),
+                  modelLabel: m.label,
+                )),
+              ),
+          ],
         ),
       );
     }
+    if (!includedNativeKernels.contains(codebuddyBuiltinProviderId) &&
+        cbAvail &&
+        cbModels.isNotEmpty) {
+      const label = 'CodeBuddy CLI';
+      otherNativeGroup.add(
+        IdeMenuAction(
+          label,
+          submenu: [
+            for (final m in cbModels)
+              IdeMenuAction(
+                m.label,
+                onSelected: () => onPickChallenger((
+                  providerName: label,
+                  modelId: modelRef(codebuddyBuiltinProviderId, m.id),
+                  modelLabel: m.label,
+                )),
+              ),
+          ],
+        ),
+      );
+    }
+    if (!includedNativeKernels.contains(claudeCodeKernelId) && claudeAvail) {
+      const label = 'Claude Code CLI';
+      otherNativeGroup.add(
+        IdeMenuAction(
+          label,
+          submenu: [
+            for (final m in _claudeCliDefaults)
+              IdeMenuAction(
+                m.label,
+                onSelected: () => onPickChallenger((
+                  providerName: label,
+                  modelId: modelRef(claudeCodeKernelId, m.id),
+                  modelLabel: m.label,
+                )),
+              ),
+          ],
+        ),
+      );
+    }
+    if (!includedNativeKernels.contains(codexKernelId) && codexAvail) {
+      final loaded = (codexModels ?? () => CodexModels.loadLocalCatalog().models)();
+      if (loaded.isNotEmpty) {
+        const label = 'Codex CLI';
+        otherNativeGroup.add(
+          IdeMenuAction(
+            label,
+            submenu: [
+              for (final m in loaded)
+                IdeMenuAction(
+                  m.label,
+                  onSelected: () => onPickChallenger((
+                    providerName: label,
+                    modelId: modelRef(codexKernelId, m.id),
+                    modelLabel: m.label,
+                  )),
+                ),
+            ],
+          ),
+        );
+      }
+    }
 
-    await showIdeMenu(context, anchor: anchor, entries: entries);
+    // 3. Enabled custom providers (all enabled chat models, no arbitrary cap).
+    final flattenSingleProvider =
+        currentKernelGroup.isEmpty &&
+        otherNativeGroup.isEmpty &&
+        enabledProviders.length == 1;
+    for (final provider in enabledProviders) {
+      final models = provider.enabledModels;
+      if (models.isEmpty) continue;
+      final ping = getPing(provider.id);
+      final pingBadge = ping.shortLabel.isEmpty ? '' : '  ${ping.shortLabel}';
+      if (flattenSingleProvider) {
+        customProviderGroup.add(
+          IdeMenuAction('${provider.name}$pingBadge', enabled: false),
+        );
+        for (final m in models) {
+          final fullId = modelRef(provider.id, m.id);
+          final label = provider.labelOf(m);
+          customProviderGroup.add(
+            IdeMenuAction(
+              label,
+              checked: fullId == selectedId,
+              onSelected: () => onPickChallenger((
+                providerName: provider.name,
+                modelId: fullId,
+                modelLabel: label,
+              )),
+            ),
+          );
+        }
+      } else {
+        customProviderGroup.add(
+          IdeMenuAction(
+            '${provider.name}$pingBadge',
+            checked: parseModelRef(selectedId)?.provider == provider.id,
+            submenu: [
+              for (final m in models)
+                IdeMenuAction(
+                  provider.labelOf(m),
+                  checked: modelRef(provider.id, m.id) == selectedId,
+                  onSelected: () => onPickChallenger((
+                    providerName: provider.name,
+                    modelId: modelRef(provider.id, m.id),
+                    modelLabel: provider.labelOf(m),
+                  )),
+                ),
+            ],
+          ),
+        );
+      }
+    }
+
+    final entries = ideMenuGroups([
+      currentKernelGroup,
+      otherNativeGroup,
+      customProviderGroup,
+    ]);
+
+    if (entries.isEmpty) {
+      return const [
+        IdeMenuAction('暂无可用对照模型（请先在设置 → 模型中配置）', enabled: false),
+      ];
+    }
+    return entries;
+  }
+
+  Future<void> _openPicker(BuildContext context) async {
+    unawaited(ProviderHealthMonitor.instance.pingAll());
+    final box = context.findRenderObject() as RenderBox?;
+    if (box == null || !box.attached) return;
+    final anchor = box.localToGlobal(Offset.zero) & box.size;
+    final entries = buildPickerEntries(
+      session: session,
+      onPickChallenger: onPickChallenger,
+    );
+    await showIdeMenu(
+      context,
+      anchor: anchor,
+      entries: entries,
+      speedSearch: true,
+    );
   }
 
   @override
@@ -953,6 +1206,8 @@ class _ModelPkComparisonCardState extends State<ModelPkComparisonCard> {
   String? _challengerAnswer;
   String? _error;
   Duration? _duration;
+  Completer<void>? _cancel;
+  int _requestSeq = 0;
 
   @override
   void initState() {
@@ -968,31 +1223,53 @@ class _ModelPkComparisonCardState extends State<ModelPkComparisonCard> {
     }
   }
 
+  @override
+  void dispose() {
+    _cancelInFlight();
+    super.dispose();
+  }
+
+  void _cancelInFlight() {
+    final prev = _cancel;
+    _cancel = null;
+    if (prev != null && !prev.isCompleted) {
+      prev.complete();
+    }
+  }
+
   Future<void> _runChallenger() async {
+    _cancelInFlight();
+    final cancel = Completer<void>();
+    _cancel = cancel;
+    final seq = ++_requestSeq;
     setState(() {
       _loading = true;
       _error = null;
       _challengerAnswer = null;
+      _duration = null;
     });
     final sw = Stopwatch()..start();
     try {
       final reply = await askClaudeHaiku(
         'Answer the user request accurately, concisely, and in the same language.',
         widget.promptText,
+        cancel: cancel.future,
         model: widget.challenger.modelId,
         exact: true,
         location: widget.session?.kernelContext.cwd,
       );
       sw.stop();
-      if (!mounted) return;
+      if (!mounted || seq != _requestSeq) return;
       setState(() {
         _loading = false;
         _challengerAnswer = reply.trim();
         _duration = sw.elapsed;
       });
+    } on ClaudeHaikuCancelled {
+      sw.stop();
     } on Object catch (err) {
       sw.stop();
-      if (!mounted) return;
+      if (!mounted || seq != _requestSeq) return;
       setState(() {
         _loading = false;
         _error = '$err';
@@ -1001,20 +1278,32 @@ class _ModelPkComparisonCardState extends State<ModelPkComparisonCard> {
     }
   }
 
+  KernelOption? _matchingSessionOption() {
+    final session = widget.session;
+    final models = session?.models;
+    if (session == null || models == null) return null;
+    final parsed = parseModelRef(widget.challenger.modelId);
+    for (final option in models.options) {
+      if (option.id == widget.challenger.modelId) return option;
+      if (parsed != null &&
+          parsed.provider == session.kernel.id &&
+          option.id == parsed.model) {
+        return option;
+      }
+    }
+    return null;
+  }
+
   void _adoptModel() {
     final session = widget.session;
     final models = session?.models;
-    if (session == null || models == null) return;
-    for (final option in models.options) {
-      if (option.id == widget.challenger.modelId) {
-        models.onSelected(option);
-        IdeNotificationsScope.maybeOf(context)?.notify(
-          IdeSeverity.info,
-          '⚡ 已将当前会话切换至 ${widget.challenger.providerName} · ${widget.challenger.modelLabel}',
-        );
-        return;
-      }
-    }
+    final option = _matchingSessionOption();
+    if (session == null || models == null || option == null) return;
+    models.onSelected(option);
+    IdeNotificationsScope.maybeOf(context)?.notify(
+      IdeSeverity.info,
+      '⚡ 已将当前会话切换至 ${widget.challenger.providerName} · ${widget.challenger.modelLabel}',
+    );
   }
 
   @override
@@ -1049,7 +1338,7 @@ class _ModelPkComparisonCardState extends State<ModelPkComparisonCard> {
                   ),
                 ),
                 if (!_loading && _challengerAnswer != null) ...[
-                  if (widget.session != null)
+                  if (_matchingSessionOption() != null)
                     TextButton(
                       onPressed: _adoptModel,
                       child: Text(

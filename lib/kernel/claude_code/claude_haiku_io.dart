@@ -3,13 +3,20 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:bao_agent/bao_agent.dart';
+import 'package:path/path.dart' as p;
 
 import '../../chat/chat_models.dart' show ImageAttachment;
 import '../../models/launch_environment.dart';
+import '../../models/model_provider.dart' show parseModelRef;
 import '../../network/network_proxy_io.dart';
 import '../../network/tls.dart';
 import '../../usage/usage_ledger.dart';
 import '../antigravity/antigravity_cli.dart';
+import '../codebuddy/codebuddy_accounts.dart';
+import '../codebuddy/codebuddy_cli.dart';
+import '../codex/codex_process_transport.dart';
+import '../kernel_registry.dart' show claudeCodeKernelId, codexKernelId;
+import 'claude_cli_transport.dart';
 import 'claude_core_setting.dart';
 import 'claude_environment.dart';
 import 'claude_haiku.dart';
@@ -110,8 +117,27 @@ Future<ClaudeTimedAnswer> timeClaudeAnswer(
   return timer.answer(stderr, code);
 }
 
-/// Runs Claude Code, giving each line it prints to [onLine]: what it
-/// wrote to stderr and exited with.
+/// Extracts plain text blocks when [prompt] is a `claudeHaikuMessage` JSON line.
+String _extractPromptText(String prompt, {required bool message}) {
+  if (!message) return prompt;
+  try {
+    if (jsonDecode(prompt.trim()) case {
+      'message': {'content': final List content},
+    }) {
+      final texts = [
+        for (final item in content)
+          if (item case {'type': 'text', 'text': final String t}) t,
+      ];
+      if (texts.isNotEmpty) return texts.join('\n\n');
+    }
+  } on FormatException {
+    // Keep prompt as-is.
+  }
+  return prompt;
+}
+
+/// Runs the appropriate single-shot backend for [model]/[env], giving each line
+/// it prints to [onLine]: what it wrote to stderr and exited with.
 Future<(String, int)> _run(
   String system,
   String prompt, {
@@ -124,7 +150,7 @@ Future<(String, int)> _run(
   ClaudeHaikuTools? tools,
   void Function()? onStart,
 }) async {
-  if (env != null || ClaudeCore.current() == ClaudeCore.builtin) {
+  if (env != null) {
     return _runBuiltin(
       system,
       prompt,
@@ -138,26 +164,95 @@ Future<(String, int)> _run(
       onStart: onStart,
     );
   }
+  final ref = parseModelRef(model);
+  if (ref?.provider == codebuddyBuiltinProviderId) {
+    return _runCodeBuddy(
+      system,
+      prompt,
+      cancel: cancel,
+      model: model,
+      message: message,
+      tools: tools,
+      onLine: onLine,
+      onStart: onStart,
+    );
+  }
+  if (ref?.provider == claudeCodeKernelId) {
+    return _runClaudeCli(
+      system,
+      prompt,
+      cancel: cancel,
+      model: ref!.model,
+      message: message,
+      tools: tools,
+      onLine: onLine,
+      onStart: onStart,
+    );
+  }
+  if (ref?.provider == codexKernelId) {
+    return _runCodexCli(
+      system,
+      prompt,
+      cancel: cancel,
+      model: ref!.model,
+      message: message,
+      tools: tools,
+      onLine: onLine,
+      onStart: onStart,
+    );
+  }
+  if (ref?.provider == antigravityBuiltinProviderId) {
+    return _runAntigravity(
+      system,
+      prompt,
+      cancel: cancel,
+      model: model,
+      message: message,
+      tools: tools,
+      onLine: onLine,
+      onStart: onStart,
+    );
+  }
+  if (ClaudeCore.current() == ClaudeCore.builtin) {
+    return _runBuiltin(
+      system,
+      prompt,
+      cancel: cancel,
+      model: model,
+      env: env,
+      stream: stream,
+      message: message,
+      tools: tools,
+      onLine: onLine,
+      onStart: onStart,
+    );
+  }
+  return _runAntigravity(
+    system,
+    prompt,
+    cancel: cancel,
+    model: model,
+    message: message,
+    tools: tools,
+    onLine: onLine,
+    onStart: onStart,
+  );
+}
+
+Future<(String, int)> _runAntigravity(
+  String system,
+  String prompt, {
+  required Future<void>? cancel,
+  required String? model,
+  required bool message,
+  required ClaudeHaikuTools? tools,
+  required void Function(String line) onLine,
+  void Function()? onStart,
+}) async {
   final cli = await LocalAntigravity.locate();
   final proxy = await NetworkProxy.instance.environment();
   final certificates = await nodeCertificatesEnvironment(cli.environment);
-  var effectivePrompt = prompt;
-  if (message) {
-    // Extract plain text blocks when called via claudeHaikuMessage JSON.
-    try {
-      if (jsonDecode(prompt.trim()) case {
-        'message': {'content': final List content},
-      }) {
-        final texts = [
-          for (final item in content)
-            if (item case {'type': 'text', 'text': final String t}) t,
-        ];
-        if (texts.isNotEmpty) effectivePrompt = texts.join('\n\n');
-      }
-    } on FormatException {
-      // Keep prompt as-is.
-    }
-  }
+  final effectivePrompt = _extractPromptText(prompt, message: message);
   final combinedPrompt = system.trim().isEmpty
       ? effectivePrompt
       : 'System instruction: $system\n\n$effectivePrompt';
@@ -195,7 +290,9 @@ Future<(String, int)> _run(
       includeParentEnvironment: Platform.isWindows,
     );
   } on ProcessException catch (error) {
-    throw ClaudeHaikuException('Antigravity CLI could not start: ${error.message}');
+    throw ClaudeHaikuException(
+      'Antigravity CLI could not start: ${error.message}',
+    );
   }
   onStart?.call();
   unawaited(process.stdin.close().catchError((Object _) {}));
@@ -276,6 +373,293 @@ Future<(String, int)> _run(
     }
   }
   return (await stderr, code);
+}
+
+Future<(String, int)> _runCodeBuddy(
+  String system,
+  String prompt, {
+  required Future<void>? cancel,
+  required String? model,
+  required bool message,
+  required ClaudeHaikuTools? tools,
+  required void Function(String line) onLine,
+  void Function()? onStart,
+}) async {
+  await CodeBuddyAccounts.instance.ensureInitialized();
+  var activeAccount = CodeBuddyAccounts.instance.currentAccount;
+  if (activeAccount != null) {
+    activeAccount = await CodeBuddyAccounts.instance.ensureFreshAccount(
+      activeAccount,
+    );
+  }
+  final accountEnv = activeAccount?.processEnvironment() ?? const <String, String>{};
+  final cli = await LocalCodeBuddy.locate();
+  final proxy = await NetworkProxy.instance.environment();
+  final certificates = await nodeCertificatesEnvironment(cli.environment);
+  final effectivePrompt = _extractPromptText(prompt, message: message);
+  final cliModel = CodeBuddyModels.cliModelIdOf(model);
+  final childEnv = <String, String>{
+    ...cli.environment,
+    ...proxy,
+    ...certificates,
+    ...accountEnv,
+    ...ClaudeEnvironment.stateDirectory(cli.environment),
+  };
+  final args = <String>[
+    '-p',
+    if (cliModel.isNotEmpty && cliModel != 'default') ...['--model', cliModel],
+    '--output-format',
+    'json',
+    '--no-session-persistence',
+    '--strict-mcp-config',
+    '--tools',
+    '',
+    if (system.trim().isNotEmpty) ...['--system-prompt', system],
+  ];
+  final Process process;
+  try {
+    process = await Process.start(
+      cli.executable,
+      args,
+      workingDirectory: switch (tools?.directory) {
+        final directory? when Directory(directory).existsSync() => directory,
+        _ => Directory.systemTemp.path,
+      },
+      environment: childEnv,
+      includeParentEnvironment: Platform.isWindows,
+      runInShell: cli.throughShell,
+    );
+  } on ProcessException catch (error) {
+    throw ClaudeHaikuException('CodeBuddy CLI could not start: ${error.message}');
+  }
+  onStart?.call();
+  try {
+    process.stdin.write(effectivePrompt);
+    await process.stdin.close();
+  } on Object {
+    // Process may have exited early; exit code & stderr will report why.
+  }
+  var cancelled = false;
+  unawaited(
+    cancel?.then((_) {
+      cancelled = true;
+      process.kill();
+    }),
+  );
+  final stdout = process.stdout
+      .transform(const Utf8Decoder(allowMalformed: true))
+      .transform(const LineSplitter())
+      .forEach(onLine);
+  final stderr = process.stderr
+      .transform(const Utf8Decoder(allowMalformed: true))
+      .join();
+  final code = await process.exitCode.timeout(
+    Duration(minutes: tools == null ? 2 : 5),
+    onTimeout: () {
+      process.kill(ProcessSignal.sigkill);
+      throw const ClaudeHaikuException('CodeBuddy CLI took too long to answer.');
+    },
+  );
+  if (cancelled) throw const ClaudeHaikuCancelled();
+  await stdout;
+  return (await stderr, code);
+}
+
+Future<(String, int)> _runClaudeCli(
+  String system,
+  String prompt, {
+  required Future<void>? cancel,
+  required String model,
+  required bool message,
+  required ClaudeHaikuTools? tools,
+  required void Function(String line) onLine,
+  void Function()? onStart,
+}) async {
+  final base = await ClaudeEnvironment.of();
+  final proxy = await NetworkProxy.instance.environment();
+  final combined = <String, String>{...base, ...proxy};
+  final env = ClaudeCliTransport.enrichEnvironment(combined);
+  final executable = ClaudeCliTransport.locateExecutable(env);
+  if (executable == null) {
+    throw const ClaudeHaikuException('未检测到 Claude Code CLI (claude)');
+  }
+  final effectivePrompt = _extractPromptText(prompt, message: message);
+  final cliModel = model.trim();
+  final args = <String>[
+    '-p',
+    if (cliModel.isNotEmpty && cliModel != 'default') ...['--model', cliModel],
+    '--output-format',
+    'json',
+    '--no-session-persistence',
+    '--strict-mcp-config',
+    '--disable-slash-commands',
+    '--tools',
+    '',
+    if (system.trim().isNotEmpty) ...['--system-prompt', system],
+  ];
+  final Process process;
+  try {
+    process = await Process.start(
+      executable,
+      args,
+      workingDirectory: switch (tools?.directory) {
+        final directory? when Directory(directory).existsSync() => directory,
+        _ => Directory.systemTemp.path,
+      },
+      environment: env,
+      includeParentEnvironment: false,
+    );
+  } on ProcessException catch (error) {
+    throw ClaudeHaikuException('Claude Code CLI could not start: ${error.message}');
+  }
+  onStart?.call();
+  try {
+    process.stdin.write(effectivePrompt);
+    await process.stdin.close();
+  } on Object {
+    // Process may have exited early; exit code & stderr will report why.
+  }
+  var cancelled = false;
+  unawaited(
+    cancel?.then((_) {
+      cancelled = true;
+      process.kill();
+    }),
+  );
+  final stdout = process.stdout
+      .transform(const Utf8Decoder(allowMalformed: true))
+      .transform(const LineSplitter())
+      .forEach(onLine);
+  final stderr = process.stderr
+      .transform(const Utf8Decoder(allowMalformed: true))
+      .join();
+  final code = await process.exitCode.timeout(
+    Duration(minutes: tools == null ? 2 : 5),
+    onTimeout: () {
+      process.kill(ProcessSignal.sigkill);
+      throw const ClaudeHaikuException('Claude Code CLI took too long to answer.');
+    },
+  );
+  if (cancelled) throw const ClaudeHaikuCancelled();
+  await stdout;
+  return (await stderr, code);
+}
+
+Future<(String, int)> _runCodexCli(
+  String system,
+  String prompt, {
+  required Future<void>? cancel,
+  required String model,
+  required bool message,
+  required ClaudeHaikuTools? tools,
+  required void Function(String line) onLine,
+  void Function()? onStart,
+}) async {
+  final base = await ClaudeEnvironment.of();
+  final proxy = await NetworkProxy.instance.environment();
+  final env = ProcessCodexTransport.enrichedPath({...base, ...proxy});
+  final binary = ProcessCodexTransport.locateCodex(env);
+  if (binary == null) {
+    throw const ClaudeHaikuException('未检测到 Codex CLI (codex)');
+  }
+  final effectivePrompt = _extractPromptText(prompt, message: message);
+  final combinedPrompt = system.trim().isEmpty
+      ? effectivePrompt
+      : 'System instruction: $system\n\n$effectivePrompt';
+  final cliModel = model.trim();
+  final outFile = File(
+    p.join(
+      Directory.systemTemp.path,
+      'ayte-codex-pk-${DateTime.now().microsecondsSinceEpoch}-$pid.txt',
+    ),
+  );
+  final args = <String>[
+    'exec',
+    '--ephemeral',
+    '--skip-git-repo-check',
+    '--sandbox',
+    'read-only',
+    '--color',
+    'never',
+    if (cliModel.isNotEmpty && cliModel != 'default') ...['-m', cliModel],
+    '-o',
+    outFile.path,
+    '-',
+  ];
+  final launch = ProcessCodexTransport.resolveLaunch(
+    binary,
+    env,
+    appServerArgs: args,
+  );
+  try {
+    final Process process;
+    try {
+      process = await Process.start(
+        launch.executable,
+        launch.arguments,
+        workingDirectory: switch (tools?.directory) {
+          final directory? when Directory(directory).existsSync() => directory,
+          _ => Directory.systemTemp.path,
+        },
+        environment: env,
+        includeParentEnvironment: false,
+        runInShell: launch.runInShell,
+      );
+    } on ProcessException catch (error) {
+      throw ClaudeHaikuException('Codex CLI could not start: ${error.message}');
+    }
+    onStart?.call();
+    try {
+      process.stdin.write(combinedPrompt);
+      await process.stdin.close();
+    } on Object {
+      // Process may have exited early; exit code & stderr will report why.
+    }
+    var cancelled = false;
+    unawaited(
+      cancel?.then((_) {
+        cancelled = true;
+        process.kill();
+      }),
+    );
+    final stdoutLines = <String>[];
+    final stdout = process.stdout
+        .transform(const Utf8Decoder(allowMalformed: true))
+        .transform(const LineSplitter())
+        .forEach(stdoutLines.add);
+    final stderr = process.stderr
+        .transform(const Utf8Decoder(allowMalformed: true))
+        .join();
+    final code = await process.exitCode.timeout(
+      Duration(minutes: tools == null ? 2 : 5),
+      onTimeout: () {
+        process.kill(ProcessSignal.sigkill);
+        throw const ClaudeHaikuException('Codex CLI took too long to answer.');
+      },
+    );
+    if (cancelled) throw const ClaudeHaikuCancelled();
+    await stdout;
+    var text = '';
+    if (await outFile.exists()) {
+      text = (await outFile.readAsString()).trim();
+    }
+    if (text.isEmpty && code == 0) {
+      text = stdoutLines.join('\n').trim();
+    }
+    if (text.isNotEmpty) {
+      onLine(
+        jsonEncode({
+          'type': 'result',
+          'subtype': 'success',
+          'is_error': code != 0,
+          'result': text,
+        }),
+      );
+    }
+    return (await stderr, code);
+  } finally {
+    unawaited(outFile.delete().catchError((Object _) => outFile));
+  }
 }
 
 void _cleanupEphemeralAgyConversation(

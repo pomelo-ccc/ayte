@@ -393,12 +393,12 @@ class _ChatScreenState extends State<ChatScreen>
       child: child,
       builder: (context, child) {
         final t = _sessionEntranceCurve.value;
-        if (t >= 1) return child!;
-        final opacity = (0.22 + 0.78 * t).clamp(0.0, 1.0);
+        final done = t >= 1;
+        final opacity = done ? 1.0 : (0.22 + 0.78 * t).clamp(0.0, 1.0);
         return Opacity(
           opacity: opacity,
           child: Transform.translate(
-            offset: Offset(0, (1 - t) * 4),
+            offset: done ? Offset.zero : Offset(0, (1 - t) * 4),
             child: child,
           ),
         );

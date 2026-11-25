@@ -324,33 +324,76 @@ void main() {
       );
     });
 
-    test('convertAgyUsage separates uncached input from cache_read_tokens', () {
-      final converted = AntigravityTransport.convertAgyUsage(const {
+    test('convertAgyUsage handles both legacy inclusive and current exclusive agy usage payloads', () {
+      // Legacy agy format where input_tokens already includes cache_read_tokens
+      // and total_tokens == input_tokens + output_tokens.
+      final legacy = AntigravityTransport.convertAgyUsage(const {
         'input_tokens': 148793,
         'output_tokens': 2811,
         'thinking_tokens': 412,
         'cache_read_tokens': 144783,
         'total_tokens': 151604,
       });
-      expect(converted, isNotNull);
-      expect(converted!.contextTokens, 151604);
-      expect(converted.usage['input_tokens'], 4010);
-      expect(converted.usage['cache_read_input_tokens'], 144783);
-      expect(converted.usage['output_tokens'], 2811);
+      expect(legacy, isNotNull);
+      expect(legacy!.contextTokens, 151604);
+      expect(legacy.usage['input_tokens'], 4010);
+      expect(legacy.usage['cache_read_input_tokens'], 144783);
+      expect(legacy.usage['output_tokens'], 2811);
+
+      // Current agy format where input_tokens is uncached input only (often
+      // smaller than cache_read_tokens) and total_tokens may be absent or
+      // equal to input + cache_read + output.
+      final currentNoTotal = AntigravityTransport.convertAgyUsage(const {
+        'input_tokens': 2975,
+        'output_tokens': 2517,
+        'thinking_tokens': 1556,
+        'cache_read_tokens': 30911,
+      });
+      expect(currentNoTotal, isNotNull);
+      expect(currentNoTotal!.contextTokens, 36403);
+      expect(currentNoTotal.usage['input_tokens'], 2975);
+      expect(currentNoTotal.usage['cache_read_input_tokens'], 30911);
+      expect(currentNoTotal.usage['output_tokens'], 2517);
+
+      // Current agy format where a single step adds more uncached input than
+      // the cached prefix (input_tokens > cache_read_tokens).
+      final currentLargeDelta = AntigravityTransport.convertAgyUsage(const {
+        'input_tokens': 60000,
+        'output_tokens': 1000,
+        'cache_read_tokens': 25000,
+        'total_tokens': 86000,
+      });
+      expect(currentLargeDelta, isNotNull);
+      expect(currentLargeDelta!.contextTokens, 86000);
+      expect(currentLargeDelta.usage['input_tokens'], 60000);
+      expect(currentLargeDelta.usage['cache_read_input_tokens'], 25000);
+
+      // Even if total_tokens omits cache_read_tokens when input < cache_read,
+      // contextTokens still accounts for cache_read_tokens.
+      final currentUnderstatedTotal = AntigravityTransport.convertAgyUsage(const {
+        'input_tokens': 2975,
+        'output_tokens': 2517,
+        'cache_read_tokens': 30911,
+        'total_tokens': 5492,
+      });
+      expect(currentUnderstatedTotal, isNotNull);
+      expect(currentUnderstatedTotal!.contextTokens, 36403);
+      expect(currentUnderstatedTotal.usage['input_tokens'], 2975);
     });
 
-    test('buildContextCategories maps cleanly to ContextUsagePanel parts', () {
+    test('buildContextCategories reports aggregate used/free segments honestly without synthetic splits', () {
       final cats = AntigravityTransport.buildContextCategories(151604, 512000);
-      expect(cats.length, 4);
-      expect(ContextUsagePanel.partOf('${cats[0]['name']}'), 'system');
-      expect(ContextUsagePanel.partOf('${cats[1]['name']}'), 'tools');
-      expect(ContextUsagePanel.partOf('${cats[2]['name']}'), 'messages');
-      final usedSum =
-          (cats[0]['tokens'] as int) +
-          (cats[1]['tokens'] as int) +
-          (cats[2]['tokens'] as int);
-      expect(usedSum, 151604);
-      expect(cats[3]['tokens'], 512000 - 151604);
+      expect(cats.length, 2);
+      expect(ContextUsagePanel.partOf('${cats[0]['name']}'), 'used');
+      expect(cats[0]['tokens'], 151604);
+      expect(cats[0]['kind'], 'used');
+      expect(cats[1]['tokens'], 512000 - 151604);
+      expect(cats[1]['kind'], 'free');
+
+      final empty = AntigravityTransport.buildContextCategories(0, 512000);
+      expect(empty.length, 1);
+      expect(empty.single['kind'], 'free');
+      expect(empty.single['tokens'], 512000);
     });
   });
 
@@ -2089,7 +2132,10 @@ Future<void> main(List<String> args) async {
         home: homeDir.path,
       );
       expect(tokens, isNotNull);
-      expect(tokens!.contextTokens, 1500);
+      expect(tokens!.inputTokens, 1200);
+      expect(tokens.cacheReadTokens, 200);
+      expect(tokens.outputTokens, 300);
+      expect(tokens.contextTokens, 1700);
 
       final syncedPath = syncAntigravityTranscriptIfNeeded(
         cwd: projDir.path,
@@ -2100,6 +2146,8 @@ Future<void> main(List<String> args) async {
       final syncedText = File(syncedPath!).readAsStringSync();
       expect(syncedText, contains('hello'));
       expect(syncedText, contains('world'));
+      expect(syncedText, contains('"input_tokens":1200'));
+      expect(syncedText, contains('"cache_read_input_tokens":200'));
     });
 
     test('cancel_async_message removes queued turns, rejects executing/unknown turns, and /clear resets state + temp images', () async {
@@ -2561,7 +2609,10 @@ Future<void> main(List<String> args) async {
         home: homeDir.path,
       );
       expect(tokens, isNotNull);
-      expect(tokens!.contextTokens, 1250);
+      expect(tokens!.inputTokens, 1000);
+      expect(tokens.cacheReadTokens, 100);
+      expect(tokens.outputTokens, 250);
+      expect(tokens.contextTokens, 1350);
 
       final syncedPath = syncAntigravityTranscriptIfNeeded(
         cwd: projDir.path,
@@ -3073,30 +3124,70 @@ Future<void> main(List<String> args) async {
         ..writeAsStringSync('');
       final homeExe = File(p.join(geminiBin.path, 'agy.exe'))
         ..writeAsStringSync('');
+      final explicitPosixExe = File(p.join(explicitBin.path, 'agy'))
+        ..writeAsStringSync('');
+      final homePosixExe = File(p.join(geminiBin.path, 'agy'))
+        ..writeAsStringSync('');
 
       final candidates = LocalAntigravity.candidatesForTesting({
         'Path': explicitBin.path,
         'UserProfile': homeDir.path,
       }, forceWindows: true);
       expect(candidates.first, p.windows.join(explicitBin.path, 'agy.exe'));
-      expect(candidates, contains(p.windows.join(geminiBin.path, 'agy.exe')));
-
       expect(
-        LocalAntigravity.findExecutableForTesting({
-          'Path': explicitBin.path,
-          'UserProfile': homeDir.path,
-        }, forceWindows: true),
-        explicitExe.path,
+        candidates,
+        contains(p.windows.join(homeDir.path, '.gemini', 'bin', 'agy.exe')),
       );
 
       // Explicit empty Path must not fall back to host PATH.
+      final homeOnlyCandidates = LocalAntigravity.candidatesForTesting({
+        'Path': '',
+        'Home': homeDir.path,
+      }, forceWindows: true);
       expect(
-        LocalAntigravity.findExecutableForTesting({
-          'Path': '',
-          'Home': homeDir.path,
-        }, forceWindows: true),
-        homeExe.path,
+        homeOnlyCandidates.first,
+        p.windows.join(homeDir.path, '.gemini', 'bin', 'agy.exe'),
       );
+      expect(
+        LocalAntigravity.candidatesForTesting({
+          'Path': '',
+          'Home': '',
+          'UserProfile': '',
+        }, forceWindows: true),
+        isEmpty,
+      );
+
+      if (Platform.isWindows) {
+        expect(
+          LocalAntigravity.findExecutableForTesting({
+            'Path': explicitBin.path,
+            'UserProfile': homeDir.path,
+          }, forceWindows: true),
+          explicitExe.path,
+        );
+        expect(
+          LocalAntigravity.findExecutableForTesting({
+            'Path': '',
+            'Home': homeDir.path,
+          }, forceWindows: true),
+          homeExe.path,
+        );
+      } else {
+        expect(
+          LocalAntigravity.findExecutableForTesting({
+            'PATH': explicitBin.path,
+            'HOME': homeDir.path,
+          }),
+          explicitPosixExe.path,
+        );
+        expect(
+          LocalAntigravity.findExecutableForTesting({
+            'PATH': '',
+            'HOME': homeDir.path,
+          }),
+          homePosixExe.path,
+        );
+      }
       expect(
         LocalAntigravity.findExecutableForTesting({
           'Path': '',
@@ -3615,6 +3706,189 @@ Future<void> main(List<String> args) async {
           args,
           contains('--add-dir=${p.join(DataDirectory.current.cacheDir, 'agy-img')}'),
         );
+      },
+    );
+
+    test(
+      'high-cache turns do not emit false compact_boundary and real compaction preserves cache_read_tokens in post_tokens',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp('agy_ctx_cache_');
+        addTearDown(() => _deleteWithRetry(tmp));
+
+        final brainFile = File(
+          p.join(
+            tmp.path,
+            '.gemini',
+            'antigravity-cli',
+            'brain',
+            'conv-ctx',
+            '.system_generated',
+            'logs',
+            'transcript.jsonl',
+          ),
+        );
+
+        final fakeAgy = FakeCliExecutable.create(
+          tmp,
+          name: 'fake_agy_ctx_cache',
+          dartBody: '''
+Future<void> main(List<String> args) async {
+  var turn = 0;
+  final brain = File(${jsonEncode(brainFile.path)});
+  await for (final line in stdin.transform(utf8.decoder).transform(const LineSplitter())) {
+    if (line.trim().isEmpty) continue;
+    turn++;
+    stdout.writeln(jsonEncode({'event': 'init', 'conversation_id': 'conv-ctx'}));
+    brain.parent.createSync(recursive: true);
+    if (turn == 1) {
+      // High-cache normal turn: input_tokens (13829) < cache_read_tokens (492125).
+      brain.writeAsStringSync(
+        "\${jsonEncode({'type': 'PLANNER_RESPONSE', 'input_tokens': 13829, 'cache_read_tokens': 492125, 'output_tokens': 202})}\\n",
+      );
+      stdout.writeln(jsonEncode({
+        'event': 'step_update',
+        'step_update': {
+          'step_index': 1,
+          'step_type': 'agent_response',
+          'state': 'DONE',
+          'text_delta': 'turn 1 answer',
+          'usage': {
+            'input_tokens': 13829,
+            'cache_read_tokens': 492125,
+            'output_tokens': 202,
+          },
+        },
+      }));
+    } else if (turn == 2) {
+      // Another high-cache normal turn that grows slightly; must NOT false-compact.
+      brain.writeAsStringSync(
+        "\${jsonEncode({'type': 'PLANNER_RESPONSE', 'input_tokens': 4100, 'cache_read_tokens': 505955, 'output_tokens': 400})}\\n",
+        mode: FileMode.append,
+      );
+      stdout.writeln(jsonEncode({
+        'event': 'step_update',
+        'step_update': {
+          'step_index': 2,
+          'step_type': 'agent_response',
+          'state': 'DONE',
+          'text_delta': 'turn 2 answer',
+          'usage': {
+            'input_tokens': 4100,
+            'cache_read_tokens': 505955,
+            'output_tokens': 400,
+          },
+        },
+      }));
+    } else {
+      // Real auto-compaction: drops from ~510K down to 36403 (2975 + 30911 + 2517).
+      brain.writeAsStringSync(
+        "\${jsonEncode({'type': 'PLANNER_RESPONSE', 'input_tokens': 2975, 'cache_read_tokens': 30911, 'output_tokens': 2517})}\\n",
+        mode: FileMode.append,
+      );
+      stdout.writeln(jsonEncode({
+        'event': 'step_update',
+        'step_update': {
+          'step_index': 3,
+          'step_type': 'agent_response',
+          'state': 'DONE',
+          'text_delta': 'turn 3 post-compact answer',
+          'usage': {
+            'input_tokens': 2975,
+            'cache_read_tokens': 30911,
+            'output_tokens': 2517,
+          },
+        },
+      }));
+    }
+    stdout.writeln(jsonEncode({
+      'event': 'result',
+      'result': {'conversation_id': 'conv-ctx', 'status': 'SUCCESS', 'response': 'ok'},
+    }));
+    await stdout.flush();
+  }
+}
+''',
+        );
+
+        final transport = AntigravityTransport.forTesting(
+          executable: fakeAgy.executablePath,
+          environment: {'HOME': tmp.path},
+          launch: ClaudeLaunch(cwd: tmp.path, persist: false),
+        );
+        addTearDown(() async {
+          transport.close();
+          await transport.exited;
+        });
+
+        final compacts = <Map<String, Object?>>[];
+        final responses = <String, Map<String, Object?>>{};
+        var idleCount = 0;
+        final sub = transport.messages.listen((m) {
+          if (m['type'] == 'system' && m['subtype'] == 'compact_boundary') {
+            compacts.add(m);
+          } else if (m['type'] == 'system' &&
+              m['subtype'] == 'session_state_changed' &&
+              m['state'] == 'idle') {
+            idleCount++;
+          } else if (m['type'] == 'control_response') {
+            final r = (m['response'] as Map).cast<String, Object?>();
+            responses[r['request_id'] as String] =
+                (r['response'] as Map).cast<String, Object?>();
+          }
+        });
+        addTearDown(sub.cancel);
+
+        Future<Map<String, Object?>> queryContext(String reqId) async {
+          transport.write({
+            'type': 'control_request',
+            'request_id': reqId,
+            'request': {'subtype': 'get_context_usage'},
+          });
+          while (!responses.containsKey(reqId)) {
+            await Future<void>.delayed(const Duration(milliseconds: 10));
+          }
+          return responses[reqId]!;
+        }
+
+        // Turn 1: 13829 + 492125 + 202 = 506156, no compaction.
+        transport.write({
+          'type': 'user',
+          'uuid': 'u1',
+          'message': {'role': 'user', 'content': 'turn 1'},
+        });
+        while (idleCount < 1) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        expect(compacts, isEmpty);
+        expect((await queryContext('c1'))['totalTokens'], 506156);
+
+        // Turn 2: 4100 + 505955 + 400 = 510455, still NO false compaction.
+        transport.write({
+          'type': 'user',
+          'uuid': 'u2',
+          'message': {'role': 'user', 'content': 'turn 2'},
+        });
+        while (idleCount < 2) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        expect(compacts, isEmpty);
+        expect((await queryContext('c2'))['totalTokens'], 510455);
+
+        // Turn 3: Real compaction drops to 2975 + 30911 + 2517 = 36403 (NOT 5492).
+        transport.write({
+          'type': 'user',
+          'uuid': 'u3',
+          'message': {'role': 'user', 'content': 'turn 3'},
+        });
+        while (idleCount < 3) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        expect(compacts, hasLength(1));
+        final meta = compacts.single['compact_metadata'] as Map;
+        expect(meta['trigger'], 'auto');
+        expect(meta['pre_tokens'], 510455);
+        expect(meta['post_tokens'], 36403);
+        expect((await queryContext('c3'))['totalTokens'], 36403);
       },
     );
   });

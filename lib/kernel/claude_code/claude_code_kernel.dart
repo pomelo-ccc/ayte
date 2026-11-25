@@ -3275,7 +3275,7 @@ class ClaudeCodeKernel
             _requests[reqId] = CacheTokens(
               read: brain.cacheReadTokens,
               written: 0,
-              uncached: math.max(0, brain.inputTokens - brain.cacheReadTokens),
+              uncached: brain.inputTokens,
             );
             counted = true;
           }

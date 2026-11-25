@@ -4,6 +4,7 @@
 import 'dart:convert';
 
 import '../../chat/chat_models.dart' show ImageAttachment;
+import '../../models/model_provider.dart' show parseModelRef;
 import '../../models/model_providers.dart';
 import '../../models/model_runtime.dart';
 import '../../remote/remote_claude.dart';
@@ -13,11 +14,26 @@ import '../../models/launch_environment.dart';
 import '../../usage/usage_capture.dart';
 import '../../usage/usage_ledger.dart';
 import '../../usage/usage_record.dart';
+import '../antigravity/antigravity_cli.dart' show antigravityBuiltinProviderId;
+import '../codebuddy/codebuddy_cli.dart' show codebuddyBuiltinProviderId;
+import '../kernel_registry.dart' show claudeCodeKernelId, codexKernelId;
 import 'claude_code_transport.dart' show ClaudeLaunch;
 import 'claude_core_setting.dart';
 import 'claude_haiku_stub.dart'
     if (dart.library.io) 'claude_haiku_io.dart'
     as platform;
+
+/// Whether [model] explicitly targets one of Ayte's built-in native CLI
+/// kernels (`@antigravity-cli/...`, `@codebuddy-cli/...`, `@claude-code/...`,
+/// `@codex/...`).
+bool isExplicitNativeCliModel(String? model) {
+  final ref = parseModelRef(model);
+  if (ref == null) return false;
+  return ref.provider == antigravityBuiltinProviderId ||
+      ref.provider == codebuddyBuiltinProviderId ||
+      ref.provider == claudeCodeKernelId ||
+      ref.provider == codexKernelId;
+}
 
 /// Asks Claude Haiku [prompt], with [system] as its system prompt (one
 /// line, so that it passes through a shell unchanged): one turn, no tools,
@@ -54,7 +70,8 @@ Future<String> askClaudeHaiku(
   final host = location == null ? null : RemoteLocation.hostOf(location);
   final providers = ModelProviders.current;
   var custom = providers.resolve(model);
-  if (custom == null && !providers.antigravityOffered) {
+  final explicitNativeCli = isExplicitNativeCliModel(model);
+  if (custom == null && !explicitNativeCli && !providers.antigravityOffered) {
     custom = providers.resolve(providers.firstModel);
     if (custom == null) {
       throw const ClaudeHaikuException(ClaudeCore.noModel);
@@ -62,7 +79,7 @@ Future<String> askClaudeHaiku(
     exact = false;
   }
   if (custom == null) {
-    if (host != null) {
+    if (host != null && !explicitNativeCli) {
       return askRemoteHaiku(
         SshHosts.instance[host],
         system,
@@ -74,7 +91,7 @@ Future<String> askClaudeHaiku(
       system,
       prompt,
       cancel: cancel,
-      model: exact ? model : null,
+      model: (exact || explicitNativeCli) ? model : null,
       images: images,
       tools: tools,
       session: session,

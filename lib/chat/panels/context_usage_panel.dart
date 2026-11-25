@@ -66,6 +66,7 @@ class ContextUsagePanel extends StatefulWidget {
         'memory files' => 'memory',
         'skills' || 'slash commands' => 'skills',
         'messages' => 'messages',
+        'used' => 'used',
         _ => null,
       };
 
@@ -181,11 +182,13 @@ class _ContextUsagePanelState extends State<ContextUsagePanel>
       for (final key in [...known, ...others])
         (
           key: key,
-          label: _order.contains(key)
+          label: key == 'used'
+              ? l10n.usageUsed
+              : _order.contains(key)
               ? UsageFormat.part(context, key)
               : labels[key] ?? key,
           tokens: tokens[key]!,
-          color: UsagePalette.part(key),
+          color: UsagePalette.part(key == 'used' ? 'messages' : key),
         ),
     ];
   }
@@ -521,7 +524,7 @@ class _ContextUsagePanelState extends State<ContextUsagePanel>
   static Color _popoverPartColor(String key) => switch (key) {
     'system' => const Color(0xFF9CA3AF),
     'tools' => const Color(0xFF8B7EC8),
-    'messages' => const Color(0xFF4A8FE7),
+    'messages' || 'used' => const Color(0xFF4A8FE7),
     _ => UsagePalette.part(key),
   };
 
@@ -530,6 +533,7 @@ class _ContextUsagePanelState extends State<ContextUsagePanel>
         'system' => isZh ? '系统提示词' : 'System prompt',
         'tools' => isZh ? '工具定义' : 'Tool definitions',
         'messages' => isZh ? '对话消息' : 'Messages',
+        'used' => isZh ? '已用上下文' : 'Used context',
         'toolResult' => isZh ? '工具结果' : 'Tool results',
         'mcp' => 'MCP',
         'skills' => isZh ? '技能' : 'Skills',
@@ -632,27 +636,12 @@ class _ContextUsagePanelState extends State<ContextUsagePanel>
       }
     }
     final used = widget.usage.used;
-    final sys = used > 0 ? math.min(3400, (used * 0.05).round()) : 0;
-    final tools = used > 0 ? math.min(20600, (used * 0.20).round()) : 0;
-    final msgs = math.max(0, used - sys - tools);
     return [
       (
-        key: 'system',
-        label: _popoverPartLabel('system', 'System prompt', isZh),
-        tokens: sys,
-        color: _popoverPartColor('system'),
-      ),
-      (
-        key: 'tools',
-        label: _popoverPartLabel('tools', 'Tool definitions', isZh),
-        tokens: tools,
-        color: _popoverPartColor('tools'),
-      ),
-      (
-        key: 'messages',
-        label: _popoverPartLabel('messages', 'Messages', isZh),
-        tokens: msgs,
-        color: _popoverPartColor('messages'),
+        key: 'used',
+        label: _popoverPartLabel('used', 'Used context', isZh),
+        tokens: used,
+        color: _popoverPartColor('used'),
       ),
     ];
   }
@@ -851,20 +840,24 @@ class _ContextUsagePanelState extends State<ContextUsagePanel>
                 ),
               ),
             ),
-            divider,
-            // Vertical parts breakdown list
-            for (final part in parts)
-              _PopoverPartRow(
-                color: part.color,
-                label: part.label,
-                value: _formatPopoverTokens(part.tokens),
-                picked: part.key == _picked,
-                onTap: detail == null
-                    ? null
-                    : () => setState(
-                        () => _picked = part.key == _picked ? null : part.key,
-                      ),
-              ),
+            // Vertical parts breakdown list (shown only when real category
+            // breakdown is available from the kernel or proxy ledger).
+            if (parts.length > 1 ||
+                (parts.length == 1 && parts.first.key != 'used')) ...[
+              divider,
+              for (final part in parts)
+                _PopoverPartRow(
+                  color: part.color,
+                  label: part.label,
+                  value: _formatPopoverTokens(part.tokens),
+                  picked: part.key == _picked,
+                  onTap: detail == null
+                      ? null
+                      : () => setState(
+                          () => _picked = part.key == _picked ? null : part.key,
+                        ),
+                ),
+            ],
             if (picked != null && items.isNotEmpty) ...[
               const SizedBox(height: 6),
               Container(

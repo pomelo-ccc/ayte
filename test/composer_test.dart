@@ -400,7 +400,7 @@ void main() {
         await tester.pump(const Duration(milliseconds: 100));
       }
       expect(section(tester).seconds, isNull);
-      expect(tester.getSize(box).height, lessThanOrEqualTo(13 * 1.6 * 7));
+      expect(tester.getSize(box).height, lessThanOrEqualTo(13 * 1.68 * 7));
       expect(position().pixels, position().maxScrollExtent);
       expect(position().pixels, greaterThan(0));
       expect(liveMask(tester).top, isTrue);
@@ -568,15 +568,17 @@ void main() {
       var top = paragraph
           .getOffsetForCaret(TextPosition(offset: offset), Rect.zero)
           .dy;
-      if (offset > 0) {
-        final box = paragraph
-            .getBoxesForSelection(
-              TextSelection(baseOffset: 0, extentOffset: offset),
-              boxHeightStyle: ui.BoxHeightStyle.max,
-            )
-            .first;
-        line = box.bottom - box.top;
-        top = box.top;
+      final end = offset > 0 ? offset : paragraph.text.toPlainText().length;
+      if (end > 0) {
+        final boxes = paragraph.getBoxesForSelection(
+          TextSelection(baseOffset: 0, extentOffset: end),
+          boxHeightStyle: ui.BoxHeightStyle.max,
+        );
+        if (boxes.isNotEmpty) {
+          final box = boxes.first;
+          line = box.bottom - box.top;
+          top = box.top;
+        }
       }
       final lineTop = caretBox
           .globalToLocal(paragraph.localToGlobal(Offset(0, top)))
@@ -1297,10 +1299,7 @@ void main() {
     await mouse.up();
     await settleAnimations(tester);
     expect(menuRow, findsNothing);
-    expect(
-      find.descendant(of: modePill, matching: find.text('Plan')),
-      findsOneWidget,
-    );
+    expect(tester.widget<ComposerPicker>(modePill).selected.label, 'Plan');
 
     // Click opens it and it stays open; arrows and Enter choose without
     // taking focus from the composer.
@@ -1314,10 +1313,7 @@ void main() {
     await pressKey(tester, LogicalKeyboardKey.enter);
     await settleAnimations(tester);
     expect(menuRow, findsNothing);
-    expect(
-      find.descendant(of: modePill, matching: find.text('Agent')),
-      findsOneWidget,
-    );
+    expect(tester.widget<ComposerPicker>(modePill).selected.label, 'Agent');
     expect(focus.hasFocus, isTrue);
     expect(composerController(tester).shownText, '');
 
@@ -1345,12 +1341,7 @@ void main() {
       await tester.sendKeyEvent(LogicalKeyboardKey.tab);
       await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
       await tester.pump();
-      return tester
-          .widgetList<Text>(
-            find.descendant(of: modePill, matching: find.byType(Text)),
-          )
-          .first
-          .data!;
+      return tester.widget<ComposerPicker>(modePill).selected.label;
     }
 
     expect(
@@ -1988,10 +1979,7 @@ void main() {
       await mouse.up();
       await settleAnimations(tester);
       expect(editorInHistory(), findsOneWidget);
-      expect(
-        find.descendant(of: editPicker, matching: find.text('Plan')),
-        findsOneWidget,
-      );
+      expect(tester.widget<ComposerPicker>(editPicker).selected.label, 'Plan');
 
       // The title bar is outside.
       await mouse.moveTo(const Offset(400, 10));

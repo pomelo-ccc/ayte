@@ -40,6 +40,23 @@ class ClaudeCliTransport implements ClaudeCodeTransport {
 
   static final Set<ClaudeCliTransport> _live = {};
   static final Set<Future<void>> _pendingStops = {};
+  static bool? _installed;
+
+  /// Whether the local `claude` CLI executable is available on PATH.
+  static bool installed() =>
+      _installed ??= _locateClaude(_enrichedPath(Platform.environment)) != null;
+
+  /// Returns a copy of [base] with common local CLI binary directories added to
+  /// `PATH`.
+  static Map<String, String> enrichEnvironment(Map<String, String> base) =>
+      _enrichedPath(base);
+
+  /// Locates the `claude` CLI executable in [env]'s `PATH`.
+  static String? locateExecutable(Map<String, String> env) {
+    final found = _locateClaude(env);
+    if (found != null) _installed = true;
+    return found;
+  }
 
   static Future<void> stopAll() async {
     final live = [..._live];

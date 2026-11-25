@@ -1361,21 +1361,17 @@ class AntigravityTransport implements ClaudeCodeTransport {
     });
   }
 
-  /// Builds `get_context_usage` category segments matching
-  /// `ContextUsagePanel.partOf` (`System prompt`, `System tools`, `Messages`).
+  /// Builds `get_context_usage` segments for backends (`agy`) that report total
+  /// context occupancy without a real per-category breakdown.
   static List<Map<String, Object?>> buildContextCategories(
     int used,
     int maxTokens,
   ) {
     final safeUsed = math.max(0, used);
-    final sys = safeUsed > 0 ? math.min(6200, (safeUsed * 0.22).round()) : 0;
-    final tools = safeUsed > 0 ? math.min(21600, (safeUsed * 0.72).round()) : 0;
-    final messages = math.max(0, safeUsed - sys - tools);
     final free = math.max(0, maxTokens - safeUsed);
     return [
-      {'name': 'System prompt', 'tokens': sys, 'kind': 'used'},
-      {'name': 'System tools', 'tokens': tools, 'kind': 'used'},
-      {'name': 'Messages', 'tokens': messages, 'kind': 'used'},
+      if (safeUsed > 0)
+        {'name': 'Used', 'tokens': safeUsed, 'kind': 'used'},
       {'name': 'Free space', 'tokens': free, 'kind': 'free'},
     ];
   }
@@ -2055,11 +2051,76 @@ class AntigravityTransport implements ClaudeCodeTransport {
       } on Object {
         // Ignore.
       }
+      final descendants = await _posixDescendantPids(proc.pid);
       try {
         proc.kill(ProcessSignal.sigterm);
       } on Object {
         // Ignore if already exited.
       }
+      for (final pid in descendants.reversed) {
+        try {
+          Process.killPid(pid, ProcessSignal.sigterm);
+        } on Object {
+          // Ignore if already exited.
+        }
+      }
+      if (descendants.isNotEmpty) {
+        await _waitForPosixPidsToExit(descendants);
+      }
+    }
+  }
+
+  static Future<List<int>> _posixDescendantPids(int rootPid) async {
+    final result = <int>[];
+    final visited = <int>{rootPid};
+    final queue = <int>[rootPid];
+    while (queue.isNotEmpty) {
+      final parent = queue.removeAt(0);
+      try {
+        final res = await Process.run('pgrep', ['-P', '$parent']);
+        if (res.exitCode != 0) continue;
+        for (final line in '${res.stdout}'.split(RegExp(r'\s+'))) {
+          final pid = int.tryParse(line.trim());
+          if (pid != null && pid > 0 && visited.add(pid)) {
+            result.add(pid);
+            queue.add(pid);
+          }
+        }
+      } on Object {
+        break;
+      }
+    }
+    return result;
+  }
+
+  static Future<void> _waitForPosixPidsToExit(List<int> pids) async {
+    final alive = pids.toList();
+    bool checkAlive(int pid) {
+      try {
+        return Process.killPid(pid, ProcessSignal.sigcont);
+      } on Object {
+        return false;
+      }
+    }
+
+    final graceDeadline = DateTime.now().add(const Duration(milliseconds: 300));
+    while (alive.isNotEmpty && DateTime.now().isBefore(graceDeadline)) {
+      alive.removeWhere((pid) => !checkAlive(pid));
+      if (alive.isEmpty) return;
+      await Future<void>.delayed(const Duration(milliseconds: 15));
+    }
+    for (final pid in alive.reversed) {
+      try {
+        Process.killPid(pid, ProcessSignal.sigkill);
+      } on Object {
+        // Ignore if already exited.
+      }
+    }
+    final killDeadline = DateTime.now().add(const Duration(milliseconds: 200));
+    while (alive.isNotEmpty && DateTime.now().isBefore(killDeadline)) {
+      alive.removeWhere((pid) => !checkAlive(pid));
+      if (alive.isEmpty) return;
+      await Future<void>.delayed(const Duration(milliseconds: 15));
     }
   }
 
@@ -2198,10 +2259,9 @@ class AntigravityTransport implements ClaudeCodeTransport {
     final errSub = _stderrSub;
     _stdoutSub = null;
     _stderrSub = null;
+    final targetTurn = notifyActiveTurn ? _activeTurn : null;
     if (proc == null && outSub == null && errSub == null) {
-      if (notifyActiveTurn) {
-        _activeTurn?.handleProcessExit(-1);
-      }
+      targetTurn?.handleProcessExit(-1);
       return Future.value();
     }
     final future = _trackCleanup(
@@ -2209,7 +2269,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
         proc: proc,
         outSub: outSub,
         errSub: errSub,
-        notifyActiveTurn: notifyActiveTurn,
+        targetTurn: targetTurn,
       ),
     );
     _pendingStops.add(future);
@@ -2225,7 +2285,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
     required Process? proc,
     required StreamSubscription<String>? outSub,
     required StreamSubscription<String>? errSub,
-    required bool notifyActiveTurn,
+    required _ActiveTurn? targetTurn,
   }) async {
     if (proc != null) {
       await _terminateProcessTree(proc);
@@ -2233,9 +2293,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
     }
     await outSub?.cancel();
     await errSub?.cancel();
-    if (notifyActiveTurn) {
-      _activeTurn?.handleProcessExit(-1);
-    }
+    targetTurn?.handleProcessExit(-1);
   }
 
   Future<void> _drainTurnQueue() async {
@@ -2305,6 +2363,8 @@ class AntigravityTransport implements ClaudeCodeTransport {
     final isManualCompact =
         prompt.trim() == '/compact' || prompt.trim().startsWith('/compact ');
     final preTurnContextTokens = _lastContextTokens;
+    var hadStepUsage = false;
+    var peakContextTokens = preTurnContextTokens;
 
     if (_needsHistorySeed && _sessionLog != null) {
       _needsHistorySeed = false;
@@ -2404,6 +2464,10 @@ class AntigravityTransport implements ClaudeCodeTransport {
         return false;
       }
       await active.done.future;
+      hadStepUsage = hadStepUsage || active.hadStepUsage;
+      if (active.peakContextTokens > peakContextTokens) {
+        peakContextTokens = active.peakContextTokens;
+      }
       if (_closed) return false;
       return active.needsFreshRetry;
     }
@@ -2512,19 +2576,19 @@ class AntigravityTransport implements ClaudeCodeTransport {
       final brain = readBrainContextTokens(convId, home: _paths.home);
       if (brain != null && brain.contextTokens > 0) {
         if (isManualCompact ||
-            (preTurnContextTokens > 60000 &&
-                brain.contextTokens < (preTurnContextTokens * 0.55).round())) {
+            (peakContextTokens > 60000 &&
+                brain.contextTokens < (peakContextTokens * 0.55).round())) {
           _lastContextTokens = brain.contextTokens;
           _emit({
             'type': 'system',
             'subtype': 'compact_boundary',
             'compact_metadata': {
               'trigger': isManualCompact ? 'manual' : 'auto',
-              if (preTurnContextTokens > 0) 'pre_tokens': preTurnContextTokens,
+              if (peakContextTokens > 0) 'pre_tokens': peakContextTokens,
               'post_tokens': _lastContextTokens,
             },
           });
-        } else if (!turn.hadStepUsage) {
+        } else if (!hadStepUsage) {
           _lastContextTokens = brain.contextTokens;
         }
       }
@@ -2539,35 +2603,105 @@ class AntigravityTransport implements ClaudeCodeTransport {
     });
   }
 
-  /// Converts an `agy` `usage` payload (`input_tokens` ALREADY includes
-  /// `cache_read_tokens`) into Anthropic/Claude-compatible `usage` where
-  /// `input_tokens` is uncached input and `contextTokens` is the single-step
-  /// total context occupancy (`input_tokens + output_tokens`).
+  static int _asInt(Object? value) => value is num ? value.round() : 0;
+
+  /// Normalizes `agy` token counts across both protocol variants:
+  /// - Current `agy` (`step_update.usage` and brain `transcript.jsonl`):
+  ///   `input_tokens` is uncached input ONLY, separate from `cache_read_tokens`.
+  /// - Legacy `agy`: `input_tokens` already included `cache_read_tokens`, with
+  ///   `total_tokens == input_tokens + output_tokens`.
+  static ({
+    int uncachedInput,
+    int cacheRead,
+    int cacheCreation,
+    int output,
+    int contextTokens,
+  })
+  normalizeAgyTokenCounts({
+    required int inputTokens,
+    required int outputTokens,
+    required int cacheRead,
+    int cacheCreation = 0,
+    int totalTokens = 0,
+  }) {
+    final safeInput = math.max(0, inputTokens);
+    final safeOutput = math.max(0, outputTokens);
+    final safeCacheRead = math.max(0, cacheRead);
+    final safeCacheCreation = math.max(0, cacheCreation);
+    final safeTotal = math.max(0, totalTokens);
+
+    final bool inputIncludesCache;
+    if (safeCacheRead <= 0 || safeInput < safeCacheRead) {
+      inputIncludesCache = false;
+    } else if (safeTotal > 0) {
+      final inclusiveTotal = safeInput + safeCacheCreation + safeOutput;
+      final exclusiveTotal =
+          safeInput + safeCacheRead + safeCacheCreation + safeOutput;
+      inputIncludesCache =
+          (safeTotal - inclusiveTotal).abs() <
+          (safeTotal - exclusiveTotal).abs();
+    } else {
+      inputIncludesCache = false;
+    }
+
+    final uncachedInput = inputIncludesCache
+        ? math.max(0, safeInput - safeCacheRead)
+        : safeInput;
+    final summedContext =
+        uncachedInput + safeCacheRead + safeCacheCreation + safeOutput;
+    final contextTokens = math.max(safeTotal, summedContext);
+
+    return (
+      uncachedInput: uncachedInput,
+      cacheRead: safeCacheRead,
+      cacheCreation: safeCacheCreation,
+      output: safeOutput,
+      contextTokens: contextTokens,
+    );
+  }
+
+  /// Converts an `agy` `usage` payload into Anthropic/Claude-compatible `usage`
+  /// where `input_tokens` is uncached input and `contextTokens` is the
+  /// single-step total context occupancy (`uncached + cache_read + cache_creation + output`).
   static ({Map<String, Object?> usage, int contextTokens})? convertAgyUsage(
     Object? rawUsage,
   ) {
     if (rawUsage is! Map) return null;
-    final inputTokens = (rawUsage['input_tokens'] as num?)?.round() ?? 0;
-    final outputTokens = (rawUsage['output_tokens'] as num?)?.round() ?? 0;
-    final cacheRead = (rawUsage['cache_read_tokens'] as num?)?.round() ?? 0;
-    final thinkingTokens = (rawUsage['thinking_tokens'] as num?)?.round();
-    final totalTokens = (rawUsage['total_tokens'] as num?)?.round() ?? 0;
+    final inputTokens = _asInt(rawUsage['input_tokens']);
+    final outputTokens = _asInt(rawUsage['output_tokens']);
+    final cacheRead = _asInt(
+      rawUsage['cache_read_tokens'] ?? rawUsage['cache_read_input_tokens'],
+    );
+    final cacheCreation = _asInt(
+      rawUsage['cache_creation_tokens'] ??
+          rawUsage['cache_creation_input_tokens'],
+    );
+    final thinkingTokens = rawUsage['thinking_tokens'] is num
+        ? (rawUsage['thinking_tokens'] as num).round()
+        : null;
+    final totalTokens = _asInt(rawUsage['total_tokens']);
 
-    final uncachedInput = math.max(0, inputTokens - cacheRead);
-    final contextTokens = totalTokens > 0
-        ? totalTokens
-        : (inputTokens + outputTokens);
-    if (contextTokens <= 0 && cacheRead <= 0) return null;
+    final normalized = normalizeAgyTokenCounts(
+      inputTokens: inputTokens,
+      outputTokens: outputTokens,
+      cacheRead: cacheRead,
+      cacheCreation: cacheCreation,
+      totalTokens: totalTokens,
+    );
+    if (normalized.contextTokens <= 0) return null;
 
     return (
       usage: {
-        'input_tokens': uncachedInput,
-        'output_tokens': outputTokens,
-        if (cacheRead > 0) 'cache_read_input_tokens': cacheRead,
+        'input_tokens': normalized.uncachedInput,
+        'output_tokens': normalized.output,
+        if (normalized.cacheCreation > 0)
+          'cache_creation_input_tokens': normalized.cacheCreation,
+        if (normalized.cacheRead > 0)
+          'cache_read_input_tokens': normalized.cacheRead,
         if (thinkingTokens != null)
           'output_tokens_details': {'thinking_tokens': thinkingTokens},
       },
-      contextTokens: contextTokens,
+      contextTokens: normalized.contextTokens,
     );
   }
 
@@ -2576,6 +2710,10 @@ class AntigravityTransport implements ClaudeCodeTransport {
     if (converted == null) return null;
     if (converted.contextTokens > 0) {
       _lastContextTokens = converted.contextTokens;
+      if (_activeTurn case final active?
+          when converted.contextTokens > active.peakContextTokens) {
+        active.peakContextTokens = converted.contextTokens;
+      }
     }
     return converted.usage;
   }
@@ -2596,6 +2734,10 @@ class AntigravityTransport implements ClaudeCodeTransport {
 
   /// Reads the latest single-step context window occupancy from `agy`'s native
   /// `~/.gemini/antigravity-cli/brain/<sessionId>/.system_generated/logs/transcript.jsonl`.
+  ///
+  /// Returned `inputTokens` is always normalized uncached input (excluding
+  /// `cacheReadTokens`), and `contextTokens` is the full occupancy including
+  /// `cacheReadTokens` and `outputTokens`.
   static ({
     int inputTokens,
     int outputTokens,
@@ -2654,17 +2796,19 @@ class AntigravityTransport implements ClaudeCodeTransport {
           final type = decoded['type'];
           if (type is! String) continue;
           if (type == 'PLANNER_RESPONSE') {
-            final inputTokens = (decoded['input_tokens'] as num?)?.round() ?? 0;
-            final outputTokens = (decoded['output_tokens'] as num?)?.round() ?? 0;
-            final cacheRead =
-                (decoded['cache_read_tokens'] as num?)?.round() ?? 0;
-            final contextTokens = inputTokens + outputTokens;
-            if (contextTokens > 0) {
+            final normalized = normalizeAgyTokenCounts(
+              inputTokens: _asInt(decoded['input_tokens']),
+              outputTokens: _asInt(decoded['output_tokens']),
+              cacheRead: _asInt(decoded['cache_read_tokens']),
+              cacheCreation: _asInt(decoded['cache_creation_tokens']),
+              totalTokens: _asInt(decoded['total_tokens']),
+            );
+            if (normalized.contextTokens > 0) {
               return (
-                inputTokens: inputTokens,
-                outputTokens: outputTokens,
-                cacheReadTokens: cacheRead,
-                contextTokens: contextTokens,
+                inputTokens: normalized.uncachedInput,
+                outputTokens: normalized.output,
+                cacheReadTokens: normalized.cacheRead,
+                contextTokens: normalized.contextTokens,
                 fromCompaction: false,
               );
             }
@@ -3179,6 +3323,7 @@ class _ActiveTurn {
   bool needsFreshRetry = false;
   bool streamedAnyResponse = false;
   bool hadStepUsage = false;
+  int peakContextTokens = 0;
   Map<String, Object?>? pendingSilentStepUsage;
   String? lastToolError;
   String? unansweredPermissionError;
@@ -3242,6 +3387,7 @@ class _ActiveTurn {
   final Map<int, StringBuffer> stepThinkingBuffer = {};
   final Map<int, StringBuffer> stepTextBuffer = {};
   final Map<int, Map<String, Object?>> stepUsage = {};
+  final Map<int, bool> stepUsageStreamed = {};
   final Map<int, bool> toolEmittedActive = {};
   final Map<int, bool> toolEmittedDone = {};
   final Map<
@@ -3303,6 +3449,14 @@ class _ActiveTurn {
         'event': {'type': 'content_block_stop', 'index': 1},
       });
     }
+    final usage = stepUsage[stepIndex];
+    if (usage != null && stepUsageStreamed[stepIndex] != true) {
+      stepUsageStreamed[stepIndex] = true;
+      transport._emit({
+        'type': 'stream_event',
+        'event': {'type': 'message_delta', 'usage': usage},
+      });
+    }
     transport._emit({
       'type': 'stream_event',
       'event': {'type': 'message_stop'},
@@ -3310,7 +3464,6 @@ class _ActiveTurn {
 
     final fullThinking = stepThinkingBuffer[stepIndex]?.toString() ?? '';
     final fullText = stepTextBuffer[stepIndex]?.toString() ?? '';
-    final usage = stepUsage[stepIndex];
     if (identical(pendingSilentStepUsage, usage)) {
       pendingSilentStepUsage = null;
     }
@@ -3515,6 +3668,7 @@ class _ActiveTurn {
       }
 
       if (usage != null && stepMessageStarted[stepIndex] == true) {
+        stepUsageStreamed[stepIndex] = true;
         transport._emit({
           'type': 'stream_event',
           'event': {'type': 'message_delta', 'usage': usage},
@@ -4254,17 +4408,7 @@ String? syncAntigravityTranscriptIfNeeded({
       } else if (type == 'PLANNER_RESPONSE') {
         final thinking = '${step['thinking'] ?? ''}'.trim();
         final text = '${step['content'] ?? ''}'.trim();
-        final inputTokens = (step['input_tokens'] as num?)?.round() ?? 0;
-        final outputTokens = (step['output_tokens'] as num?)?.round() ?? 0;
-        final cacheRead = (step['cache_read_tokens'] as num?)?.round() ?? 0;
-        final uncachedInput = math.max(0, inputTokens - cacheRead);
-        final usage = (inputTokens > 0 || outputTokens > 0 || cacheRead > 0)
-            ? <String, Object?>{
-                'input_tokens': uncachedInput,
-                'output_tokens': outputTokens,
-                if (cacheRead > 0) 'cache_read_input_tokens': cacheRead,
-              }
-            : null;
+        final usage = AntigravityTransport.convertAgyUsage(step)?.usage;
 
         if (thinking.isNotEmpty || text.isNotEmpty) {
           seq++;

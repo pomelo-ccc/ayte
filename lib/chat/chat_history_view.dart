@@ -3106,7 +3106,15 @@ class _ChatHistoryViewState extends State<ChatHistoryView>
                   top: 0,
                   left: _gutter,
                   right: _gutter,
-                  child: _inset > 0 ? _OverRail(child: _findBar()) : _findBar(),
+                  child: _inset > 0
+                      ? ListenableBuilder(
+                          listenable: _find,
+                          builder: (_, child) => _find.visible
+                              ? _OverRail(child: child!)
+                              : const SizedBox.shrink(),
+                          child: _findBar(),
+                        )
+                      : _findBar(),
                 ),
               ],
             ),

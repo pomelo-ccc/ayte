@@ -9,8 +9,7 @@ import '../../network/network_proxy_io.dart';
 import '../claude_code/claude_environment.dart';
 import 'codex_transport.dart';
 
-/// Resolved command invocation for spawning `codex app-server`.
-@visibleForTesting
+/// Resolved command invocation for spawning `codex`.
 class CodexLaunchSpec {
   const CodexLaunchSpec({
     required this.executable,
@@ -66,6 +65,11 @@ class ProcessCodexTransport implements CodexTransport {
 
   static final Set<ProcessCodexTransport> _live = {};
   static final Set<Future<void>> _pendingStops = {};
+  static bool? _installed;
+
+  /// Whether the local `codex` CLI executable is available on PATH.
+  static bool installed() =>
+      _installed ??= locateCodex(enrichedPath(Platform.environment)) != null;
 
   static Future<void> stopAll() async {
     final live = [..._live];
@@ -656,7 +660,6 @@ class ProcessCodexTransport implements CodexTransport {
   /// Enriches `PATH` with common Windows and POSIX tool/runtime locations
   /// (npm, Volta, Bun, Node.js, OpenAI Codex app binary directories) while
   /// preserving case-insensitive `PATH` semantics on Windows.
-  @visibleForTesting
   static Map<String, String> enrichedPath(
     Map<String, String> base, {
     bool? forceWindows,
@@ -768,7 +771,6 @@ class ProcessCodexTransport implements CodexTransport {
   /// `%LOCALAPPDATA%\OpenAI\Codex\bin\*` on Windows, respecting `PATH`
   /// directory order while preferring native `.exe` binaries before
   /// `.cmd`/`.bat`/`.ps1` shims within each directory.
-  @visibleForTesting
   static String? locateCodex(
     Map<String, String> env, {
     bool? forceWindows,
@@ -807,9 +809,8 @@ class ProcessCodexTransport implements CodexTransport {
   }
 
   /// Resolves the final process executable, arguments, and `runInShell` flag
-  /// for launching `codex app-server`, unwrapping Windows npm `.cmd`/`.bat` and
+  /// for launching `codex`, unwrapping Windows npm `.cmd`/`.bat` and
   /// `.ps1` shims directly to `node.exe` + script when possible.
-  @visibleForTesting
   static CodexLaunchSpec resolveLaunch(
     String executable,
     Map<String, String> env, {
