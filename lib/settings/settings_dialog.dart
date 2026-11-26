@@ -57,30 +57,46 @@ enum SettingsCategory {
   preferences([
     SettingsSection.general,
     SettingsSection.appearance,
+    SettingsSection.language,
+    SettingsSection.keyboard,
+  ]),
+  ai([
     SettingsSection.models,
     SettingsSection.antigravityAccounts,
     SettingsSection.codebuddyAccounts,
     SettingsSection.usage,
+  ]),
+  capabilities([
+    SettingsSection.browser,
+    SettingsSection.computerUse,
+    SettingsSection.voice,
+    SettingsSection.notifications,
+    SettingsSection.stash,
+  ]),
+  connections([
     SettingsSection.network,
     SettingsSection.ssh,
     SettingsSection.mobile,
-    SettingsSection.browser,
-    SettingsSection.computerUse,
-    SettingsSection.notifications,
-    SettingsSection.voice,
-    SettingsSection.stash,
     SettingsSection.accounts,
     SettingsSection.customize,
-    SettingsSection.language,
-    SettingsSection.keyboard,
+  ]),
+  system([
     SettingsSection.updates,
     SettingsSection.about,
-  ]),
-  advanced([SettingsSection.dataDirectory]);
+    SettingsSection.dataDirectory,
+  ]);
 
   const SettingsCategory(this.sections);
 
   final List<SettingsSection> sections;
+
+  /// Returns the category containing [section].
+  static SettingsCategory of(SettingsSection section) {
+    for (final category in values) {
+      if (category.sections.contains(section)) return category;
+    }
+    return SettingsCategory.preferences;
+  }
 }
 
 /// Opens the settings dialog on a section, for what is under it (the
@@ -187,23 +203,28 @@ class SettingsDialogState extends State<SettingsDialog> {
   /// takes the resize drag.
   static const _handleWidth = 5.0;
 
-  /// The list's width and whether it is docked, kept from one opening of
-  /// the dialog to the next, as the window keeps its sidebar's.
+  /// The list's width, docked state, and collapsed categories, kept from one
+  /// opening of the dialog to the next, as the window keeps its sidebar's.
   static double _keptWidth = SettingsDialog.navWidth;
   static bool _keptDocked = true;
+  static final Set<SettingsCategory> _keptCollapsed = {};
 
   @visibleForTesting
   static void resetLayout() {
     _keptWidth = SettingsDialog.navWidth;
     _keptDocked = true;
+    _keptCollapsed.clear();
   }
 
   late SettingsSection _section = widget.section;
 
   SettingsSection get section => _section;
 
-  /// Shows [section]'s page.
-  void show(SettingsSection section) => setState(() => _section = section);
+  /// Shows [section]'s page and ensures its category is expanded.
+  void show(SettingsSection section) => setState(() {
+    _section = section;
+    _keptCollapsed.remove(SettingsCategory.of(section));
+  });
 
   /// The width set by dragging, shown as [_shownWidth]. A drag sets it
   /// without building the dialog again (see the window's sidebar).
@@ -288,9 +309,13 @@ class SettingsDialogState extends State<SettingsDialog> {
 
   static String categoryLabel(BuildContext context, SettingsCategory category) {
     final l10n = context.l10n;
+    final isZh = Localizations.localeOf(context).languageCode == 'zh';
     return switch (category) {
       SettingsCategory.preferences => l10n.settingsGroupPreferences,
-      SettingsCategory.advanced => l10n.settingsGroupAdvanced,
+      SettingsCategory.ai => isZh ? '模型与账号' : 'Models & Accounts',
+      SettingsCategory.capabilities => isZh ? '能力与交互' : 'Capabilities',
+      SettingsCategory.connections => isZh ? '连接与扩展' : 'Connections',
+      SettingsCategory.system => isZh ? '系统' : 'System',
     };
   }
 
@@ -400,6 +425,7 @@ class SettingsDialogState extends State<SettingsDialog> {
   @override
   void initState() {
     super.initState();
+    _keptCollapsed.remove(SettingsCategory.of(_section));
     EmbeddedBrowserController.instance.pushOverlay();
     _search.addListener(() => setState(() {}));
   }
@@ -702,25 +728,36 @@ class SettingsDialogState extends State<SettingsDialog> {
     );
   }
 
-  /// The sections whose name has what is searched for.
-  bool _matches(SettingsSection section) {
+  /// The sections whose name, keywords, or category heading match the search.
+  bool _matches(SettingsCategory category, SettingsSection section) {
     final query = _search.text.trim().toLowerCase();
     return query.isEmpty ||
         label(context, section).toLowerCase().contains(query) ||
         section.name.toLowerCase().contains(query) ||
-        keywords(context, section).toLowerCase().contains(query);
+        keywords(context, section).toLowerCase().contains(query) ||
+        categoryLabel(context, category).toLowerCase().contains(query);
   }
+
+  void _toggleCategory(SettingsCategory category) => setState(() {
+    if (!_keptCollapsed.remove(category)) {
+      _keptCollapsed.add(category);
+    }
+  });
 
   Widget _nav(BuildContext context) {
     final l10n = context.l10n;
     final colors = themeColors;
+    final searching = _search.text.trim().isNotEmpty;
     final groups = [
       for (final category in SettingsCategory.values)
-        [
-          for (final section in category.sections)
-            if (_matches(section)) section,
-        ],
-    ].where((sections) => sections.isNotEmpty).toList();
+        (
+          category: category,
+          sections: [
+            for (final section in category.sections)
+              if (_matches(category, section)) section,
+          ],
+        ),
+    ].where((g) => g.sections.isNotEmpty).toList();
     final hide = SidebarIconButton(
       icon: Codicons.layoutSidebarLeft,
       tooltip: l10n.windowHideSidebar,
@@ -807,23 +844,120 @@ class SettingsDialogState extends State<SettingsDialog> {
         ),
         Expanded(
           child: SmoothScrolling(
-            builder: (context, controller) => ListView(
+            builder: (context, controller) => SingleChildScrollView(
               controller: controller,
-              padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
-              children: [
-                for (final sections in groups)
-                  for (final section in sections)
-                    _NavItem(
-                      icon: icon(section),
-                      label: label(context, section),
-                      selected: section == _section,
-                      onTap: () {
-                        show(section);
-                        _closeDrawer();
-                      },
+              padding: const EdgeInsets.fromLTRB(8, 0, 8, 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  for (final (index, group) in groups.indexed) ...[
+                    _NavGroupHeader(
+                      label: categoryLabel(context, group.category),
+                      first: index == 0,
+                      collapsed:
+                          !searching && _keptCollapsed.contains(group.category),
+                      collapsible: !searching,
+                      onToggle: () => _toggleCategory(group.category),
                     ),
-              ],
+                    if (searching || !_keptCollapsed.contains(group.category))
+                      for (final section in group.sections)
+                        _NavItem(
+                          icon: icon(section),
+                          label: label(context, section),
+                          selected: section == _section,
+                          onTap: () {
+                            show(section);
+                            _closeDrawer();
+                          },
+                        ),
+                  ],
+                ],
+              ),
             ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _NavGroupHeader extends StatefulWidget {
+  const _NavGroupHeader({
+    required this.label,
+    required this.first,
+    required this.collapsed,
+    required this.collapsible,
+    required this.onToggle,
+  });
+
+  final String label;
+  final bool first;
+  final bool collapsed;
+  final bool collapsible;
+  final VoidCallback onToggle;
+
+  @override
+  State<_NavGroupHeader> createState() => _NavGroupHeaderState();
+}
+
+class _NavGroupHeaderState extends State<_NavGroupHeader> {
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final showChevron = widget.collapsible && (widget.collapsed || _hover);
+    final labelRow = Padding(
+      padding: EdgeInsets.fromLTRB(10, widget.first ? 2 : 5, 8, 3),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              widget.label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: _hover && widget.collapsible
+                    ? SettingsColors.textSecondary
+                    : SettingsColors.textTertiary,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 0.3,
+                height: 1.2,
+              ),
+            ),
+          ),
+          AnimatedOpacity(
+            opacity: showChevron ? 1 : 0,
+            duration: const Duration(milliseconds: 120),
+            child: Icon(
+              widget.collapsed ? Codicons.chevronRight : Codicons.chevronDown,
+              size: 12,
+              color: SettingsColors.iconTertiary,
+            ),
+          ),
+        ],
+      ),
+    );
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (!widget.first)
+          Container(
+            height: 1,
+            margin: const EdgeInsets.fromLTRB(10, 6, 10, 1),
+            color: SettingsColors.stroke,
+          ),
+        MouseRegion(
+          cursor: widget.collapsible
+              ? SystemMouseCursors.click
+              : SystemMouseCursors.basic,
+          onEnter: (_) => setState(() => _hover = true),
+          onExit: (_) => setState(() => _hover = false),
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: widget.collapsible ? widget.onToggle : null,
+            child: labelRow,
           ),
         ),
       ],

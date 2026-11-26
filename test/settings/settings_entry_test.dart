@@ -336,6 +336,49 @@ void main() {
     ], unorderedEquals(SettingsSection.values));
   });
 
+  testWidgets('the settings nav renders category headings, folds on click, and expands matching categories on search', (
+    tester,
+  ) async {
+    final state = await _openSettings(tester, const Size(1000, 960));
+    expect(find.text('Preferences'), findsOneWidget);
+    expect(find.text('Models & Accounts'), findsOneWidget);
+    expect(find.text('Capabilities'), findsOneWidget);
+    expect(find.text('Connections'), findsOneWidget);
+    expect(find.text('System'), findsOneWidget);
+
+    // Order of partition headings top-to-bottom.
+    final headingTops = [
+      'Preferences',
+      'Models & Accounts',
+      'Capabilities',
+      'Connections',
+      'System',
+    ].map((t) => tester.getTopLeft(find.text(t)).dy).toList();
+    expect(headingTops, orderedEquals([...headingTops]..sort()));
+
+    // Folding "Models & Accounts" hides its items while keeping other groups visible.
+    expect(find.text('Models'), findsOneWidget);
+    await tester.tap(find.text('Models & Accounts'));
+    await tester.pumpAndSettle();
+    expect(find.text('Models'), findsNothing);
+    expect(find.text('General'), findsOneWidget);
+
+    // Searching auto-expands matching items even inside a collapsed category,
+    // and hides categories with no matches.
+    await tester.enterText(find.byType(TextField), 'models');
+    await tester.pump();
+    expect(find.text('Models'), findsOneWidget);
+    expect(find.text('System'), findsNothing);
+
+    // Clearing search returns to collapsed state; programmatic navigation auto-expands it.
+    await tester.enterText(find.byType(TextField), '');
+    await tester.pump();
+    expect(find.text('Models'), findsNothing);
+    state().show(SettingsSection.models);
+    await tester.pumpAndSettle();
+    expect(find.text('Models'), findsOneWidget);
+  });
+
   testWidgets('over the settings, ⌘K ⌘T shows the color theme\'s page and '
       '⌘K ⌘S the keyboard shortcuts\'', (tester) async {
     _stillMotion(tester);
