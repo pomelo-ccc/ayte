@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
+import '../chat/resume_after_update.dart';
 import '../ide/ide_notifications.dart';
 import '../l10n/l10n.dart';
 import 'update_service.dart';
@@ -202,10 +203,28 @@ class UpdateController {
     IdeNotifications notifications,
     AppLocalizations Function() l10n,
   ) {
+    void notifyResumed(List<UpdateResumeEntry> resumed) {
+      if (resumed.isEmpty) return;
+      final loc = l10n();
+      final isZh = loc.localeName.startsWith('zh');
+      final count = resumed.length;
+      final message = isZh
+          ? '更新重启完成，已自动继续 $count 个中断的会话。'
+          : (count == 1
+                ? 'Update finished — automatically resumed 1 interrupted session.'
+                : 'Update finished — automatically resumed $count interrupted sessions.');
+      notifications.notify(IdeSeverity.info, message);
+    }
+
     // Once the window that listens is built (its l10n is not there before).
     final unfinished = Timer(Duration.zero, () {
       if (service.takeUnfinishedInstall() case final version?) {
         showUnfinished(notifications, l10n(), version);
+      }
+      final pendingResumed = ResumeAfterUpdate.current
+          .takePendingResumedNotice();
+      if (pendingResumed.isNotEmpty) {
+        notifyResumed(pendingResumed);
       }
     });
     final offers = service.offers.listen(
@@ -218,10 +237,12 @@ class UpdateController {
         sticky: true,
       ),
     );
+    final resumedSub = ResumeAfterUpdate.current.resumed.listen(notifyResumed);
     return () {
       unfinished.cancel();
       unawaited(offers.cancel());
       unawaited(failures.cancel());
+      unawaited(resumedSub.cancel());
     };
   }
 }

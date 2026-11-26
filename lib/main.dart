@@ -37,6 +37,7 @@ import 'chat/user_message_style.dart';
 import 'chat/widgets/chat_minimap.dart';
 import 'chat/widgets/pixel_loader.dart';
 import 'chat/resume_after_reset.dart';
+import 'chat/resume_after_update.dart';
 import 'chat/rewind_files_setting.dart';
 import 'chat/widgets/turn_footer.dart'
     show LiveTurnStatsSetting, SessionReplaySetting;
@@ -242,6 +243,12 @@ Future<void> main(List<String> arguments) async {
       ),
     );
     unawaited(ResumeAfterReset.current.load());
+    ResumeAfterUpdate.current = ResumeAfterUpdate(
+      store: PreferenceStore.file(
+        p.join(DataDirectory.current.stateDir, ResumeAfterUpdate.fileName),
+      ),
+    );
+    unawaited(ResumeAfterUpdate.current.load());
   }
   final workspace = Workspace(
     preferences: PreferenceStore.file(),
@@ -541,6 +548,19 @@ void followSettingsFiles(SettingsFiles files) {
           // A settings file that does not parse is left as it is; its
           // error is shown.
           debugPrint('${ResumeAfterResetSetting.settingKey} not kept: $error');
+        }),
+  );
+  // Active sessions interrupted by an update restart: automatically continue
+  // after relaunch unless explicitly disabled in Settings → Updates.
+  ResumeAfterUpdateSetting.current = () => ResumeAfterUpdateSetting.enabled(
+    files.settings[ResumeAfterUpdateSetting.settingKey],
+  );
+  ResumeAfterUpdateSetting.changes = files.settings;
+  ResumeAfterUpdateSetting.write = (on) => unawaited(
+    files.settings
+        .update(ResumeAfterUpdateSetting.settingKey, on ? null : false)
+        .catchError((Object error) {
+          debugPrint('${ResumeAfterUpdateSetting.settingKey} not kept: $error');
         }),
   );
   // A message edited and sent again: whether the files changed after it
@@ -958,17 +978,26 @@ class _BaoCodeAppState extends State<BaoCodeApp>
       // The unsaved files of all windows asked about at once, then the
       // agents at work; in the window in front.
       final updates = _settings.updates?.service;
-      if (!await _windows.confirmQuit()) {
+      final updating = updates?.armed ?? false;
+      final targetVersion = updates?.armedVersion?.marketing;
+      if (!await _windows.confirmQuit(updating: updating)) {
         appEvent('app', 'quit cancelled');
         updates?.disarm();
         return AppExitResponse.cancel;
       }
       // Restart to Update: the installer waits for the app to go. One that
       // will not start keeps the app (and says why).
-      final updating = updates?.armed ?? false;
       if (updates != null && !await updates.launchArmed()) {
         appEvent('app', 'quit cancelled: the update would not start');
         return AppExitResponse.cancel;
+      }
+      if (updating) {
+        final saved = await _workspace.saveInterruptedForUpdate(
+          targetVersion: targetVersion,
+        );
+        if (saved > 0) {
+          appEvent('app', 'saved $saved active session(s) to resume after update');
+        }
       }
       await Future.wait([
         AntigravityTransport.stopAll(),

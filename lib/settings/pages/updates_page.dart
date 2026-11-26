@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../../chat/resume_after_update.dart';
 import '../../diagnostics/diagnostics_upload.dart';
 import '../../ide/ide_button.dart';
 import '../../ide/ide_menu.dart';
@@ -72,6 +73,18 @@ class _UpdatesSettingsPageState extends State<UpdatesSettingsPage> {
             // A settings file that does not parse is left as it is; its
             // error is shown.
             debugPrint('${UpdateMode.settingKey} not kept: $error');
+          }),
+    );
+  }
+
+  void _writeResumeAfterUpdate(bool on) {
+    final settings = widget.settings;
+    if (settings == null) return;
+    unawaited(
+      settings
+          .update(ResumeAfterUpdateSetting.settingKey, on ? null : false)
+          .catchError((Object error) {
+            debugPrint('${ResumeAfterUpdateSetting.settingKey} not kept: $error');
           }),
     );
   }
@@ -154,6 +167,18 @@ class _UpdatesSettingsPageState extends State<UpdatesSettingsPage> {
                     ),
                 ],
               ),
+            ),
+            SettingsSwitchRow(
+              label: l10n.localeName.startsWith('zh')
+                  ? '更新重启后自动继续中断的会话'
+                  : 'Resume interrupted sessions after update',
+              description: l10n.localeName.startsWith('zh')
+                  ? '通过更新重启 Ayte 时，记录正在运行的会话并在新版本启动后自动继续任务（设置项 ${ResumeAfterUpdateSetting.settingKey}）。'
+                  : 'Automatically continue sessions that were running when Ayte restarted to install an update (${ResumeAfterUpdateSetting.settingKey}).',
+              value: ResumeAfterUpdateSetting.enabled(
+                widget.settings?[ResumeAfterUpdateSetting.settingKey],
+              ),
+              onChanged: _writeResumeAfterUpdate,
             ),
           ],
         ),

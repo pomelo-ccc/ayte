@@ -514,6 +514,7 @@ class UpdateService extends ChangeNotifier {
 
   /// The version [_armed] installs.
   AppVersion? _armedVersion;
+  AppVersion? get armedVersion => _armedVersion;
 
   /// Whether an install waits for the app to quit.
   bool get armed => _armed != null;

@@ -1212,7 +1212,7 @@ class AppWindows extends ChangeNotifier implements WindowHostEvents {
   /// whether to quit with agents or terminals at work; asked in the window
   /// in front, shown for it (the app may be in the tray). With nothing at
   /// work, the Quit (the tray's, the last window's close button) is enough.
-  Future<bool> confirmQuit() async {
+  Future<bool> confirmQuit({bool updating = false}) async {
     final windows = [..._ide, chat];
     if (!await _confirmUnsaved(windows)) return false;
     final working =
@@ -1231,11 +1231,18 @@ class AppWindows extends ChangeNotifier implements WindowHostEvents {
     // What runs on remote hosts ends with their servers.
     final remote = RemoteClaudeTransport.running + RemotePtyAdapter.open;
     if (!working && remote == 0) return true;
+    final resumingAfterUpdate = updating && workspace.updateResumes.enabled
+        ? workspace.resumableActiveThreads.length
+        : 0;
     final asker = active.delegate?.windowContext != null ? active : chat;
     final context = asker.delegate?.windowContext;
     if (context == null || !context.mounted) return true;
     if (_started) _focus(asker);
-    return QuitConfirmation.confirm(context, remote: remote);
+    return QuitConfirmation.confirm(
+      context,
+      remote: remote,
+      resumingAfterUpdate: resumingAfterUpdate,
+    );
   }
 
   // --- The system's events -----------------------------------------------------

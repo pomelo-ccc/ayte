@@ -12,6 +12,7 @@ import '../chat/composer/composer_draft.dart';
 import '../chat/composer/composer_embeds.dart' show composerContentFromOps;
 import '../chat/mock_conversation.dart';
 import '../chat/resume_after_reset.dart';
+import '../chat/resume_after_update.dart';
 import '../icons/emoji_sheet.dart';
 import '../icons/icon_library.dart';
 import '../icons/project_icon.dart';
@@ -307,8 +308,10 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
     AppLocalizations Function()? l10n,
     this.workspaceDirectories = const ProjectWorkspaceDirectories(),
     ResumeAfterReset? resumes,
+    ResumeAfterUpdate? updateResumes,
   }) : _projects = [...projects],
        resumes = resumes ?? ResumeAfterReset.current,
+       updateResumes = updateResumes ?? ResumeAfterUpdate.current,
        icons = icons ?? IconLibrary(),
        l10n = l10n ?? (() => englishLocalizations),
        kernels = kernels ?? KernelRegistry.all,
@@ -331,6 +334,10 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
   /// The agents stopped at the usage limit, to go on once it resets: this
   /// continues them, once the agents are listed.
   final ResumeAfterReset resumes;
+
+  /// The agents interrupted by an update restart, to continue automatically
+  /// once the updated app launches and lists its sessions.
+  final ResumeAfterUpdate updateResumes;
 
   /// The strings of the app's language, for the titles given here: they
   /// are kept with the session, so are in the language of when given.
@@ -420,7 +427,10 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
       _ensureIdeChat(folder);
     }
     _restoreChatView();
-    if (!_disposed) resumes.resume = _resumeAfterReset;
+    if (!_disposed) {
+      resumes.resume = _resumeAfterReset;
+      updateResumes.resume = _resumeAfterUpdate;
+    }
     if (_selected == null && _projects.isNotEmpty) {
       create();
     } else {
@@ -462,7 +472,10 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
         }
       }
     }
-    if (_threads.length != before || goneOn) notifyListeners();
+    if (_threads.length != before || goneOn) {
+      notifyListeners();
+      if (_threads.length != before) updateResumes.threadsUpdated();
+    }
     _reloadGoneOn();
   }
 
@@ -626,7 +639,10 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
         _addKept(kernel, project, session);
       }
     }
-    if (_threads.length != before) notifyListeners();
+    if (_threads.length != before) {
+      notifyListeners();
+      updateResumes.threadsUpdated();
+    }
   }
 
   /// Remote projects whose sessions were not asked for, being off the
@@ -4106,6 +4122,86 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
     }
   }
 
+  /// Non-archived user sessions actively mid-turn or running background tasks
+  /// (excluding sessions paused waiting on user input/approval) that have a
+  /// persisted session ID and can be automatically resumed after an update.
+  List<AgentThread> get resumableActiveThreads => [
+    for (final thread in _threads)
+      if (!thread.archived &&
+          !isAppFolder(thread.project.path) &&
+          thread.id != null &&
+          thread.id!.isNotEmpty &&
+          thread.status != ThreadStatus.needsInput &&
+          (thread.status == ThreadStatus.running || thread.runsInBackground))
+        thread,
+  ];
+
+  /// Persists currently running sessions right before the app exits to install
+  /// an update so the relaunched app automatically continues them.
+  Future<int> saveInterruptedForUpdate({String? targetVersion}) async {
+    if (!updateResumes.enabled) {
+      await updateResumes.clear();
+      return 0;
+    }
+    final now = DateTime.now();
+    final active = resumableActiveThreads;
+    final entries = <UpdateResumeEntry>[
+      for (final thread in active)
+        UpdateResumeEntry(
+          sessionId: thread.id!,
+          savedAt: now,
+          projectPath: thread.project.path,
+          kernelId: thread.kernel.id,
+          title: thread.titled ? thread.title : '',
+          queuedTexts: [
+            if (thread.isOpen)
+              for (final (_, item) in thread.session.queued)
+                if (item.text.trim().isNotEmpty) item.text.trim(),
+          ],
+          targetVersion: targetVersion,
+        ),
+    ];
+    await updateResumes.capture(entries);
+    return entries.length;
+  }
+
+  /// Automatically resumes one session interrupted by an update restart.
+  Future<UpdateResumeOutcome> _resumeAfterUpdate(
+    UpdateResumeEntry entry,
+  ) async {
+    if (_disposed || !updateResumes.enabled) {
+      return UpdateResumeOutcome.skipped;
+    }
+    final thread = _threads
+        .where((t) => t.id == entry.sessionId)
+        .firstOrNull;
+    if (thread == null) {
+      // A remote SSH project or slow catalog may still be listing threads.
+      return UpdateResumeOutcome.retry;
+    }
+    if (thread.archived || isAppFolder(thread.project.path)) {
+      return UpdateResumeOutcome.skipped;
+    }
+    final session = thread.session;
+    if (session.loadingHistory) await _historyRead(session);
+    if (_disposed || !_threads.contains(thread)) {
+      return UpdateResumeOutcome.skipped;
+    }
+    // Never disturb a session already streaming or paused waiting for user input.
+    if (session.isStreaming ||
+        session.pendingInteraction != null ||
+        session.canStartPlan) {
+      return UpdateResumeOutcome.skipped;
+    }
+    if (session.loadingHistory || !session.canSend) {
+      return UpdateResumeOutcome.retry;
+    }
+    final isZh = l10n().localeName.startsWith('zh');
+    final prompt = ResumeAfterUpdate.buildContinuePrompt(entry, isZh: isZh);
+    session.send(ComposerMessage(text: prompt));
+    return UpdateResumeOutcome.resumed;
+  }
+
   /// Sends the agent [sessionId] its message to continue, the usage limit
   /// it stopped at reset; whether it is no longer to be (sent, gone on, or
   /// gone).
@@ -4482,6 +4578,7 @@ class Workspace extends ChangeNotifier implements ColorThemeStorage {
   void dispose() {
     _disposed = true;
     if (resumes.resume == _resumeAfterReset) resumes.resume = null;
+    if (updateResumes.resume == _resumeAfterUpdate) updateResumes.resume = null;
     icons.removeListener(notifyListeners);
     for (final MapEntry(key: path, value: listener) in _unreached.entries) {
       SshHosts.instance[RemoteLocation.hostOf(path)!].removeListener(listener);

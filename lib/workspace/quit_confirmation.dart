@@ -31,7 +31,11 @@ abstract final class QuitConfirmation {
   /// asking when there is none yet. Asked once at a time: a request while
   /// the question is up does not quit (see [quitAnyway]). [remote] sessions
   /// and terminals on remote hosts, if any, are told of too.
-  static Future<bool> confirm(BuildContext? context, {int remote = 0}) async {
+  static Future<bool> confirm(
+    BuildContext? context, {
+    int remote = 0,
+    int resumingAfterUpdate = 0,
+  }) async {
     if (_skipNext) {
       _skipNext = false;
       return true;
@@ -41,13 +45,22 @@ abstract final class QuitConfirmation {
     final answer = _answer = Completer<bool>();
     try {
       final l10n = context.l10n;
+      final isZh = l10n.localeName.startsWith('zh');
+      final details = <String>[
+        l10n.quitConfirmDetail,
+        if (resumingAfterUpdate > 0)
+          isZh
+              ? '其中 $resumingAfterUpdate 个正在运行的会话将在更新重启后自动继续当前任务。'
+              : (resumingAfterUpdate == 1
+                    ? '1 running session will automatically resume after the update restarts.'
+                    : '$resumingAfterUpdate running sessions will automatically resume after the update restarts.'),
+        if (remote > 0) l10n.quitConfirmRemote(remote),
+      ];
       unawaited(
         showIdeDialog(
           context,
           message: l10n.quitConfirmMessage,
-          detail: remote > 0
-              ? '${l10n.quitConfirmDetail}\n${l10n.quitConfirmRemote(remote)}'
-              : l10n.quitConfirmDetail,
+          detail: details.join('\n'),
           buttons: [l10n.quitConfirmQuit],
           type: IdeDialogType.question,
         ).then(
