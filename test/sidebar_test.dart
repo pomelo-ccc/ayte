@@ -2682,7 +2682,18 @@ void main() {
 
       await tester.tap(inSidebar(find.text('By project')));
       await tester.pump(const Duration(milliseconds: 250));
-      await tester.tap(find.text(secondKernel.label).last);
+      final kernelMenuColumn = find
+          .ancestor(
+            of: find.text('All kernels'),
+            matching: find.byType(Column),
+          )
+          .first;
+      await tester.tap(
+        find.descendant(
+          of: kernelMenuColumn,
+          matching: find.text(secondKernel.label),
+        ),
+      );
       await tester.pump(const Duration(milliseconds: 400));
 
       expect(workspace.sidebarKernelFilter, secondKernel.id);

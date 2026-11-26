@@ -4,6 +4,7 @@ import 'agent_kernel.dart';
 import 'antigravity/antigravity_catalog.dart';
 import 'antigravity/antigravity_cli.dart' show antigravityBuiltinProviderId;
 import 'claude_code/claude_code_kernel.dart';
+import 'codebuddy/codebuddy_catalog.dart';
 import 'codebuddy/codebuddy_cli.dart' show codebuddyBuiltinProviderId;
 import 'codex/codex_catalog.dart';
 import 'codex/codex_kernel.dart';
@@ -53,7 +54,7 @@ abstract final class KernelRegistry {
       usageOffBy: () => claudeUsageOffByAt(context.cwd),
       rejectTooOld: rejectTooOldClaude,
     ),
-    catalog: const ClaudeCatalog(),
+    catalog: const CodeBuddyCatalog(),
   );
 
   static final KernelDescriptor claudeCode = KernelDescriptor(

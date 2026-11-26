@@ -4487,24 +4487,33 @@ class ClaudeCodeKernel
 
   @override
   late final ModelSetting effort = _ModelSetting(
-    optionsFor: (model) => [
-      for (final level in _effortLevelsOf(model))
-        KernelOption(
-          level,
-          effortLabel(level),
-          Icons.speed_rounded,
-          switch (level) {
-            'none' => 'No thinking',
-            'enabled' => 'Enable thinking mode',
-            'low' => 'Fastest, least thinking',
-            'medium' => 'Balanced',
-            'high' => 'Thinks more',
-            'xhigh' => 'Thinks a lot more',
-            'max' => 'Most thinking, this session only',
-            _ => '',
-          },
-        ),
-    ],
+    optionsFor: (model) {
+      final cb = _codebuddyModelOf(model);
+      final readOnly = cb != null && cb.isReasoningFixed;
+      return [
+        for (final level in _effortLevelsOf(model))
+          KernelOption(
+            level,
+            cb != null
+                ? cb.effortOptionLabel(level, effortLabel(level))
+                : effortLabel(level),
+            Icons.speed_rounded,
+            readOnly
+                ? '该模型思考强度固定，不支持调整'
+                : switch (level) {
+                    'none' => 'No thinking',
+                    'enabled' => 'Enable thinking mode',
+                    'low' => 'Fastest, least thinking',
+                    'medium' => 'Balanced',
+                    'high' => 'Thinks more',
+                    'xhigh' => 'Thinks a lot more',
+                    'max' => 'Most thinking, this session only',
+                    _ => '',
+                  },
+            readOnly: readOnly,
+          ),
+      ];
+    },
     selected: () {
       if (_custom case (_, final info)) return _effortFor(info);
       if (_codebuddyModelOf(_model) case final cb?) {
@@ -4565,7 +4574,7 @@ class ClaudeCodeKernel
         return;
       }
       if (_codebuddyModelOf(model) case final cb?) {
-        if (!cb.effortLevels.contains(id)) return;
+        if (cb.isReasoningFixed || !cb.effortLevels.contains(id)) return;
         if (model != this.model.selected) _keepModelSettings();
         final ref = modelRef(codebuddyBuiltinProviderId, cb.id);
         _pickedEfforts[model] = id;

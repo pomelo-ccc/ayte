@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:bao_editor/monaco/flutter/keybinding_entry.dart'
     show KeybindingPlatform;
@@ -41,6 +42,10 @@ class _VoiceSettingsPageState extends State<VoiceSettingsPage> {
 
   List<SystemVoiceInfo> _systemVoices = const [];
   List<VoiceInputDevice> _inputDevices = const [];
+  List<RemoteVoiceInfo> _remoteApiVoices = const [];
+  bool _loadingApiVoices = false;
+  String? _apiVoicesStatus;
+  int _apiVoicesReqSeq = 0;
   bool _hasSttKey = false;
   bool _hasTtsKey = false;
   String? _sttTestResult;
@@ -70,6 +75,60 @@ class _VoiceSettingsPageState extends State<VoiceSettingsPage> {
       _inputDevices = results[1] as List<VoiceInputDevice>;
       _hasSttKey = (results[2] as String?)?.isNotEmpty == true;
       _hasTtsKey = (results[3] as String?)?.isNotEmpty == true;
+    });
+    if (_store.config.ttsEngine == VoiceTtsEngine.openaiCompatible) {
+      final isZh = Localizations.localeOf(context).languageCode == 'zh';
+      unawaited(_refreshApiVoices(isZh: isZh));
+    }
+  }
+
+  Future<void> _refreshApiVoices({
+    required bool isZh,
+    String? baseUrlOverride,
+    bool force = false,
+  }) async {
+    if (!force && Platform.environment['FLUTTER_TEST'] == 'true') return;
+    final baseUrl = (baseUrlOverride ?? _store.config.ttsApiBaseUrl).trim();
+    if (baseUrl.isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _remoteApiVoices = const [];
+        _loadingApiVoices = false;
+        _apiVoicesStatus = null;
+      });
+      return;
+    }
+    final seq = ++_apiVoicesReqSeq;
+    if (mounted) {
+      setState(() {
+        _loadingApiVoices = true;
+        _apiVoicesStatus = isZh
+            ? '正在从服务端拉取音色列表…'
+            : 'Fetching voices from server…';
+      });
+    }
+    final apiKey = await _store.readTtsApiKey();
+    final result = await VoiceTtsService.listOpenAiVoices(
+      baseUrl: baseUrl,
+      apiKey: apiKey,
+    );
+    if (!mounted || seq != _apiVoicesReqSeq) return;
+    setState(() {
+      _loadingApiVoices = false;
+      _remoteApiVoices = result.voices;
+      if (result.voices.isNotEmpty) {
+        _apiVoicesStatus = isZh
+            ? '已从服务端加载 ${result.voices.length} 个音色（也可在下方输入自定义音色 ID）'
+            : 'Loaded ${result.voices.length} voices from server (or enter a custom ID below)';
+      } else if (result.error != null) {
+        _apiVoicesStatus = isZh
+            ? '未能拉取服务端音色（${result.error}），可在下方手动输入音色 ID'
+            : 'Could not fetch server voices (${result.error}); enter a custom voice ID below';
+      } else {
+        _apiVoicesStatus = isZh
+            ? '该服务未暴露音色列表接口，可选择预设或在下方手动输入音色 ID'
+            : 'Server exposes no voice list endpoint; pick a preset or enter a custom ID below';
+      }
     });
   }
 
@@ -113,6 +172,9 @@ class _VoiceSettingsPageState extends State<VoiceSettingsPage> {
             ? (isZh ? '已清除语音合成 API Key' : 'Cleared TTS API key')
             : (isZh ? '语音合成 API Key 已安全保存至系统凭据库' : 'TTS API key saved securely');
       });
+      if (_store.config.ttsEngine == VoiceTtsEngine.openaiCompatible) {
+        unawaited(_refreshApiVoices(isZh: isZh));
+      }
     } on Object catch (e) {
       if (!mounted) return;
       setState(() => _keyStatus = e.toString());
@@ -691,13 +753,16 @@ class _VoiceSettingsPageState extends State<VoiceSettingsPage> {
                         isZh ? 'OpenAI 兼容 TTS API' : 'OpenAI-compatible TTS API',
                         checked:
                             cfg.ttsEngine == VoiceTtsEngine.openaiCompatible,
-                        onSelected: () => unawaited(
-                          _update(
-                            cfg.copyWith(
-                              ttsEngine: VoiceTtsEngine.openaiCompatible,
+                        onSelected: () {
+                          unawaited(
+                            _update(
+                              cfg.copyWith(
+                                ttsEngine: VoiceTtsEngine.openaiCompatible,
+                              ),
                             ),
-                          ),
-                        ),
+                          );
+                          unawaited(_refreshApiVoices(isZh: isZh));
+                        },
                       ),
                     ],
                   ),
@@ -775,22 +840,27 @@ class _VoiceSettingsPageState extends State<VoiceSettingsPage> {
                   SettingsRow(
                     label: isZh ? 'TTS API 地址' : 'TTS API Base URL',
                     description: isZh
-                        ? '将请求 /audio/speech 接口'
-                        : 'Calls /audio/speech on this endpoint',
+                        ? '将请求 /audio/speech（404 时自动尝试 /v1/audio/speech）'
+                        : 'Calls /audio/speech (auto-retries /v1/audio/speech on 404)',
                     trailing: SettingsTextField(
                       value: cfg.ttsApiBaseUrl,
                       semanticLabel: 'TTS API Base URL',
                       hint: VoiceConfig.defaultApiBaseUrl,
                       width: 260,
-                      onSubmitted: (v) => unawaited(
-                        _update(
-                          cfg.copyWith(
-                            ttsApiBaseUrl: v.isEmpty
-                                ? VoiceConfig.defaultApiBaseUrl
-                                : v,
+                      onSubmitted: (v) {
+                        final nextUrl = v.isEmpty
+                            ? VoiceConfig.defaultApiBaseUrl
+                            : v;
+                        unawaited(
+                          _update(cfg.copyWith(ttsApiBaseUrl: nextUrl)),
+                        );
+                        unawaited(
+                          _refreshApiVoices(
+                            isZh: isZh,
+                            baseUrlOverride: nextUrl,
                           ),
-                        ),
-                      ),
+                        );
+                      },
                     ),
                   ),
                   SettingsRow(
@@ -811,19 +881,92 @@ class _VoiceSettingsPageState extends State<VoiceSettingsPage> {
                   ),
                   SettingsRow(
                     label: isZh ? 'API 音色' : 'API Voice',
-                    trailing: SettingsDropdown(
-                      current: cfg.ttsApiVoice,
-                      semanticLabel: cfg.ttsApiVoice,
-                      entries: () => [
-                        for (final voice in VoiceConfig.openaiVoices)
-                          IdeMenuAction(
-                            voice,
-                            checked: cfg.ttsApiVoice == voice,
-                            onSelected: () => unawaited(
-                              _update(cfg.copyWith(ttsApiVoice: voice)),
-                            ),
-                          ),
+                    description: _apiVoicesStatus ??
+                        (isZh
+                            ? '可点击刷新从服务端拉取已有音色，或从预设列表中选择'
+                            : 'Click Refresh to load server voices, or choose a preset'),
+                    trailing: SettingsButtons(
+                      children: [
+                        Builder(
+                          builder: (_) {
+                            final matched = _remoteApiVoices
+                                .cast<RemoteVoiceInfo?>()
+                                .firstWhere(
+                                  (v) => v?.id == cfg.ttsApiVoice,
+                                  orElse: () => null,
+                                );
+                            final apiVoiceLabel =
+                                matched?.displayLabel ?? cfg.ttsApiVoice;
+                            final remoteIds = _remoteApiVoices
+                                .map((v) => v.id)
+                                .toSet();
+                            final remainingPresets = VoiceConfig.openaiVoices
+                                .where((v) => !remoteIds.contains(v))
+                                .toList();
+                            return SettingsDropdown(
+                              current: apiVoiceLabel,
+                              semanticLabel: apiVoiceLabel,
+                              entries: () => [
+                                for (final voice in _remoteApiVoices)
+                                  IdeMenuAction(
+                                    voice.displayLabel,
+                                    checked: cfg.ttsApiVoice == voice.id,
+                                    onSelected: () => unawaited(
+                                      _update(
+                                        cfg.copyWith(ttsApiVoice: voice.id),
+                                      ),
+                                    ),
+                                  ),
+                                if (_remoteApiVoices.isNotEmpty &&
+                                    remainingPresets.isNotEmpty)
+                                  const IdeMenuSeparator(),
+                                for (final voice in remainingPresets)
+                                  IdeMenuAction(
+                                    voice,
+                                    checked: cfg.ttsApiVoice == voice,
+                                    onSelected: () => unawaited(
+                                      _update(
+                                        cfg.copyWith(ttsApiVoice: voice),
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            );
+                          },
+                        ),
+                        IdeButton(
+                          label: isZh ? '刷新音色' : 'Refresh',
+                          icon: Codicons.refresh,
+                          spinning: _loadingApiVoices,
+                          secondary: true,
+                          onPressed: _loadingApiVoices
+                              ? null
+                              : () => unawaited(
+                                  _refreshApiVoices(isZh: isZh, force: true),
+                                ),
+                        ),
                       ],
+                    ),
+                  ),
+                  SettingsRow(
+                    label: isZh ? '自定义音色 ID' : 'Custom Voice ID',
+                    description: isZh
+                        ? '可直接输入服务端任意音色名称（回车或失焦保存，与上方选择同步）'
+                        : 'Type any custom server voice ID directly (synced with the picker above)',
+                    trailing: SettingsTextField(
+                      value: cfg.ttsApiVoice,
+                      semanticLabel: 'Custom TTS Voice ID',
+                      hint: VoiceConfig.defaultTtsApiVoice,
+                      width: 220,
+                      onSubmitted: (v) => unawaited(
+                        _update(
+                          cfg.copyWith(
+                            ttsApiVoice: v.isEmpty
+                                ? VoiceConfig.defaultTtsApiVoice
+                                : v,
+                          ),
+                        ),
+                      ),
                     ),
                   ),
                   _ApiKeyRow(
@@ -831,6 +974,7 @@ class _VoiceSettingsPageState extends State<VoiceSettingsPage> {
                     hasKey: _hasTtsKey,
                     controller: _ttsKeyController,
                     isZh: isZh,
+                    optional: true,
                     onSave: () => unawaited(_saveTtsKey(isZh)),
                   ),
                 ],
@@ -887,6 +1031,7 @@ class _ApiKeyRow extends StatelessWidget {
     required this.controller,
     required this.isZh,
     required this.onSave,
+    this.optional = false,
   });
 
   final String label;
@@ -894,6 +1039,7 @@ class _ApiKeyRow extends StatelessWidget {
   final TextEditingController controller;
   final bool isZh;
   final VoidCallback onSave;
+  final bool optional;
 
   @override
   Widget build(BuildContext context) {
@@ -906,15 +1052,23 @@ class _ApiKeyRow extends StatelessWidget {
       fontFamilyFallback: AppFonts.monoFallbacks,
       fontSize: 12,
     );
+    final emptyDescription = optional
+        ? (isZh
+              ? '可选：自建 / 局域网免 Key 服务可留空；填写后将加密存储在系统凭据库'
+              : 'Optional for keyless local servers; stored encrypted in OS keychain when set')
+        : (isZh
+              ? '将加密存储在系统凭据库，不会明文写入 settings.json'
+              : 'Encrypted in OS keychain; never written to settings.json');
+    final emptyHint = optional
+        ? (isZh ? '免 Key 可留空 / sk-...' : 'Optional / sk-...')
+        : 'sk-...';
     return SettingsRow(
       label: label,
       description: hasKey
           ? (isZh
                 ? '已保存至系统安全凭据库（留空点保存可清除）'
                 : 'Stored securely in system keychain (save empty to clear)')
-          : (isZh
-                ? '将加密存储在系统凭据库，不会明文写入 settings.json'
-                : 'Encrypted in OS keychain; never written to settings.json'),
+          : emptyDescription,
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -927,7 +1081,7 @@ class _ApiKeyRow extends StatelessWidget {
               style: mono.copyWith(color: AppColors.text),
               decoration: InputDecoration(
                 isDense: true,
-                hintText: hasKey ? '••••••••••••' : 'sk-...',
+                hintText: hasKey ? '••••••••••••' : emptyHint,
                 hintStyle: mono.copyWith(color: AppColors.textFaint),
                 contentPadding: const EdgeInsets.symmetric(
                   horizontal: 8,

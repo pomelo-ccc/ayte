@@ -527,6 +527,7 @@ class ComposerPickerState extends State<ComposerPicker> {
   /// on is looked at with them still open, more than once. Any other is a
   /// choice made and done with, and closes them.
   void _selectSetting(ModelSettingChoice setting, KernelOption option) {
+    if (option.readOnly) return;
     if (setting.toggle) return setting.onSelected(option);
     _setOpen(false);
     setting.onSelected(option);
@@ -1735,6 +1736,68 @@ class _SettingRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final readOnly = option.readOnly;
+    final foreground = readOnly
+        ? AppColors.textMuted
+        : IdeMenuColors.foreground;
+    final rowContent = Row(
+      children: [
+        if (full) ...[
+          option.iconBuilder?.call(15, AppColors.textMuted) ??
+              Icon(option.icon, size: 15, color: AppColors.textMuted),
+          const SizedBox(width: 10),
+        ],
+        Expanded(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                option.label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: foreground,
+                  fontSize: 12.5,
+                ),
+              ),
+              if (describes)
+                Text(
+                  option.description,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: AppColors.textFaint,
+                    fontSize: 11,
+                  ),
+                ),
+            ],
+          ),
+        ),
+        if (toggle) ...[
+          const SizedBox(width: 12),
+          IdeSwitch(
+            value: selected,
+            semanticLabel: option.label,
+            enabled: !readOnly,
+            onChanged: (_) => onTap(),
+          ),
+        ] else if (selected)
+          Icon(
+            Icons.check_rounded,
+            size: 15,
+            color: readOnly ? AppColors.textFaint : IdeMenuColors.foreground,
+          ),
+      ],
+    );
+    if (readOnly) {
+      return Container(
+        height: height,
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        alignment: Alignment.centerLeft,
+        child: rowContent,
+      );
+    }
     return MouseRegion(
       cursor: SystemMouseCursors.click,
       onHover: (_) => onHover(),
@@ -1748,55 +1811,7 @@ class _SettingRow extends StatelessWidget {
             index: index,
             highlight: highlight,
             height: height,
-            child: Row(
-              children: [
-                if (full) ...[
-                  option.iconBuilder?.call(15, AppColors.textMuted) ??
-                      Icon(option.icon, size: 15, color: AppColors.textMuted),
-                  const SizedBox(width: 10),
-                ],
-                Expanded(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        option.label,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          color: IdeMenuColors.foreground,
-                          fontSize: 12.5,
-                        ),
-                      ),
-                      if (describes)
-                        Text(
-                          option.description,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            color: AppColors.textFaint,
-                            fontSize: 11,
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
-                if (toggle) ...[
-                  const SizedBox(width: 12),
-                  IdeSwitch(
-                    value: selected,
-                    semanticLabel: option.label,
-                    onChanged: (_) => onTap(),
-                  ),
-                ] else if (selected)
-                  Icon(
-                    Icons.check_rounded,
-                    size: 15,
-                    color: IdeMenuColors.foreground,
-                  ),
-              ],
-            ),
+            child: rowContent,
           ),
         ),
       ),

@@ -160,10 +160,11 @@ class _Spot {
 /// (shown on asking), or that all are and can be fewer again.
 typedef _Rows = ({List<AgentThread> threads, int more, bool less});
 
-enum _ListRowKind { header, thread, more, pinZone, projectsBar }
+enum _ListRowKind { header, agentHeader, thread, more, pinZone, projectsBar }
 
 const _projectsBarGroup = _Group('#projectsBar', '', []);
 const _pinnedRowHeight = 54.0;
+const _agentHeaderHeight = 20.0;
 
 /// Visible row data, independent of whether the list built its widget.
 class _ListRow {
@@ -175,6 +176,9 @@ class _ListRow {
     this.thread,
     this.more,
     this.aside = false,
+    this.agentKernel,
+    this.agentSubgroupId,
+    this.agentThreads,
   });
 
   final _ListRowKind kind;
@@ -186,6 +190,11 @@ class _ListRow {
 
   /// Whether [thread] is an aside, under the one it was asked beside.
   final bool aside;
+
+  /// Set for subtle per-agent sub-headers nested under a project group.
+  final KernelDescriptor? agentKernel;
+  final String? agentSubgroupId;
+  final List<AgentThread>? agentThreads;
 }
 
 /// What the window asks of its sidebar, for the chat's keybindings: the
@@ -514,14 +523,80 @@ class _SidebarState extends State<Sidebar>
     super.dispose();
   }
 
+  static String _agentSubgroupId(_Group group, KernelDescriptor kernel) =>
+      '${group.id}::agent:${kernel.id}';
+
+  bool _hasMultipleKernelsIn(List<_Group> groups) {
+    String? first;
+    for (final group in groups) {
+      if (group.archivedOf != null) continue;
+      for (final thread in group.threads) {
+        final id = thread.kernel.id;
+        if (first == null) {
+          first = id;
+        } else if (first != id) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  bool _usesAgentSubgroups(
+    _Group group,
+    List<AgentThread> threads, {
+    required bool multiKernel,
+  }) =>
+      multiKernel &&
+      _grouping == SidebarGrouping.project &&
+      group.project != null &&
+      !group.pinned &&
+      group.archivedOf == null &&
+      _workspace.sidebarKernelFilter == null &&
+      !_workspace.isManuallyOrdered(group.project!) &&
+      threads.isNotEmpty;
+
+  /// Groups [threads] by agent kernel while preserving most-recently-active
+  /// agent first and keeping chronological order within each agent.
+  static List<({KernelDescriptor kernel, List<AgentThread> threads})>
+  _groupByAgent(List<AgentThread> threads) {
+    final buckets =
+        <String, ({KernelDescriptor kernel, List<AgentThread> threads})>{};
+    for (final thread in threads) {
+      final bucket = buckets.putIfAbsent(
+        thread.kernel.id,
+        () => (kernel: thread.kernel, threads: <AgentThread>[]),
+      );
+      bucket.threads.add(thread);
+    }
+    return buckets.values.toList();
+  }
+
   /// The agents listed, top to bottom (see [_buildList]).
-  List<AgentThread> _visibleThreads() => [
-    for (final group in _groups())
-      for (final thread in _rows(group).threads) ...[
-        thread,
-        ..._asidesListed(thread),
-      ],
-  ];
+  List<AgentThread> _visibleThreads() {
+    final groups = _groups();
+    final multiKernel = _hasMultipleKernelsIn(groups);
+    final result = <AgentThread>[];
+    for (final group in groups) {
+      final shown = _rows(group).threads;
+      if (_usesAgentSubgroups(group, shown, multiKernel: multiKernel)) {
+        for (final bucket in _groupByAgent(shown)) {
+          final subId = _agentSubgroupId(group, bucket.kernel);
+          if (_workspace.isCollapsed(subId)) continue;
+          for (final thread in bucket.threads) {
+            result.add(thread);
+            result.addAll(_asidesListed(thread));
+          }
+        }
+      } else {
+        for (final thread in shown) {
+          result.add(thread);
+          result.addAll(_asidesListed(thread));
+        }
+      }
+    }
+    return result;
+  }
 
   /// The asides listed under [thread]: folded, none but the one shown.
   List<AgentThread> _asidesListed(AgentThread thread) {
@@ -769,6 +844,12 @@ class _SidebarState extends State<Sidebar>
           row.group.threads.contains(current)) {
         return _bringTo(index);
       }
+      if (row.kind == _ListRowKind.agentHeader &&
+          row.agentSubgroupId != null &&
+          _workspace.isCollapsed(row.agentSubgroupId!) &&
+          (row.agentThreads?.contains(current) ?? false)) {
+        return _bringTo(index);
+      }
     }
   }
 
@@ -931,7 +1012,11 @@ class _SidebarState extends State<Sidebar>
     if (group == null) return;
     if (_collapsed(group)) _workspace.toggleCollapsed(group.id);
     final first = _rows(group).threads.firstOrNull;
-    if (first != null) setState(() => _listSelection.select(first));
+    if (first != null) {
+      final subId = _agentSubgroupId(group, first.kernel);
+      if (_workspace.isCollapsed(subId)) _workspace.toggleCollapsed(subId);
+      setState(() => _listSelection.select(first));
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       first == null ? _revealHeader(group.id) : _revealRow(first);
@@ -2294,8 +2379,33 @@ class _SidebarState extends State<Sidebar>
               for (final group in all)
                 if (_speedHits.containsKey(group.id)) group,
             ];
+      final multiKernel = _hasMultipleKernelsIn(all);
       final rows = <_ListRow>[];
       var addedProjectsBar = _speedQuery.isNotEmpty || groups.isEmpty;
+      void appendThreadRows(_Group group, AgentThread thread) {
+        rows.add(
+          _ListRow(
+            _ListRowKind.thread,
+            group,
+            ObjectKey(thread),
+            group.pinned ? _pinnedRowHeight : _rowHeight,
+            thread: thread,
+          ),
+        );
+        for (final aside in _asidesListed(thread)) {
+          rows.add(
+            _ListRow(
+              _ListRowKind.thread,
+              group,
+              ObjectKey(aside),
+              _rowHeight,
+              thread: aside,
+              aside: true,
+            ),
+          );
+        }
+      }
+
       for (final group in groups) {
         if (!addedProjectsBar && !group.pinned) {
           final hasPinnedAbove = rows.isNotEmpty;
@@ -2323,27 +2433,32 @@ class _SidebarState extends State<Sidebar>
           );
         }
         final shown = _rows(group);
-        for (final thread in shown.threads) {
-          rows.add(
-            _ListRow(
-              _ListRowKind.thread,
-              group,
-              ObjectKey(thread),
-              group.pinned ? _pinnedRowHeight : _rowHeight,
-              thread: thread,
-            ),
-          );
-          for (final aside in _asidesListed(thread)) {
+        if (_usesAgentSubgroups(
+          group,
+          shown.threads,
+          multiKernel: multiKernel,
+        )) {
+          for (final bucket in _groupByAgent(shown.threads)) {
+            final subId = _agentSubgroupId(group, bucket.kernel);
             rows.add(
               _ListRow(
-                _ListRowKind.thread,
+                _ListRowKind.agentHeader,
                 group,
-                ObjectKey(aside),
-                _rowHeight,
-                thread: aside,
-                aside: true,
+                ValueKey(subId),
+                _agentHeaderHeight,
+                agentKernel: bucket.kernel,
+                agentSubgroupId: subId,
+                agentThreads: bucket.threads,
               ),
             );
+            if (_workspace.isCollapsed(subId)) continue;
+            for (final thread in bucket.threads) {
+              appendThreadRows(group, thread);
+            }
+          }
+        } else {
+          for (final thread in shown.threads) {
+            appendThreadRows(group, thread);
           }
         }
         if (shown.more > 0 || shown.less) {
@@ -2458,6 +2573,19 @@ class _SidebarState extends State<Sidebar>
                   slot: row.group.id,
                   slots: _slots,
                   child: _buildHeader(row.group, projects),
+                ),
+                _ListRowKind.agentHeader => _AgentSubHeader(
+                  kernel: row.agentKernel!,
+                  count: row.agentThreads?.length ?? 0,
+                  collapsed: _workspace.isCollapsed(row.agentSubgroupId!),
+                  onToggle: () {
+                    _listFocus.requestFocus();
+                    _workspace.toggleCollapsed(row.agentSubgroupId!);
+                  },
+                  menu: () => _kernelItems(
+                    row.agentKernel!,
+                    row.agentThreads ?? const [],
+                  ),
                 ),
                 _ListRowKind.thread => _buildRow(
                   row.thread!,
@@ -2693,6 +2821,7 @@ class _SidebarState extends State<Sidebar>
       drag: widget.drag,
       // Archived ones are under a heading naming their folder.
       showProject: group.project == null && group.archivedOf == null,
+      showKernelBadge: _hasMultipleKernelsIn(_listGroups),
       showTime: SidebarTimes.shown.value,
       renaming: identical(thread, _renaming),
       onTap: () => _handleRowTap(thread),
@@ -3026,7 +3155,11 @@ class _SidebarState extends State<Sidebar>
     if (index == null) return null;
     final row = _listRows[index];
     final group = row.group;
-    if (!_takes(group, threads) || row.kind == _ListRowKind.more) return null;
+    if (!_takes(group, threads) ||
+        row.kind == _ListRowKind.more ||
+        row.kind == _ListRowKind.agentHeader) {
+      return null;
+    }
     final thread = row.thread;
     if (thread == null) return _Spot(group);
     if (threads.contains(thread)) return null;
@@ -4566,6 +4699,124 @@ class _SlotState extends State<_Slot> {
   Widget build(BuildContext context) => widget.child;
 }
 
+/// Understated per-agent sub-group divider nested inside a project group
+/// (e.g. `✦ CodeBuddy ────────`), letting users distinguish sessions from
+/// different agents at a glance without adding heavy visual chrome.
+class _AgentSubHeader extends StatelessWidget {
+  const _AgentSubHeader({
+    required this.kernel,
+    required this.count,
+    required this.collapsed,
+    required this.onToggle,
+    this.menu,
+  });
+
+  final KernelDescriptor kernel;
+  final int count;
+  final bool collapsed;
+  final VoidCallback onToggle;
+  final List<SidebarMenuItem> Function()? menu;
+
+  static Color _subtleTint(String kernelId) {
+    final base = switch (kernelId) {
+      'antigravity-cli' => const Color(0xFF6E8EF5),
+      'codebuddy-cli' => const Color(0xFF3FB8A8),
+      'claude-code' => const Color(0xFFD98B5F),
+      'codex' => const Color(0xFF56B87B),
+      _ => AppColors.textFaint,
+    };
+    return Color.lerp(AppColors.textFaint, base, 0.55) ?? AppColors.textFaint;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final menu = this.menu;
+    if (menu == null) return _build(context, null);
+    return SidebarMenu(
+      items: menu,
+      placement: (side: FloatingSide.bottom, align: FloatingAlign.end),
+      builder: _build,
+    );
+  }
+
+  Widget _build(BuildContext context, SidebarMenuState? menu) {
+    final tint = _subtleTint(kernel.id);
+    return HoverBuilder(
+      cursor: SystemMouseCursors.click,
+      builder: (context, hovered) {
+        final active = hovered || (menu?.isOpen ?? false);
+        final labelColor = AppColors.textFaint.withValues(
+          alpha: active ? 0.95 : 0.72,
+        );
+        final lineColor = AppColors.partBorder.withValues(
+          alpha: active ? 0.45 : 0.24,
+        );
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: onToggle,
+          onSecondaryTapUp: menu == null
+              ? null
+              : (details) => menu.open(details.globalPosition),
+          child: Container(
+            height: _agentHeaderHeight,
+            padding: const EdgeInsets.fromLTRB(34, 3, 12, 1),
+            alignment: Alignment.centerLeft,
+            child: Row(
+              children: [
+                Icon(
+                  kernel.icon,
+                  size: 10.5,
+                  color: tint.withValues(alpha: active ? 0.95 : 0.75),
+                ),
+                const SizedBox(width: 4),
+                Flexible(
+                  flex: 0,
+                  child: Text(
+                    kernel.label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: labelColor,
+                      fontSize: 10,
+                      height: 1.1,
+                      fontWeight: FontWeight.w500,
+                      letterSpacing: 0.2,
+                    ),
+                  ),
+                ),
+                if (collapsed || active) ...[
+                  const SizedBox(width: 4),
+                  Text(
+                    '$count',
+                    style: TextStyle(
+                      color: AppColors.textFaint.withValues(alpha: 0.65),
+                      fontSize: 9.5,
+                      height: 1.1,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                ],
+                const SizedBox(width: 6),
+                Expanded(child: Container(height: 0.75, color: lineColor)),
+                if (collapsed || active) ...[
+                  const SizedBox(width: 4),
+                  Icon(
+                    collapsed ? Codicons.chevronRight : Codicons.chevronDown,
+                    size: 10,
+                    color: AppColors.textFaint.withValues(
+                      alpha: active ? 0.85 : 0.55,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
 /// Under a project's most recent agents: the rest, or fewer again.
 class _MoreRow extends StatelessWidget {
   const _MoreRow({required this.label, required this.onTap});
@@ -4612,6 +4863,7 @@ class _ThreadRow extends StatelessWidget {
     required this.focused,
     required this.drag,
     required this.showProject,
+    this.showKernelBadge = false,
     required this.showTime,
     required this.renaming,
     required this.onTap,
@@ -4661,6 +4913,7 @@ class _ThreadRow extends StatelessWidget {
 
   final ChatDrag? drag;
   final bool showProject;
+  final bool showKernelBadge;
 
   /// Whether the time it last did something shows at its end (its hover
   /// shows it either way).
@@ -4948,18 +5201,38 @@ class _ThreadRow extends StatelessWidget {
                       ),
                       const SizedBox(width: 4),
                       Expanded(
-                        child: RichText(
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          text: TextSpan(
-                            text: thread.project.name,
-                            style: DefaultTextStyle.of(context).style.copyWith(
-                              color: AppColors.textMuted,
-                              fontSize: 11,
-                              height: 1.15,
-                              fontWeight: FontWeight.w400,
+                        child: Row(
+                          children: [
+                            Flexible(
+                              child: RichText(
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                text: TextSpan(
+                                  text: thread.project.name,
+                                  style: DefaultTextStyle.of(context).style
+                                      .copyWith(
+                                        color: AppColors.textMuted,
+                                        fontSize: 11,
+                                        height: 1.15,
+                                        fontWeight: FontWeight.w400,
+                                      ),
+                                ),
+                              ),
                             ),
-                          ),
+                            if (showKernelBadge) ...[
+                              Text(
+                                ' · ${thread.kernel.label}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  color: AppColors.textFaint,
+                                  fontSize: 10.5,
+                                  height: 1.15,
+                                  fontWeight: FontWeight.w400,
+                                ),
+                              ),
+                            ],
+                          ],
                         ),
                       ),
                       if (showTime) ...[
@@ -5041,6 +5314,13 @@ class _ThreadRow extends StatelessWidget {
           ),
           const SizedBox(height: 2),
           Text(thread.project.path, style: faint),
+          if (showKernelBadge)
+            Text(
+              thread.kernel.label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: faint,
+            ),
           if (model() case final model?)
             Text(
               l10n.sidebarHoverModel(model),

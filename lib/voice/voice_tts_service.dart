@@ -21,6 +21,43 @@ class SystemVoiceInfo {
   String get displayLabel => locale.isEmpty ? name : '$name ($locale)';
 }
 
+/// Describes a voice advertised by an OpenAI-compatible TTS server.
+@immutable
+class RemoteVoiceInfo {
+  const RemoteVoiceInfo({
+    required this.id,
+    this.name = '',
+    this.locale = '',
+  });
+
+  final String id;
+  final String name;
+  final String locale;
+
+  String get displayLabel {
+    final trimmedName = name.trim();
+    final base = trimmedName.isEmpty || trimmedName == id
+        ? id
+        : '$trimmedName ($id)';
+    final trimmedLocale = locale.trim();
+    return trimmedLocale.isEmpty ? base : '$base · $trimmedLocale';
+  }
+}
+
+/// Result of querying an OpenAI-compatible TTS server for available voices.
+@immutable
+class RemoteVoiceListResult {
+  const RemoteVoiceListResult({
+    this.voices = const [],
+    this.endpoint,
+    this.error,
+  });
+
+  final List<RemoteVoiceInfo> voices;
+  final Uri? endpoint;
+  final String? error;
+}
+
 /// Unified Text-to-Speech controller supporting:
 /// - **Edge Neural TTS** (persistent Python `edge-tts` worker + sentence-by-
 ///   sentence streaming pipeline + native C++ Win32 MCI playback for <0.5s
@@ -173,12 +210,9 @@ if __name__ == "__main__":
     try {
       if (config.ttsEngine == VoiceTtsEngine.openaiCompatible) {
         final key = await _settings.readTtsApiKey();
-        if (key != null && key.isNotEmpty) {
-          await _speakViaOpenAi(cleaned, config: config, apiKey: key, gen: gen);
-          completedNaturally = gen == _generation;
-          return;
-        }
-        // Gracefully fall back if API key is missing.
+        await _speakViaOpenAi(cleaned, config: config, apiKey: key, gen: gen);
+        completedNaturally = gen == _generation;
+        return;
       }
       if (config.ttsEngine == VoiceTtsEngine.edgeNeural) {
         try {
@@ -822,7 +856,7 @@ try {
   Future<void> _speakViaOpenAi(
     String text, {
     required VoiceConfig config,
-    required String apiKey,
+    String? apiKey,
     required int gen,
   }) async {
     final audioBytes = await synthesizeViaOpenAi(
@@ -837,7 +871,8 @@ try {
 
     final dir = await Directory.systemTemp.createTemp('ayte_tts_');
     _activeTempDirs.add(dir);
-    final file = File(p.join(dir.path, 'speech.mp3'));
+    final ext = detectAudioExtension(audioBytes);
+    final file = File(p.join(dir.path, 'speech.$ext'));
     await file.writeAsBytes(audioBytes, flush: true);
 
     try {
@@ -989,11 +1024,15 @@ try {
     }
   }
 
-  /// Calls an OpenAI-compatible `/audio/speech` endpoint and returns MP3 bytes.
+  /// Calls an OpenAI-compatible `/audio/speech` endpoint and returns audio bytes.
+  ///
+  /// [apiKey] is optional so keyless self-hosted / LAN TTS servers work without
+  /// an `Authorization` header. When [baseUrl] omits `/v1` and `/audio/speech`
+  /// responds with 404/405, automatically retries `/v1/audio/speech`.
   static Future<List<int>> synthesizeViaOpenAi({
     required String text,
     required String baseUrl,
-    required String apiKey,
+    String? apiKey,
     required String model,
     required String voice,
     double speed = 1.0,
@@ -1002,30 +1041,49 @@ try {
     final ownClient = client == null;
     final http = client ?? HttpClient()
       ..connectionTimeout = const Duration(seconds: 20);
-    try {
-      final uri = buildSpeechUri(baseUrl);
-      final payload = jsonEncode({
+    final trimmedKey = apiKey?.trim() ?? '';
+    final payload = utf8.encode(
+      jsonEncode({
         'model': model,
         'input': text,
         'voice': voice,
         'speed': speed.clamp(0.25, 4.0),
         'response_format': 'mp3',
-      });
-      final req = await http.postUrl(uri);
-      req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $apiKey');
-      req.headers.set(
-        HttpHeaders.contentTypeHeader,
-        'application/json; charset=utf-8',
-      );
-      req.add(utf8.encode(payload));
+      }),
+    );
+    try {
+      final uris = buildSpeechUris(baseUrl);
+      HttpException? lastHttpError;
+      for (var i = 0; i < uris.length; i++) {
+        final req = await http.postUrl(uris[i]);
+        if (trimmedKey.isNotEmpty) {
+          req.headers.set(
+            HttpHeaders.authorizationHeader,
+            'Bearer $trimmedKey',
+          );
+        }
+        req.headers.set(
+          HttpHeaders.contentTypeHeader,
+          'application/json; charset=utf-8',
+        );
+        req.add(payload);
 
-      final res = await req.close().timeout(const Duration(seconds: 60));
-      final bytes = await consolidateHttpClientResponseBytes(res);
-      if (res.statusCode < 200 || res.statusCode >= 300) {
+        final res = await req.close().timeout(const Duration(seconds: 60));
+        final bytes = await consolidateHttpClientResponseBytes(res);
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          return bytes;
+        }
         final msg = utf8.decode(bytes, allowMalformed: true);
-        throw HttpException('HTTP ${res.statusCode}: $msg');
+        lastHttpError = HttpException('HTTP ${res.statusCode}: $msg');
+        final canRetryPath =
+            (res.statusCode == HttpStatus.notFound ||
+                res.statusCode == HttpStatus.methodNotAllowed) &&
+            i + 1 < uris.length;
+        if (!canRetryPath) {
+          throw lastHttpError;
+        }
       }
-      return bytes;
+      throw lastHttpError ?? const HttpException('Empty TTS API base URL');
     } finally {
       if (ownClient) http.close();
     }
@@ -1037,6 +1095,333 @@ try {
       return Uri.parse(trimmed);
     }
     return Uri.parse('$trimmed/audio/speech');
+  }
+
+  static List<Uri> buildSpeechUris(String baseUrl) {
+    final trimmed = baseUrl.trim().replaceAll(RegExp(r'/+$'), '');
+    if (trimmed.isEmpty) return const [];
+    final primary = buildSpeechUri(trimmed);
+    if (trimmed.endsWith('/audio/speech') ||
+        RegExp(r'/v\d+$', caseSensitive: false).hasMatch(trimmed)) {
+      return [primary];
+    }
+    return [primary, Uri.parse('$trimmed/v1/audio/speech')];
+  }
+
+  /// Candidate voice-listing endpoints for OpenAI-compatible and self-hosted
+  /// TTS servers.
+  static List<Uri> buildVoiceListUris(String baseUrl) {
+    var root = baseUrl.trim().replaceAll(RegExp(r'/+$'), '');
+    if (root.isEmpty) return const [];
+    if (root.endsWith('/audio/speech')) {
+      root = root.substring(0, root.length - '/audio/speech'.length);
+    }
+    final versioned = RegExp(
+      r'^(.*)/v\d+$',
+      caseSensitive: false,
+    ).firstMatch(root);
+    final seen = <String>{};
+    final out = <Uri>[];
+    void add(String raw) {
+      if (!seen.add(raw)) return;
+      final parsed = Uri.tryParse(raw);
+      if (parsed != null && parsed.hasScheme && parsed.host.isNotEmpty) {
+        out.add(parsed);
+      }
+    }
+
+    if (versioned != null) {
+      final originRoot = versioned.group(1)!;
+      add('$root/audio/voices');
+      add('$root/voices');
+      if (originRoot.isNotEmpty && !originRoot.endsWith('://')) {
+        add('$originRoot/voices');
+        add('$originRoot/api/voices');
+        add('$originRoot/speakers');
+      }
+    } else {
+      add('$root/v1/audio/voices');
+      add('$root/audio/voices');
+      add('$root/v1/voices');
+      add('$root/voices');
+      add('$root/api/voices');
+      add('$root/speakers');
+    }
+    return out;
+  }
+
+  /// Queries an OpenAI-compatible TTS server for its available voices.
+  ///
+  /// Stops at the first candidate endpoint that returns a non-empty voice list,
+  /// and aborts immediately on connectivity or authorization failures.
+  static Future<RemoteVoiceListResult> listOpenAiVoices({
+    required String baseUrl,
+    String? apiKey,
+    HttpClient? client,
+  }) async {
+    final uris = buildVoiceListUris(baseUrl);
+    if (uris.isEmpty) {
+      return const RemoteVoiceListResult(error: 'Invalid TTS API URL');
+    }
+    final ownClient = client == null;
+    final http = client ?? HttpClient()
+      ..connectionTimeout = const Duration(seconds: 5);
+    final trimmedKey = apiKey?.trim() ?? '';
+    try {
+      String? lastError;
+      for (final uri in uris) {
+        try {
+          final req = await http.getUrl(uri).timeout(
+            const Duration(seconds: 5),
+          );
+          if (trimmedKey.isNotEmpty) {
+            req.headers.set(
+              HttpHeaders.authorizationHeader,
+              'Bearer $trimmedKey',
+            );
+          }
+          req.headers.set(HttpHeaders.acceptHeader, 'application/json');
+          final res = await req.close().timeout(const Duration(seconds: 6));
+          final bytes = await consolidateHttpClientResponseBytes(res);
+          if (res.statusCode == HttpStatus.unauthorized ||
+              res.statusCode == HttpStatus.forbidden) {
+            return RemoteVoiceListResult(
+              endpoint: uri,
+              error: 'HTTP ${res.statusCode}',
+            );
+          }
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            final body = utf8.decode(bytes, allowMalformed: true);
+            final voices = parseOpenAiVoicesResponse(body);
+            if (voices.isNotEmpty) {
+              return RemoteVoiceListResult(voices: voices, endpoint: uri);
+            }
+          } else if (res.statusCode >= 500) {
+            lastError = 'HTTP ${res.statusCode}';
+          }
+        } on SocketException catch (e) {
+          return RemoteVoiceListResult(
+            endpoint: uri,
+            error: e.message.isNotEmpty ? e.message : 'Connection failed',
+          );
+        } on TimeoutException {
+          return RemoteVoiceListResult(
+            endpoint: uri,
+            error: 'Request timed out',
+          );
+        } on HandshakeException catch (e) {
+          return RemoteVoiceListResult(
+            endpoint: uri,
+            error: e.message.isNotEmpty ? e.message : 'TLS handshake failed',
+          );
+        } on Object catch (e) {
+          lastError = e.toString();
+        }
+      }
+      return RemoteVoiceListResult(error: lastError);
+    } finally {
+      if (ownClient) http.close();
+    }
+  }
+
+  /// Parses JSON voice listings returned by common OpenAI-compatible and
+  /// self-hosted TTS servers (Kokoro, Speaches, OpenedAI-Speech, Fish Speech,
+  /// CosyVoice, IndexTTS, etc.).
+  static List<RemoteVoiceInfo> parseOpenAiVoicesResponse(String body) {
+    final trimmed = body.trim();
+    if (trimmed.isEmpty) return const [];
+    final Object? decoded;
+    try {
+      decoded = jsonDecode(trimmed);
+    } on FormatException {
+      return const [];
+    }
+    return _extractRemoteVoices(decoded);
+  }
+
+  static List<RemoteVoiceInfo> _extractRemoteVoices(
+    Object? raw, {
+    int depth = 0,
+  }) {
+    if (raw == null || depth > 2) return const [];
+    if (raw is List) {
+      return _parseVoiceListItems(raw);
+    }
+    if (raw is Map) {
+      for (final key in const [
+        'voices',
+        'speakers',
+        'data',
+        'items',
+        'results',
+        'list',
+      ]) {
+        if (!raw.containsKey(key)) continue;
+        final value = raw[key];
+        if (value is List) {
+          final parsed = _parseVoiceListItems(value);
+          if (parsed.isNotEmpty) return parsed;
+        } else if (value is Map) {
+          if (key == 'data' || key == 'results') {
+            final nested = _extractRemoteVoices(value, depth: depth + 1);
+            if (nested.isNotEmpty) return nested;
+          }
+          if (key == 'voices' || key == 'speakers') {
+            final mapped = _parseVoiceMapEntries(value);
+            if (mapped.isNotEmpty) return mapped;
+          }
+        }
+      }
+    }
+    return const [];
+  }
+
+  static List<RemoteVoiceInfo> _parseVoiceListItems(List<dynamic> items) {
+    final out = <RemoteVoiceInfo>[];
+    final seen = <String>{};
+    for (final item in items) {
+      final info = _parseVoiceItem(item);
+      if (info != null && seen.add(info.id)) {
+        out.add(info);
+      }
+    }
+    return out;
+  }
+
+  static List<RemoteVoiceInfo> _parseVoiceMapEntries(
+    Map<dynamic, dynamic> map,
+  ) {
+    final out = <RemoteVoiceInfo>[];
+    final seen = <String>{};
+    for (final entry in map.entries) {
+      final id = entry.key.toString().trim();
+      if (id.isEmpty) continue;
+      final value = entry.value;
+      RemoteVoiceInfo? info;
+      if (value is String) {
+        info = RemoteVoiceInfo(id: id, name: value.trim());
+      } else if (value is Map) {
+        info = _parseVoiceMapObject(value, fallbackId: id);
+      } else {
+        info = RemoteVoiceInfo(id: id);
+      }
+      if (info != null && seen.add(info.id)) {
+        out.add(info);
+      }
+    }
+    return out;
+  }
+
+  static RemoteVoiceInfo? _parseVoiceItem(Object? item) {
+    if (item is String) {
+      final id = item.trim();
+      return id.isEmpty ? null : RemoteVoiceInfo(id: id);
+    }
+    if (item is Map) {
+      return _parseVoiceMapObject(item);
+    }
+    return null;
+  }
+
+  static RemoteVoiceInfo? _parseVoiceMapObject(
+    Map<dynamic, dynamic> map, {
+    String? fallbackId,
+  }) {
+    String firstStr(List<String> keys) {
+      for (final k in keys) {
+        final v = map[k];
+        if (v is String) {
+          final t = v.trim();
+          if (t.isNotEmpty) return t;
+        }
+      }
+      return '';
+    }
+
+    final explicitId = firstStr(const [
+      'voice_id',
+      'id',
+      'short_name',
+      'ShortName',
+      'speaker_id',
+    ]);
+    final String effectiveId;
+    if (explicitId.isNotEmpty) {
+      effectiveId = explicitId;
+    } else if (fallbackId != null && fallbackId.trim().isNotEmpty) {
+      effectiveId = fallbackId.trim();
+    } else {
+      effectiveId = firstStr(const [
+        'voice',
+        'speaker',
+        'value',
+        'key',
+        'name',
+        'Name',
+      ]);
+    }
+    if (effectiveId.isEmpty) return null;
+
+    final name = firstStr(const [
+      'display_name',
+      'displayName',
+      'friendly_name',
+      'FriendlyName',
+      'title',
+      'label',
+      'name',
+      'Name',
+    ]);
+
+    var locale = firstStr(const [
+      'locale',
+      'Locale',
+      'language',
+      'Language',
+      'lang',
+    ]);
+    if (locale.isEmpty && map['languages'] is List) {
+      final langs = (map['languages'] as List)
+          .whereType<String>()
+          .map((s) => s.trim())
+          .where((s) => s.isNotEmpty)
+          .take(2)
+          .toList();
+      if (langs.isNotEmpty) locale = langs.join('/');
+    }
+
+    return RemoteVoiceInfo(id: effectiveId, name: name, locale: locale);
+  }
+
+  /// Sniffs common audio container headers so self-hosted servers returning WAV
+  /// or OGG play cleanly even when MP3 was requested.
+  static String detectAudioExtension(List<int> bytes) {
+    if (bytes.length >= 12 &&
+        bytes[0] == 0x52 &&
+        bytes[1] == 0x49 &&
+        bytes[2] == 0x46 &&
+        bytes[3] == 0x46 &&
+        bytes[8] == 0x57 &&
+        bytes[9] == 0x41 &&
+        bytes[10] == 0x56 &&
+        bytes[11] == 0x45) {
+      return 'wav';
+    }
+    if (bytes.length >= 4 &&
+        bytes[0] == 0x4F &&
+        bytes[1] == 0x67 &&
+        bytes[2] == 0x67 &&
+        bytes[3] == 0x53) {
+      return 'ogg';
+    }
+    if (bytes.length >= 4 &&
+        bytes[0] == 0x66 &&
+        bytes[1] == 0x4C &&
+        bytes[2] == 0x61 &&
+        bytes[3] == 0x43) {
+      return 'flac';
+    }
+    return 'mp3';
   }
 
   static Future<void> _cleanupTempDir(Directory dir) async {

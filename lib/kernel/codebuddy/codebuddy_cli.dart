@@ -192,6 +192,15 @@ class CodeBuddyModel {
   bool get isReasoningConfigurable =>
       supportsReasoning && (supportedEfforts.isNotEmpty || canToggleThinking);
 
+  /// Whether reasoning is always active at a single fixed effort level that the
+  /// user cannot toggle off or adjust (rendered as a read-only indicator).
+  bool get isReasoningFixed =>
+      supportsReasoning && !canToggleThinking && supportedEfforts.length == 1;
+
+  /// Menu label for an effort option (`baseLabel` is e.g. `High`).
+  String effortOptionLabel(String level, String baseLabel) =>
+      isReasoningFixed ? '固定 $baseLabel（不支持调整）' : baseLabel;
+
   /// Valid effort states selectable in the kernel:
   /// - Empty when `!isReasoningConfigurable` (no effort menu shown).
   /// - Includes `'none'` when `canToggleThinking` is true.
@@ -251,9 +260,27 @@ class CodeBuddyModel {
     };
   }
 
+  /// Normalizes a raw effort/thinking-level token to [workbuddyEffortOrder],
+  /// returning `null` for disabled/off/unknown values.
+  static String? _normalizeEffortToken(Object? value) {
+    if (value is! String) return null;
+    final trimmed = value.trim().toLowerCase();
+    if (trimmed.isEmpty) return null;
+    final norm = trimmed == 'minimal' ? 'low' : trimmed;
+    return workbuddyEffortOrder.contains(norm) ? norm : null;
+  }
+
+  static bool _isOffEffortToken(String raw) =>
+      const {'off', 'none', 'disabled'}.contains(raw.trim().toLowerCase());
+
   /// Parses a full `rawModels` entry from `codebuddy`'s `get_available_models`
-  /// control response using WorkBuddy's exact capability rules.
-  factory CodeBuddyModel.fromRawJson(Map<String, Object?> raw) {
+  /// control response using WorkBuddy's capability rules, supporting both
+  /// `reasoning.supportedEfforts` arrays and `thinkingLevelMap` maps (including
+  /// 2-tier and fixed single-tier reasoning models).
+  factory CodeBuddyModel.fromRawJson(
+    Map<String, Object?> raw, {
+    CodeBuddyModel? fallback,
+  }) {
     final id = (raw['id'] ?? raw['modelId'] ?? raw['value']) as String? ?? '';
     final rawName =
         ((raw['name'] ?? raw['displayName']) as String?)?.trim() ?? '';
@@ -271,43 +298,112 @@ class CodeBuddyModel {
       label = '$label (免费)';
     }
 
-    final supportsReasoning = raw['supportsReasoning'] == true;
+    final rawReasoning = raw['reasoning'];
+    final reasoning = rawReasoning is Map
+        ? rawReasoning.cast<String, Object?>()
+        : null;
+    final supportsReasoning =
+        raw['supportsReasoning'] == true ||
+        rawReasoning == true ||
+        reasoning != null;
     final onlyReasoning = raw['onlyReasoning'] == true;
-    final reasoning = (raw['reasoning'] as Map?)?.cast<String, Object?>();
-    final canDisable =
-        supportsReasoning &&
-        !onlyReasoning &&
-        raw['canDisableThinking'] != false &&
-        reasoning?['canDisableThinking'] != false;
 
     final rawEfforts =
-        reasoning?['supportedEfforts'] ?? raw['supportedEffortLevels'];
+        reasoning?['supportedEfforts'] ??
+        raw['supportedEfforts'] ??
+        raw['supportedEffortLevels'] ??
+        raw['effortLevels'];
+    final rawThinkingMap =
+        reasoning?['thinkingLevelMap'] ?? raw['thinkingLevelMap'];
+    final hasExplicitEfforts = rawEfforts is List || rawThinkingMap is Map;
+
     final supportedSet = <String>{};
+    var mapAllowsDisable = false;
+
     if (rawEfforts is List) {
       for (final item in rawEfforts) {
-        if (item is! String) continue;
-        final norm = item.trim() == 'minimal' ? 'low' : item.trim();
-        if (workbuddyEffortOrder.contains(norm)) {
+        if (item is String && _isOffEffortToken(item)) {
+          mapAllowsDisable = true;
+          continue;
+        }
+        final norm = _normalizeEffortToken(item);
+        if (norm != null) {
           supportedSet.add(norm);
         }
       }
     }
+
+    if (rawThinkingMap is Map) {
+      for (final entry in rawThinkingMap.entries) {
+        final key = entry.key.toString().trim().toLowerCase();
+        final val = entry.value;
+        if (val == null || val == false) continue;
+        final valStr = val is String
+            ? val.trim().toLowerCase()
+            : (val == true ? key : '');
+        if (valStr.isEmpty) continue;
+        if (_isOffEffortToken(key) || _isOffEffortToken(valStr)) {
+          if (_isOffEffortToken(key)) mapAllowsDisable = true;
+          continue;
+        }
+        final norm =
+            _normalizeEffortToken(valStr) ?? _normalizeEffortToken(key);
+        if (norm != null) {
+          supportedSet.add(norm);
+        }
+      }
+    }
+
+    final rawDefaultCandidates = [
+      reasoning?['defaultEffort'],
+      reasoning?['effort'],
+      raw['defaultEffort'],
+      raw['effort'],
+      fallback?.defaultEffort,
+    ];
+
+    if (!hasExplicitEfforts && supportsReasoning) {
+      if (fallback != null && fallback.supportedEfforts.isNotEmpty) {
+        supportedSet.addAll(fallback.supportedEfforts);
+      } else {
+        for (final candidate in rawDefaultCandidates) {
+          final norm = _normalizeEffortToken(candidate);
+          if (norm != null) {
+            supportedSet.add(norm);
+            break;
+          }
+        }
+      }
+    }
+
     final supportedEfforts = [
       for (final tier in workbuddyEffortOrder)
         if (supportedSet.contains(tier)) tier,
     ];
 
+    final bool canDisable;
+    if (!supportsReasoning || onlyReasoning) {
+      canDisable = false;
+    } else if (rawThinkingMap is Map && rawEfforts is! List) {
+      // A `thinkingLevelMap` with all-null / off-only entries must not produce
+      // an empty or misleading toggle panel.
+      canDisable =
+          supportedEfforts.isNotEmpty &&
+          (mapAllowsDisable ||
+              raw['canDisableThinking'] == true ||
+              reasoning?['canDisableThinking'] == true);
+    } else {
+      canDisable =
+          raw['canDisableThinking'] != false &&
+          reasoning?['canDisableThinking'] != false;
+    }
+
     String? defaultEffort;
-    for (final candidate in [
-      reasoning?['defaultEffort'],
-      reasoning?['effort'],
-    ]) {
-      if (candidate is String && candidate.trim().isNotEmpty) {
-        final norm = candidate.trim() == 'minimal' ? 'low' : candidate.trim();
-        if (supportedEfforts.contains(norm)) {
-          defaultEffort = norm;
-          break;
-        }
+    for (final candidate in rawDefaultCandidates) {
+      final norm = _normalizeEffortToken(candidate);
+      if (norm != null && supportedEfforts.contains(norm)) {
+        defaultEffort = norm;
+        break;
       }
     }
     defaultEffort ??= supportedEfforts.firstOrNull;
@@ -792,11 +888,14 @@ abstract final class CodeBuddyModels {
       final hasRichMetadata =
           raw.containsKey('supportsReasoning') ||
           raw.containsKey('reasoning') ||
+          raw.containsKey('thinkingLevelMap') ||
+          raw.containsKey('supportedEfforts') ||
+          raw.containsKey('supportedEffortLevels') ||
           raw.containsKey('credits') ||
           raw.containsKey('onlyReasoning');
 
       if (hasRichMetadata) {
-        updated.add(CodeBuddyModel.fromRawJson(raw));
+        updated.add(CodeBuddyModel.fromRawJson(raw, fallback: byKnown[id]));
         continue;
       }
 
@@ -839,7 +938,11 @@ abstract final class CodeBuddyModels {
         final map = item.cast<String, Object?>();
         final id = (map['id'] as String?)?.trim() ?? '';
         if (id.isEmpty) continue;
-        if (map.containsKey('reasoning') || map.containsKey('onlyReasoning')) {
+        if (map.containsKey('reasoning') ||
+            map.containsKey('onlyReasoning') ||
+            map.containsKey('thinkingLevelMap') ||
+            map.containsKey('supportedEfforts') ||
+            map.containsKey('supportedEffortLevels')) {
           out.add(CodeBuddyModel.fromRawJson(map));
           continue;
         }

@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 
@@ -468,4 +470,285 @@ void main() => print('hi');
       expect(VoiceModelInstaller.formatMb(239233841), '228.2 MB');
     });
   });
+
+  group('OpenAI-compatible TTS voice discovery & keyless mode', () {
+    test('builds speech fallback URIs when /v1 is omitted', () {
+      expect(
+        VoiceTtsService.buildSpeechUris('https://api.openai.com/v1')
+            .map((u) => u.toString())
+            .toList(),
+        ['https://api.openai.com/v1/audio/speech'],
+      );
+      expect(
+        VoiceTtsService.buildSpeechUris('http://192.168.100.129:17865/')
+            .map((u) => u.toString())
+            .toList(),
+        [
+          'http://192.168.100.129:17865/audio/speech',
+          'http://192.168.100.129:17865/v1/audio/speech',
+        ],
+      );
+      expect(
+        VoiceTtsService.buildSpeechUris(
+          'http://localhost:8880/v1/audio/speech',
+        ).map((u) => u.toString()).toList(),
+        ['http://localhost:8880/v1/audio/speech'],
+      );
+    });
+
+    test('builds deduplicated candidate voice-listing URIs', () {
+      expect(
+        VoiceTtsService.buildVoiceListUris('http://192.168.100.129:17865/')
+            .map((u) => u.toString())
+            .toList(),
+        [
+          'http://192.168.100.129:17865/v1/audio/voices',
+          'http://192.168.100.129:17865/audio/voices',
+          'http://192.168.100.129:17865/v1/voices',
+          'http://192.168.100.129:17865/voices',
+          'http://192.168.100.129:17865/api/voices',
+          'http://192.168.100.129:17865/speakers',
+        ],
+      );
+      expect(
+        VoiceTtsService.buildVoiceListUris(
+          'http://localhost:8880/v1/audio/speech',
+        ).map((u) => u.toString()).toList(),
+        [
+          'http://localhost:8880/v1/audio/voices',
+          'http://localhost:8880/v1/voices',
+          'http://localhost:8880/voices',
+          'http://localhost:8880/api/voices',
+          'http://localhost:8880/speakers',
+        ],
+      );
+      expect(VoiceTtsService.buildVoiceListUris('not-a-url'), isEmpty);
+    });
+
+    test('parses diverse OpenAI-compatible voice list payloads', () {
+      final simple = VoiceTtsService.parseOpenAiVoicesResponse(
+        '{"voices": ["af_heart", "zf_xiaobei", "af_heart"]}',
+      );
+      expect(simple.map((v) => v.id).toList(), ['af_heart', 'zf_xiaobei']);
+      expect(simple.first.displayLabel, 'af_heart');
+
+      final detailed = VoiceTtsService.parseOpenAiVoicesResponse(
+        jsonEncode({
+          'voices': [
+            {'voice_id': 'zh_female_1', 'name': '温柔女声', 'locale': 'zh-CN'},
+          ],
+        }),
+      );
+      expect(detailed, hasLength(1));
+      expect(detailed.first.id, 'zh_female_1');
+      expect(detailed.first.displayLabel, '温柔女声 (zh_female_1) · zh-CN');
+
+      final nested = VoiceTtsService.parseOpenAiVoicesResponse(
+        jsonEncode({
+          'code': 0,
+          'data': {
+            'items': [
+              {
+                'id': 'narrator_01',
+                'display_name': '旁白',
+                'languages': ['zh', 'en'],
+              },
+            ],
+          },
+        }),
+      );
+      expect(nested, hasLength(1));
+      expect(nested.first.id, 'narrator_01');
+      expect(nested.first.displayLabel, '旁白 (narrator_01) · zh/en');
+
+      final mapped = VoiceTtsService.parseOpenAiVoicesResponse(
+        jsonEncode({
+          'voices': {
+            'zf_xiaobei': {'name': '小贝', 'lang': 'zh-CN'},
+          },
+        }),
+      );
+      expect(mapped, hasLength(1));
+      expect(mapped.first.id, 'zf_xiaobei');
+      expect(mapped.first.displayLabel, '小贝 (zf_xiaobei) · zh-CN');
+
+      final topList = VoiceTtsService.parseOpenAiVoicesResponse(
+        jsonEncode([
+          {'short_name': 'zh-CN-XiaoxiaoNeural', 'friendly_name': '晓晓'},
+        ]),
+      );
+      expect(topList, hasLength(1));
+      expect(topList.first.id, 'zh-CN-XiaoxiaoNeural');
+      expect(topList.first.displayLabel, '晓晓 (zh-CN-XiaoxiaoNeural)');
+
+      expect(
+        VoiceTtsService.parseOpenAiVoicesResponse(
+          '{"error": {"message": "not found"}}',
+        ),
+        isEmpty,
+      );
+      expect(
+        VoiceTtsService.parseOpenAiVoicesResponse('<html><body>ok</body></html>'),
+        isEmpty,
+      );
+    });
+
+    test('detects audio container extensions cleanly', () {
+      expect(
+        VoiceTtsService.detectAudioExtension([
+          0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x41, 0x56, 0x45,
+        ]),
+        'wav',
+      );
+      expect(
+        VoiceTtsService.detectAudioExtension([0x4F, 0x67, 0x67, 0x53, 0]),
+        'ogg',
+      );
+      expect(
+        VoiceTtsService.detectAudioExtension([0x66, 0x4C, 0x61, 0x43, 0]),
+        'flac',
+      );
+      expect(VoiceTtsService.detectAudioExtension([0x49, 0x44, 0x33]), 'mp3');
+    });
+
+    test('persists custom ttsApiVoice values cleanly', () {
+      final cfg = VoiceConfig.fromSettings(
+        (key) => {
+          VoiceConfig.ttsEngineKey: 'openaiCompatible',
+          VoiceConfig.ttsApiVoiceKey: 'zf_xiaobei_custom',
+        }[key],
+      );
+      expect(cfg.ttsApiVoice, 'zf_xiaobei_custom');
+      expect(
+        cfg.toSettingsMap()[VoiceConfig.ttsApiVoiceKey],
+        'zf_xiaobei_custom',
+      );
+    });
+
+    test('lists voices and synthesizes keyless with /v1 fallback', () async {
+      final seenVoicePaths = <String>[];
+      final seenAuthHeaders = <String?>[];
+      final seenSpeechPaths = <String>[];
+      Map<String, dynamic>? speechBody;
+
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(server.close);
+      server.listen((req) async {
+        if (req.method == 'GET') {
+          seenVoicePaths.add(req.uri.path);
+          seenAuthHeaders.add(req.headers.value(HttpHeaders.authorizationHeader));
+          if (req.uri.path == '/voices') {
+            req.response
+              ..statusCode = HttpStatus.ok
+              ..headers.contentType = ContentType.json
+              ..write(
+                jsonEncode({
+                  'voices': [
+                    {'id': 'local_zh_1', 'name': '小青'},
+                    {'id': 'local_en_1', 'name': 'Alex'},
+                  ],
+                }),
+              );
+          } else {
+            req.response.statusCode = HttpStatus.notFound;
+          }
+          await req.response.close();
+          return;
+        }
+        if (req.method == 'POST') {
+          seenSpeechPaths.add(req.uri.path);
+          seenAuthHeaders.add(req.headers.value(HttpHeaders.authorizationHeader));
+          final rawBody = await utf8.decoder.bind(req).join();
+          if (req.uri.path == '/v1/audio/speech') {
+            speechBody = jsonDecode(rawBody) as Map<String, dynamic>;
+            req.response
+              ..statusCode = HttpStatus.ok
+              ..add([0x49, 0x44, 0x33, 0x03]);
+          } else {
+            req.response.statusCode = HttpStatus.notFound;
+          }
+          await req.response.close();
+          return;
+        }
+        req.response.statusCode = HttpStatus.methodNotAllowed;
+        await req.response.close();
+      });
+
+      final baseUrl = 'http://${server.address.address}:${server.port}';
+      final http = HttpOverrides.runWithHttpOverrides(
+        HttpClient.new,
+        _DirectHttpOverrides(),
+      );
+      addTearDown(() => http.close(force: true));
+
+      // Keyless voice listing falls through 404s until /voices succeeds.
+      final listed = await VoiceTtsService.listOpenAiVoices(
+        baseUrl: baseUrl,
+        client: http,
+      );
+      expect(listed.error, isNull);
+      expect(listed.voices.map((v) => v.id).toList(), [
+        'local_zh_1',
+        'local_en_1',
+      ]);
+      expect(seenVoicePaths, [
+        '/v1/audio/voices',
+        '/audio/voices',
+        '/v1/voices',
+        '/voices',
+      ]);
+      expect(seenAuthHeaders.every((h) => h == null), isTrue);
+
+      // Keyless synthesis retries /v1/audio/speech on 404 and sends custom voice.
+      seenAuthHeaders.clear();
+      final bytes = await VoiceTtsService.synthesizeViaOpenAi(
+        text: '你好',
+        baseUrl: baseUrl,
+        model: 'tts-1',
+        voice: 'local_zh_1',
+        client: http,
+      );
+      expect(bytes, [0x49, 0x44, 0x33, 0x03]);
+      expect(seenSpeechPaths, ['/audio/speech', '/v1/audio/speech']);
+      expect(seenAuthHeaders.every((h) => h == null), isTrue);
+      expect(speechBody?['voice'], 'local_zh_1');
+
+      // When an API key is provided, Bearer header is attached.
+      seenAuthHeaders.clear();
+      final withKey = await VoiceTtsService.listOpenAiVoices(
+        baseUrl: baseUrl,
+        apiKey: 'sk-local',
+        client: http,
+      );
+      expect(withKey.voices, hasLength(2));
+      expect(seenAuthHeaders.every((h) => h == 'Bearer sk-local'), isTrue);
+    });
+
+    test('stops probing immediately on 401 unauthorized', () async {
+      var hits = 0;
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(server.close);
+      server.listen((req) async {
+        hits++;
+        req.response.statusCode = HttpStatus.unauthorized;
+        await req.response.close();
+      });
+
+      final baseUrl = 'http://${server.address.address}:${server.port}';
+      final http = HttpOverrides.runWithHttpOverrides(
+        HttpClient.new,
+        _DirectHttpOverrides(),
+      );
+      addTearDown(() => http.close(force: true));
+      final result = await VoiceTtsService.listOpenAiVoices(
+        baseUrl: baseUrl,
+        client: http,
+      );
+      expect(result.voices, isEmpty);
+      expect(result.error, 'HTTP 401');
+      expect(hits, 1);
+    });
+  });
 }
+
+class _DirectHttpOverrides extends HttpOverrides {}

@@ -79,6 +79,10 @@ class AntigravityCatalog implements SessionCatalog, MovesSessions {
   /// unreadable.
   static String? inferJsonlKernelId(String path) {
     if (path.isEmpty) return null;
+    final normalizedPath = path.replaceAll('\\', '/');
+    if (normalizedPath.contains('/.codebuddy/projects/')) {
+      return codebuddyBuiltinProviderId;
+    }
     RandomAccessFile? raf;
     try {
       final file = File(path);
@@ -103,13 +107,21 @@ class AntigravityCatalog implements SessionCatalog, MovesSessions {
           continue;
         }
         if (decoded == null) continue;
+        if (decoded.containsKey('__codebuddyLocal')) {
+          return codebuddyBuiltinProviderId;
+        }
         final uuid = decoded['uuid'];
         if (uuid is String && uuid.startsWith('agy-')) {
           return antigravityBuiltinProviderId;
         }
         final message = decoded['message'];
+        final providerData = decoded['providerData'];
         final rawModel =
-            (message is Map ? message['model'] : null) ?? decoded['model'];
+            (message is Map ? message['model'] : null) ??
+            (providerData is Map
+                ? (providerData['model'] ?? providerData['requestModelId'])
+                : null) ??
+            decoded['model'];
         if (rawModel is String) {
           final model = rawModel.trim();
           if (model.isNotEmpty &&

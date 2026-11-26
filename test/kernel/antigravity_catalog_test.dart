@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:bao_agent/bao_agent.dart' show AgentPaths;
 import 'package:baocode/kernel/antigravity/antigravity_catalog.dart';
 import 'package:baocode/kernel/claude_code/claude_storage_io.dart';
+import 'package:baocode/kernel/codebuddy/codebuddy_catalog.dart';
 import 'package:baocode/kernel/kernel_registry.dart';
 import 'package:baocode/platform/data_dir.dart';
 import 'package:baocode/remote/remote_claude.dart';
@@ -481,7 +482,7 @@ void main() {
 
   test('KernelRegistry wires AntigravityCatalog to antigravity only', () {
     expect(KernelRegistry.antigravity.catalog, isA<AntigravityCatalog>());
-    expect(KernelRegistry.codebuddy.catalog, isA<ClaudeCatalog>());
+    expect(KernelRegistry.codebuddy.catalog, isA<CodeBuddyCatalog>());
     expect(KernelRegistry.claudeCode.catalog, isA<ClaudeCatalog>());
     expect(KernelRegistry.codex.catalog?.runtimeType.toString(), 'CodexCatalog');
   });

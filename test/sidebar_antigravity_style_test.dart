@@ -121,4 +121,73 @@ void main() {
       expect(inSidebar(find.byType(AntigravitySidebarIcon)), findsWidgets);
     },
   );
+
+  testWidgets(
+    'groups project threads under subtle per-agent sub-headers when multiple agents exist',
+    (tester) async {
+      tester.view.physicalSize = const Size(1400, 900);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+
+      final workspace = Workspace.mock();
+      await tester.pumpWidget(BaoCodeApp(workspace: workspace));
+      await tester.pump(const Duration(milliseconds: 250));
+
+      // api-gateway has both Claude Code (Rate limit, Flaky) and Codex (Migrate auth).
+      // Subtle agent sub-headers nest under the project and group threads by agent.
+      final apiGatewayTop = tester
+          .getTopLeft(inSidebar(find.text('api-gateway')))
+          .dy;
+      final rateLimitTop = tester
+          .getTopLeft(inSidebar(find.textContaining('Rate limit per API key')))
+          .dy;
+      final flakyTop = tester
+          .getTopLeft(
+            inSidebar(find.textContaining('Flaky integration test on CI')),
+          )
+          .dy;
+      final migrateTop = tester
+          .getTopLeft(
+            inSidebar(find.textContaining('Migrate auth middleware to JWT')),
+          )
+          .dy;
+
+      // Most-recently-active agent in api-gateway is Claude Code (Rate limit 55m ago),
+      // so both Claude Code threads appear together above the Codex thread.
+      expect(apiGatewayTop, lessThan(rateLimitTop));
+      expect(rateLimitTop, lessThan(flakyTop));
+      expect(flakyTop, lessThan(migrateTop));
+
+      // Subtle agent sub-headers are present for both Claude Code and Codex.
+      final codexHeaders = inSidebar(find.text('Codex'));
+      expect(codexHeaders, findsWidgets);
+
+      // Tapping the Codex sub-header inside api-gateway folds only Codex threads
+      // under api-gateway without hiding Claude Code threads in api-gateway.
+      await tester.tap(codexHeaders.last);
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(
+        inSidebar(find.textContaining('Migrate auth middleware to JWT')),
+        findsNothing,
+      );
+      expect(
+        inSidebar(find.textContaining('Rate limit per API key')),
+        findsOneWidget,
+      );
+
+      // Filtering the sidebar to a single kernel hides redundant sub-headers
+      // (only the active filter chip still shows the kernel label).
+      workspace.sidebarKernelFilter = workspace.kernels.first.id;
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(inSidebar(find.text('Codex')), findsNothing);
+      expect(
+        inSidebar(find.byKey(const ValueKey('sidebar-kernel-filter-chip'))),
+        findsOneWidget,
+      );
+      expect(
+        inSidebar(find.text(workspace.kernels.first.label)),
+        findsOneWidget,
+      );
+    },
+  );
 }

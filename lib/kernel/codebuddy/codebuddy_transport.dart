@@ -16,6 +16,7 @@ import '../claude_code/claude_environment.dart';
 import '../claude_code/claude_settings_file.dart';
 import 'codebuddy_account_models.dart';
 import 'codebuddy_accounts.dart';
+import 'codebuddy_catalog.dart';
 import 'codebuddy_cli.dart';
 
 /// Starts a session on the CodeBuddy CLI (`codebuddy` / `cbc`).
@@ -1730,10 +1731,13 @@ class CodeBuddyTransport implements ClaudeCodeTransport {
   void _appendCustomTitleToTranscript(String sessionId, String title) {
     if (!launch.persist) return;
     try {
-      final path =
-          _paths.findSession(sessionId) ??
-          _paths.sessionFile(launch.cwd, sessionId);
-      final file = File(path);
+      final nativeFile = CodeBuddyCatalog.findNativeSessionFile(
+        sessionId,
+        paths: _paths,
+      );
+      final targetPath = nativeFile?.path ?? _paths.findSession(sessionId);
+      if (targetPath == null) return;
+      final file = File(targetPath);
       if (!file.parent.existsSync()) {
         file.parent.createSync(recursive: true);
       }

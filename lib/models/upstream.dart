@@ -347,13 +347,7 @@ List<RemoteModel> parseModelList(Object? json) {
         id,
         label: label,
         contextWindow: window,
-        efforts: switch (item['reasoning_levels']) {
-          final List levels when levels.isNotEmpty => [
-            for (final level in levels)
-              if (level is String && level.trim().isNotEmpty) level.trim(),
-          ],
-          _ => null,
-        },
+        efforts: _effortsOf(item),
         images: switch (item['modalities']) {
           {'input': final List inputs} => inputs.any(
             (input) => input is String && input.startsWith('image'),
@@ -365,6 +359,44 @@ List<RemoteModel> parseModelList(Object? json) {
     );
   }
   return models;
+}
+
+List<String>? _effortsOf(Map item) {
+  final rawList =
+      item['reasoning_levels'] ??
+      item['supportedEffortLevels'] ??
+      item['supportedEfforts'];
+  if (rawList is List && rawList.isNotEmpty) {
+    final parsed = [
+      for (final level in rawList)
+        if (level is String && level.trim().isNotEmpty) level.trim(),
+    ];
+    if (parsed.isNotEmpty) return parsed;
+  }
+  final rawMap =
+      item['thinkingLevelMap'] ??
+      (item['reasoning'] is Map
+          ? (item['reasoning'] as Map)['thinkingLevelMap']
+          : null);
+  if (rawMap is Map) {
+    final parsed = <String>[];
+    for (final entry in rawMap.entries) {
+      final val = entry.value;
+      if (val == null || val == false) continue;
+      final token = val is String
+          ? val.trim().toLowerCase()
+          : (val == true ? entry.key.toString().trim().toLowerCase() : '');
+      if (token.isEmpty ||
+          token == 'off' ||
+          token == 'none' ||
+          token == 'disabled') {
+        continue;
+      }
+      if (!parsed.contains(token)) parsed.add(token);
+    }
+    if (parsed.isNotEmpty) return parsed;
+  }
+  return null;
 }
 
 /// What a listed model is for, where its entry says: magpie's `kind`, what

@@ -10,6 +10,7 @@ class KernelOption {
     this.icon,
     this.description, {
     this.caution = false,
+    this.readOnly = false,
     this.iconBuilder,
     this.group,
   });
@@ -22,6 +23,10 @@ class KernelOption {
 
   /// Risky to pick (e.g. no permission checks): shown as a warning.
   final bool caution;
+
+  /// Informational-only entry (e.g. a model's fixed reasoning effort):
+  /// rendered clearly in the submenu without hover highlight or click action.
+  final bool readOnly;
 
   /// Drawn in place of [icon], at a size and in a color (a project's own
   /// icon).
@@ -37,10 +42,12 @@ class KernelOption {
       other.label == label &&
       other.description == description &&
       other.caution == caution &&
+      other.readOnly == readOnly &&
       other.group == group;
 
   @override
-  int get hashCode => Object.hash(id, label, description, caution, group);
+  int get hashCode =>
+      Object.hash(id, label, description, caution, readOnly, group);
 }
 
 /// Options listed together under a heading, e.g. a provider's models.

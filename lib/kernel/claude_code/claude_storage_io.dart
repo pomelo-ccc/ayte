@@ -4,6 +4,7 @@ import 'package:path/path.dart' as p;
 import '../../platform/data_dir.dart';
 import '../agent_kernel.dart';
 import '../antigravity/antigravity_transport.dart';
+import '../codebuddy/codebuddy_catalog.dart';
 
 /// Claude Code's own record of its sessions on this machine (see
 /// [ClaudeSessions]).
@@ -64,11 +65,15 @@ class ClaudeStorage implements SessionCatalog, MovesSessions {
   static Future<List<Map<String, Object?>>> read(SessionRecord session) {
     final path =
         session.path ??
+        CodeBuddyCatalog.findNativeSessionFile(session.id)?.path ??
         syncAntigravityTranscriptIfNeeded(
           cwd: session.cwd,
           sessionId: session.id,
         );
     if (path == null) return Future.value(const []);
+    if (CodeBuddyCatalog.isNativeCodeBuddyJsonl(path)) {
+      return CodeBuddyCatalog.readNative(path);
+    }
     return ClaudeSessions.read(path);
   }
 
@@ -80,11 +85,19 @@ class ClaudeStorage implements SessionCatalog, MovesSessions {
   }) {
     final path =
         session.path ??
+        CodeBuddyCatalog.findNativeSessionFile(session.id)?.path ??
         syncAntigravityTranscriptIfNeeded(
           cwd: session.cwd,
           sessionId: session.id,
         );
     if (path == null) return Future.value(const ClaudeHistoryPage([]));
+    if (CodeBuddyCatalog.isNativeCodeBuddyJsonl(path)) {
+      return CodeBuddyCatalog.readNativePage(
+        path,
+        turns: turns,
+        before: before,
+      );
+    }
     return ClaudeSessions.readPage(path, turns: turns, before: before);
   }
 

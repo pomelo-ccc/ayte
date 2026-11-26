@@ -160,6 +160,141 @@ void main() {
         expect(cmd['category'], 'builtin');
       }
     });
+
+    test('parses 2-tier thinkingLevelMap, fixed single-tier, and all-null edge cases', () {
+      // 2-tier thinkingLevelMap with boolean `reasoning: true` (DeepSeek-V4.1-Flash)
+      final twoTier = CodeBuddyModel.fromRawJson({
+        'id': 'deepseek-v4.1-flash',
+        'name': 'Deepseek-V4.1-Flash',
+        'reasoning': true,
+        'thinkingLevelMap': {
+          'minimal': null,
+          'low': null,
+          'medium': null,
+          'high': 'high',
+          'max': 'max',
+        },
+        'maxInputTokens': 1000000,
+      });
+      expect(twoTier.supportsReasoning, isTrue);
+      expect(twoTier.effortLevels, ['high', 'max']);
+      expect(twoTier.isReasoningFixed, isFalse);
+      expect(twoTier.initialEffort, 'high');
+      expect(twoTier.effortOptionLabel('high', 'High'), 'High');
+
+      // 1-tier fixed reasoning model degrades to a read-only indicator
+      final fixedTier = CodeBuddyModel.fromRawJson({
+        'id': 'fixed-reasoner',
+        'name': 'Fixed Reasoner',
+        'reasoning': true,
+        'thinkingLevelMap': {
+          'minimal': null,
+          'low': null,
+          'medium': null,
+          'high': 'high',
+          'max': null,
+        },
+      });
+      expect(fixedTier.effortLevels, ['high']);
+      expect(fixedTier.isReasoningFixed, isTrue);
+      expect(fixedTier.effortOptionLabel('high', 'High'), '固定 High（不支持调整）');
+
+      // All-null or off-only thinkingLevelMap never produces an empty/bogus menu
+      final allNull = CodeBuddyModel.fromRawJson({
+        'id': 'no-effort-map',
+        'name': 'No Effort Map',
+        'reasoning': true,
+        'thinkingLevelMap': {
+          'minimal': null,
+          'low': null,
+          'medium': null,
+          'high': null,
+          'max': null,
+        },
+      });
+      expect(allNull.effortLevels, isEmpty);
+      expect(allNull.isReasoningConfigurable, isFalse);
+
+      final offOnly = CodeBuddyModel.fromRawJson({
+        'id': 'off-only-map',
+        'name': 'Off Only',
+        'reasoning': true,
+        'thinkingLevelMap': {'off': 'off', 'low': null},
+      });
+      expect(offOnly.effortLevels, isEmpty);
+      expect(offOnly.isReasoningConfigurable, isFalse);
+    });
+
+    test('updateFromCliModels preserves known efforts when rawModels only reports reasoning.effort', () {
+      CodeBuddyModels.syncForRegion(CodeBuddyRegion.cn);
+      addTearDown(() => CodeBuddyModels.syncForRegion(CodeBuddyRegion.cn));
+
+      CodeBuddyModels.updateFromCliModels([
+        {
+          'id': 'deepseek-v4.1-flash',
+          'name': 'Deepseek-V4.1-Flash',
+          'supportsReasoning': true,
+          'onlyReasoning': true,
+          'reasoning': {'effort': 'high', 'summary': 'auto'},
+          'maxInputTokens': 1000000,
+        },
+        {
+          'id': 'glm-5.2',
+          'name': 'GLM-5.2',
+          'supportsReasoning': true,
+          'onlyReasoning': true,
+          'reasoning': {'effort': 'medium', 'summary': 'auto'},
+          'maxInputTokens': 1000000,
+        },
+        {
+          'id': 'custom-2tier',
+          'name': 'Custom 2-Tier',
+          'reasoning': true,
+          'thinkingLevelMap': {
+            'minimal': null,
+            'low': null,
+            'medium': null,
+            'high': 'high',
+            'max': 'max',
+          },
+        },
+      ]);
+
+      final ds = CodeBuddyModels.of('deepseek-v4.1-flash')!;
+      expect(ds.effortLevels, ['low', 'high', 'max']);
+      expect(ds.isReasoningFixed, isFalse);
+      expect(ds.initialEffort, 'high');
+
+      final glm52 = CodeBuddyModels.of('glm-5.2')!;
+      expect(glm52.effortLevels, ['medium']);
+      expect(glm52.isReasoningFixed, isTrue);
+
+      final custom2 = CodeBuddyModels.of('custom-2tier')!;
+      expect(custom2.effortLevels, ['high', 'max']);
+      expect(custom2.isReasoningFixed, isFalse);
+
+      // Kernel effort options mark fixed models as readOnly and keep 2-tier selectable.
+      final kernel = ClaudeCodeKernel(
+        KernelRegistry.codebuddy,
+        const KernelContext(cwd: '.'),
+        start: (_) => Completer<ClaudeCodeTransport>().future,
+      );
+      addTearDown(kernel.dispose);
+
+      final twoTierOptions = kernel.effort.optionsFor(
+        '@$codebuddyBuiltinProviderId/custom-2tier',
+      );
+      expect(twoTierOptions.map((o) => o.id).toList(), ['high', 'max']);
+      expect(twoTierOptions.every((o) => !o.readOnly), isTrue);
+
+      final fixedOptions = kernel.effort.optionsFor(
+        '@$codebuddyBuiltinProviderId/glm-5.2',
+      );
+      expect(fixedOptions, hasLength(1));
+      expect(fixedOptions.single.id, 'medium');
+      expect(fixedOptions.single.readOnly, isTrue);
+      expect(fixedOptions.single.label, '固定 Medium（不支持调整）');
+    });
   });
 
   group('CodeBuddyTransport.buildArguments', () {
