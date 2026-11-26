@@ -316,6 +316,16 @@ class CanvasNode {
     },
   };
 
+  /// Normalizes a node timeout: approval gates allow `0` (wait indefinitely)
+  /// or `10..86400s`, while automated nodes clamp to `10..3600s`.
+  static int normalizeTimeout(CanvasNodeKind kind, int? raw) {
+    if (kind == CanvasNodeKind.approval) {
+      if (raw == null || raw <= 0) return 0;
+      return raw.clamp(10, 86400);
+    }
+    return (raw ?? 600).clamp(10, 3600);
+  }
+
   static CanvasNode? fromJson(Object? raw, {bool includeRuntime = false}) {
     if (raw is! Map) return null;
     final id = raw['id'] as String?;
@@ -342,9 +352,9 @@ class CanvasNode {
       httpUrl: raw['httpUrl'] as String? ?? '',
       httpHeaders: raw['httpHeaders'] as String? ?? '',
       conditionExpr: raw['conditionExpr'] as String? ?? 'notContains:FAIL',
-      timeoutSeconds: ((raw['timeoutSeconds'] as num?)?.toInt() ?? 600).clamp(
-        10,
-        3600,
+      timeoutSeconds: normalizeTimeout(
+        kind,
+        (raw['timeoutSeconds'] as num?)?.toInt(),
       ),
       maxRetries: ((raw['maxRetries'] as num?)?.toInt() ?? 0).clamp(0, 5),
       retryDelaySeconds:
@@ -1715,7 +1725,7 @@ class CanvasController extends ChangeNotifier {
     String httpUrl = '',
     String httpHeaders = '',
     String conditionExpr = 'notContains:FAIL',
-    int timeoutSeconds = 600,
+    int? timeoutSeconds,
     int maxRetries = 0,
     int retryDelaySeconds = 2,
     bool recoversFailure = false,
@@ -1750,7 +1760,7 @@ class CanvasController extends ChangeNotifier {
       httpUrl: httpUrl,
       httpHeaders: httpHeaders,
       conditionExpr: conditionExpr,
-      timeoutSeconds: timeoutSeconds,
+      timeoutSeconds: CanvasNode.normalizeTimeout(kind, timeoutSeconds),
       maxRetries: maxRetries,
       retryDelaySeconds: retryDelaySeconds,
       recoversFailure: recoversFailure,
@@ -2054,7 +2064,10 @@ class CanvasController extends ChangeNotifier {
         if (httpHeaders != null) n.httpHeaders = httpHeaders;
         if (conditionExpr != null) n.conditionExpr = conditionExpr;
         if (timeoutSeconds != null) {
-          n.timeoutSeconds = timeoutSeconds.clamp(10, 3600);
+          n.timeoutSeconds = CanvasNode.normalizeTimeout(
+            n.kind,
+            timeoutSeconds,
+          );
         }
         if (maxRetries != null) n.maxRetries = maxRetries.clamp(0, 5);
         if (retryDelaySeconds != null) {
@@ -3000,16 +3013,17 @@ echo "3) 解决后直接点击顶部「从失败节点续跑」，无需从头�
         x: 48,
         y: 84,
         width: 285,
-        height: 195,
+        height: 205,
         colorValue: CanvasNodeKind.trigger.defaultColorValue,
         refId: root,
         content:
-            'bugsUrl=http://pomeloc.top/bugs/\n'
-            'filterStatus=待排(ASSIGN),程序修改中(PR),重新打开(REOPENED)\n'
+            'bugsUrl=https://pomeloc.top/bugs/\n'
+            'bugId=\n'
+            'filterStatus=REOPENED,PR,ASSIGN,NEW\n'
             'filterAssignee=当前视角账号\n'
             'filterModule=全部\n'
             'filterSeverity=全部\n'
-            'pickRule=优先高优先级且未做本地排查的第一条\n'
+            'pickRule=优先未做本地排查、按 REOPENED>PR>ASSIGN>NEW 且严重程度最高的第一条\n'
             'backendOwner=林泽世 (linzsb)\n'
             'root=$root\n'
             'evidenceDir=$evidenceDir\n'
@@ -3029,15 +3043,21 @@ echo "3) 解决后直接点击顶部「从失败节点续跑」，无需从头�
         colorValue: CanvasNodeKind.agent.defaultColorValue,
         agentId: '',
         refId: root,
+        timeoutSeconds: 900,
         content:
-            '请主动打开问题单平台 {{input.bugsUrl}}（不要等待人工输入单号！）：\n'
-            '1. 【自动筛选选单】按筛选条件勾选：状态={{input.filterStatus}}、处理人={{input.filterAssignee}}、模块={{input.filterModule}}、严重程度={{input.filterSeverity}}；按规则「{{input.pickRule}}」自动选中 1 条待处理问题单，读取其单号、标题、正文、富文本截图、单据附件/视频与历史流转记录。\n'
-            '2. 【结合代码初判】在 {{input.root}} 中定位对应组件/接口/调用链，核实是否前端问题。\n'
-            '3. 【本地状态同步与建档】在 {{input.bugsUrl}} 将该单「本地排查结论」标记为 ROOT_CAUSE（已定位）或 BLOCKED（描述不足/待补）；并在 {{input.evidenceDir}}/<BUG_ID>/ 创建 trace.md，记录拉单时间、原单链接、筛选条件、附件清单与初判结论。\n'
-            '4. 【结构化输出】首行必须包含 BUG_ID: <单号>，随后清晰输出：\n'
-            '   - 清晰重述（若原单描述含糊，用 2~3 句说清「实际现象 / 期望结果 / 复现路径」）\n'
-            '   - 归属判断（前端精确到 lc/ng-bc-dpp/pdm/ppm/umc 文件，还是后端需转 {{input.backendOwner}}，还是需求/数据问题）\n'
-            '   - 建议决策与需人工确认的疑问点。',
+            '请通过问题单平台 {{input.bugsUrl}} 的直连 REST API 拉取并研判问题单（无头模式下**禁止**尝试打开交互浏览器或 Tabbit 抓 DOM；访问 pomeloc.top 时务必绕过本地代理，直接用 `curl -sSL --noproxy \'*\' -m 90` 或 Python `ProxyHandler({})` 且超时 ≥ 90s（冷缓存 TTFB 约 30~45s，切勿用小于 60s 的超时），基础前缀 `API="https://pomeloc.top/bugs/api"`）：\n'
+            '1. 【自动筛选选单】调用 `GET \${API}/bugs`（返回 `{meta:{currentUser:{id,name}}, bugs:[...]}`）：\n'
+            '   - 若指定了单号 `{{input.bugId ?? \'\'}}`（非空），直接定位该 `key`；\n'
+            '   - 否则按条件筛选：`status.code`/`status.label` 匹配 `{{input.filterStatus}}`、处理人 `assignee` 匹配 `{{input.filterAssignee}}`（`当前视角账号` 即 `meta.currentUser.id/name`）、模块=`{{input.filterModule}}`、严重程度=`{{input.filterSeverity}}`；按规则「{{input.pickRule}}」选中 1 条待处理单（`analysis` 为空优先，`severity.rank` 越小优先级越高）。若接口不可达或 0 条命中，明确说明原因并直接输出 `VERDICT: FAIL`。\n'
+            '2. 【读取完整详情与附件】调用 `GET \${API}/instance/detail?guid=<guid>&className=<className>` 获取完整正文、历史回复 `replies`、`files`、`inlineImages`、`classGuid` 与 `commitFolder`。若有图片附件或内嵌图，可下载到 `{{input.evidenceDir}}/<BUG_ID>/attachments/` 并用看图工具核实。\n'
+            '3. 【结合代码初判】在 `{{input.root}}` 内按目标模块精确检索具体子仓 `src`/`projects`（遵循 AGENTS.md，禁止无过滤扫全仓），定位对应组件/服务/接口，核实是否前端问题。\n'
+            '4. 【本地状态同步与建档】调用 `POST \${API}/analysis/state`（JSON `{"key":"<BUG_ID>","state":"ROOT_CAUSE"}` 或 `"BLOCKED"`）同步本地排查结论；并在 `{{input.evidenceDir}}/<BUG_ID>/trace.md` 记录拉单时间、原单链接、GUID、筛选条件、附件清单与初判结论。\n'
+            '5. 【严格结构化输出】开头必须单独成行输出：\n'
+            '   BUG_ID: <单号>\n'
+            '   BUG_GUID: <guid>\n'
+            '   BUG_TITLE: <单据标题>\n'
+            '   BUG_URL: <原单链接>\n'
+            '   随后清晰输出：清晰重述（实际现象 / 期望结果 / 复现路径）、归属判断（精确到 lc/ng-bc-dpp/pdm/ppm/umc 具体文件，或后端转 {{input.backendOwner}}，或需求/数据问题）、建议决策、疑问点及 `trace.md` 绝对路径，末行必须单独输出 `VERDICT: PASS` 或 `VERDICT: FAIL`。',
       ),
       CanvasNode(
         id: 'step_triage_gate',
@@ -3048,11 +3068,12 @@ echo "3) 解决后直接点击顶部「从失败节点续跑」，无需从头�
         width: 295,
         height: 195,
         colorValue: CanvasNodeKind.approval.defaultColorValue,
+        timeoutSeconds: 0,
         content:
-            '请审阅 AI 自动筛选拉取的问题单与清晰化研判：\n'
+            '请审阅 AI 自动筛选拉取的问题单（{{bug.id ?? 待识别}}）与清晰化研判：\n'
             '• 确认由前端修改：可在下方补充修改要求或清晰描述后点「通过放行」（将自动置状态为 程序修改中 PR 并修复）。\n'
             '• 不需修改 / 转交后端 {{input.backendOwner}} / 描述不清需退回补充：填写意见后点「驳回」（将自动更新平台状态并写入回复，不改动代码）。\n\n'
-            '{{prev.output}}',
+            '{{step_triage.output ?? prev.output}}',
       ),
       CanvasNode(
         id: 'step_mark_pr',
@@ -3066,10 +3087,13 @@ echo "3) 解决后直接点击顶部「从失败节点续跑」，无需从头�
         agentId: '',
         refId: root,
         content:
-            '基于上游研判上下文（{{prev.output}}）中的 BUG_ID，以及人工决策意见（{{approval.note}}）：\n'
-            '1. 在 {{input.bugsUrl}} 打开该问题单，执行「修改 PLM 状态与流转」→ 选择【修改 (PR) / 程序修改中(PR)】，处理人保持当前视角账号，并附简明流转说明（含根因摘要与开始修复时间）。\n'
-            '2. 在 {{input.evidenceDir}}/<BUG_ID>/trace.md 中追加一条状态变更审计记录（时间 · 原状态 → 程序修改中(PR) · 人工决策备注）。\n'
-            '3. 输出 BUG_ID、状态更新结果与 trace.md 路径，结尾输出 VERDICT: PASS 或 VERDICT: FAIL。',
+            '目标单号：{{bug.id ?? 请从上游提取}}（GUID: {{bug.guid ?? 请从上游提取}}）\n'
+            '人工决策意见：{{step_triage_gate.note ?? 无}}\n\n'
+            '上游研判摘要：\n{{step_triage.output ?? prev.output}}\n\n'
+            '请通过 {{input.bugsUrl}} REST API 完成状态同步（访问 pomeloc.top 务必 `--noproxy \'*\'` / 绕过代理，基础前缀 `API="https://pomeloc.top/bugs/api"`）：\n'
+            '1. 若该单当前状态还不是 `PR`（程序修改中），调用 `POST \${API}/quick-reply`（JSON `{"action":"fix","items":[{"guid":"<BUG_GUID>","className":"BugInner","key":"<BUG_ID>"}]}`）将状态置为「程序修改中(PR)」；若返回未登录/401，先用 `RD-ENV.md` 中的 Keychain 密码（`security find-generic-password -a chenlonga -s rd-plm -w`）调用 `POST \${API}/plm/operator`（`{"userId":"chenlonga","password":"..."}`）携带 Cookie 后重试；若当前已是 `PR` 则记录「原态已为 PR，无需重复流转」。\n'
+            '2. 在 `{{input.evidenceDir}}/{{bug.id}}/trace.md` 追加一条状态变更审计记录（时间 · 原状态 → 程序修改中(PR) · 人工决策备注）。\n'
+            '3. 输出 `BUG_ID: {{bug.id}}`、状态更新结果与 `trace.md` 绝对路径，末行单独输出 `VERDICT: PASS` 或 `VERDICT: FAIL`。',
       ),
       CanvasNode(
         id: 'step_fix_code',
@@ -3082,14 +3106,20 @@ echo "3) 解决后直接点击顶部「从失败节点续跑」，无需从头�
         colorValue: CanvasNodeKind.agent.defaultColorValue,
         agentId: '',
         refId: root,
+        timeoutSeconds: 900,
         content:
-            '上游单据与研判上下文：{{prev.output}}\n'
-            '人工决策与补充说明：{{approval.note}}\n\n'
+            '目标单号：{{bug.id ?? 请从上游提取}}（GUID: {{bug.guid ?? \'\'}}）\n'
+            '人工决策与补充说明：{{step_triage_gate.note ?? 无}}\n\n'
+            '【完整研判上下文】\n{{step_triage.output ?? prev.output}}\n\n'
+            '【PR 状态同步结果】\n{{step_mark_pr.output ?? 无}}\n\n'
             '请在 {{input.root}} 中执行：\n'
-            '1. 按最小化精准原则修复前端代码，仅对修改文件运行 lint/单测校验。\n'
-            '2. 【留痕可溯源】将本次修改的 `git diff` 保存到 {{input.evidenceDir}}/<BUG_ID>/git.diff，并在 trace.md 记录修改仓库、文件清单、核心变更摘要与单测结果。\n'
-            '3. 【同步本地排查状态】在 {{input.bugsUrl}} 将该单本地排查结论更新为 MODIFIED_LOCAL（本地已修改待验证）。\n'
-            '4. 结尾必须输出 BUG_ID、修改清单、diff 路径及 VERDICT: PASS 或 VERDICT: FAIL。',
+            '1. 按最小化精准原则修复前端代码（仅修改与本单直接相关的文件，严禁碰其他无关未提交改动），仅对修改文件运行 lint/单测校验。\n'
+            '2. 【留痕可溯源】仅导出本次改动文件的 `git diff` 保存到 `{{input.evidenceDir}}/{{bug.id}}/git.diff`，并在 `{{input.evidenceDir}}/{{bug.id}}/trace.md` 记录修改仓库、文件清单、核心变更摘要与单测结果。\n'
+            '3. 【同步本地排查状态】通过 `POST https://pomeloc.top/bugs/api/analysis/state`（`--noproxy \'*\'`，JSON `{"key":"{{bug.id}}","state":"MODIFIED_LOCAL"}`）更新本地排查状态。\n'
+            '4. 结尾必须单独成行输出：\n'
+            '   BUG_ID: {{bug.id}}\n'
+            '   CHANGED_REPOS: <空格分隔的本次改动仓库名，如 pdm 或 lc ng-bc-dpp pdm>\n'
+            '   以及修改文件清单、diff 绝对路径，末行单独输出 `VERDICT: PASS` 或 `VERDICT: FAIL`。',
       ),
       CanvasNode(
         id: 'step_rebuild_local',
@@ -3102,24 +3132,48 @@ echo "3) 解决后直接点击顶部「从失败节点续跑」，无需从头�
         colorValue: CanvasNodeKind.command.defaultColorValue,
         refId: root,
         content: '''ROOT="{{input.root}}"
-if [ -n "\$(git -C "\$ROOT/lc" status --short 2>/dev/null)" ]; then
-  (cd "\$ROOT/lc" && node projects/ng-lc-dpp/dpp-table/scripts/build-grid-styles.mjs && ./node_modules/.bin/ng build ng-lc-dpp-lib) || exit 1
-  rm -rf "\$ROOT/ng-bc-dpp/node_modules/ng-lc-dpp" && cp -R "\$ROOT/lc/dist/ng-lc-dpp" "\$ROOT/ng-bc-dpp/node_modules/ng-lc-dpp"
+CHANGED="\${AYTE_FIX_REPOS:-}"
+NEED_LC=0
+NEED_BC=0
+if [ -n "\$CHANGED" ]; then
+  case " \$CHANGED " in *" lc "*) NEED_LC=1 ;; esac
+  case " \$CHANGED " in *" ng-bc-dpp "*) NEED_BC=1 ;; esac
+else
+  [ -n "\$(git -C "\$ROOT/lc" status --short 2>/dev/null)" ] && NEED_LC=1
+  [ -n "\$(git -C "\$ROOT/ng-bc-dpp" status --short 2>/dev/null)" ] && NEED_BC=1
 fi
-if [ -n "\$(git -C "\$ROOT/ng-bc-dpp" status --short 2>/dev/null)" ] || [ -n "\$(git -C "\$ROOT/lc" status --short 2>/dev/null)" ]; then
+echo "BUG_ID: {{bug.id ?? ''}}"
+echo "本次检测改动仓库: \${CHANGED:-auto} (NEED_LC=\$NEED_LC, NEED_BC=\$NEED_BC)"
+if [ "\$NEED_LC" = "1" ]; then
+  (cd "\$ROOT/lc" && node projects/ng-lc-dpp/dpp-table/scripts/build-grid-styles.mjs && ./node_modules/.bin/ng build ng-lc-dpp-lib) || exit 1
+  rm -rf "\$ROOT/ng-bc-dpp/node_modules/ng-lc-dpp" && cp -R "\$ROOT/lc/dist/ng-lc-dpp" "\$ROOT/ng-bc-dpp/node_modules/ng-lc-dpp" || exit 1
+fi
+if [ "\$NEED_LC" = "1" ] || [ "\$NEED_BC" = "1" ]; then
   (cd "\$ROOT/ng-bc-dpp" && ./node_modules/.bin/ng build ng-bc-dpp) || exit 1
   for app in pdm umc ppm; do
-    rm -rf "\$ROOT/\$app/node_modules/ng-lc-dpp" "\$ROOT/\$app/node_modules/ng-bc-dpp" "\$ROOT/\$app/.angular/cache" "\$ROOT/\$app/node_modules/.cache"
-    cp -R "\$ROOT/lc/dist/ng-lc-dpp" "\$ROOT/\$app/node_modules/ng-lc-dpp"
-    cp -R "\$ROOT/ng-bc-dpp/dist/ng-bc-dpp" "\$ROOT/\$app/node_modules/ng-bc-dpp"
+    [ -d "\$ROOT/\$app" ] || continue
+    rm -rf "\$ROOT/\$app/node_modules/ng-bc-dpp" "\$ROOT/\$app/.angular/cache" "\$ROOT/\$app/node_modules/.cache"
+    cp -R "\$ROOT/ng-bc-dpp/dist/ng-bc-dpp" "\$ROOT/\$app/node_modules/ng-bc-dpp" || exit 1
+    if [ "\$NEED_LC" = "1" ] && [ -d "\$ROOT/lc/dist/ng-lc-dpp" ]; then
+      rm -rf "\$ROOT/\$app/node_modules/ng-lc-dpp"
+      cp -R "\$ROOT/lc/dist/ng-lc-dpp" "\$ROOT/\$app/node_modules/ng-lc-dpp" || exit 1
+    fi
   done
   if tmux has-session -t plm 2>/dev/null; then
-    tmux send-keys -t plm:pdm C-c; sleep 1
+    tmux send-keys -t plm:pdm C-c
+    tmux send-keys -t plm:umc C-c 2>/dev/null || true
+    tmux send-keys -t plm:ppm C-c 2>/dev/null || true
+    sleep 2
     tmux send-keys -t plm:pdm "./node_modules/.bin/ng serve --host=0.0.0.0 --allowed-hosts=all --port 4200 2>&1 | tee /tmp/plm-pdm.log" Enter
+    tmux send-keys -t plm:umc "./node_modules/.bin/ng serve --hmr --port=4203 --host=0.0.0.0 --allowed-hosts=all 2>&1 | tee /tmp/plm-umc.log" Enter 2>/dev/null || true
+    tmux send-keys -t plm:ppm "./node_modules/.bin/ng serve --port 4205 --host=0.0.0.0 --allowed-hosts=all 2>&1 | tee /tmp/plm-ppm.log" Enter 2>/dev/null || true
+    sleep 3
   fi
+else
+  echo "⏭ 未改动 lc/ng-bc-dpp，按并发安全规范复用现有本地服务（不重启 ng serve）。"
 fi
-for i in \$(seq 1 30); do
-  code=\$(curl -s -o /dev/null -w "%{http_code}" "{{input.localUrl}}/")
+for i in \$(seq 1 90); do
+  code=\$(curl -s -m 3 -o /dev/null -w "%{http_code}" "{{input.localUrl}}/")
   if [ "\$code" = "200" ]; then
     echo "✅ 本地 4200 已就绪 (HTTP 200)"
     exit 0
@@ -3141,10 +3195,15 @@ exit 1''',
         agentId: '',
         refId: root,
         content:
-            '在本地 {{input.localUrl}} 按真实复现路径验证上游问题单（使用 admin/super 一步秒登规范，严禁死循环登录，满 15 步立即熔断交人工）：\n'
-            '1. 【截图 + 视频双留证】使用 Playwright（开启 `recordVideo`）执行完整操作回归，将关键结果截图保存为 `{{input.evidenceDir}}/<BUG_ID>/local-4200-after.png`，完整操作录屏保存为 `{{input.evidenceDir}}/<BUG_ID>/local-4200-verify.webm`（或 `.mp4`），并检查浏览器 Console/Network 无新增报错。\n'
-            '2. 【同步状态与溯源】在 {{input.bugsUrl}} 将该单本地排查结论更新为 FIXED_WS（本地已修复并验证通过），并在 `trace.md` 追加验证时间、截图与视频绝对路径。\n'
-            '3. 结尾输出截图/视频绝对路径与 VERDICT: PASS 或 VERDICT: FAIL。',
+            '目标单号：{{bug.id ?? 请从上游提取}}\n\n'
+            '【原单与复现路径】\n{{step_triage.output ?? 无}}\n\n'
+            '【本次代码修复摘要】\n{{step_fix_code.output ?? 无}}\n\n'
+            '请在本地 `{{input.localUrl}}` 按真实复现路径验证本问题单（严格遵守 15 步浏览器操作熔断，若缺数据或连续 2 次登录失败立即停下汇报）：\n'
+            '1. 【截图 + 视频双留证】本机已安装 Python Playwright（`python3` + `from playwright.sync_api import sync_playwright`，不要用未本地安装的 Node `require("playwright")`）。编写临时脚本开启 `record_video_dir`：\n'
+            '   - 登录规范（PLM Angular Reactive Form）：若跳到 4201/SSO 登录页，用 `page.evaluate` 通过 `Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set` 设置 `#myNameInput`=`admin`、`#myPasswordInput`=`super` 并触发 `input` 事件，点击「登入」后轮询 500~1500ms，如弹出「讯息」保密提示框则点击「确认」。\n'
+            '   - 回归验证并保存关键结果截图 `{{input.evidenceDir}}/{{bug.id}}/local-4200-after.png` 与完整操作录屏 `{{input.evidenceDir}}/{{bug.id}}/local-4200-verify.webm`，检查 Console/Network 无新增报错。\n'
+            '2. 【同步状态与溯源】通过 `POST https://pomeloc.top/bugs/api/analysis/state`（`--noproxy \'*\'`，JSON `{"key":"{{bug.id}}","state":"FIXED_WS"}`）更新本地排查状态，并在 `{{input.evidenceDir}}/{{bug.id}}/trace.md` 追加验证时间、截图与视频绝对路径。\n'
+            '3. 输出 `BUG_ID: {{bug.id}}`、截图/视频绝对路径，末行单独输出 `VERDICT: PASS` 或 `VERDICT: FAIL`。',
       ),
       CanvasNode(
         id: 'step_deploy_69_gate',
@@ -3155,10 +3214,11 @@ exit 1''',
         width: 290,
         height: 190,
         colorValue: CanvasNodeKind.approval.defaultColorValue,
+        timeoutSeconds: 0,
         content:
-            '本地 4200 验证已通过并已生成截图与录屏留证！\n'
-            '请点击下方按钮打开留证目录核对 `local-4200-after.png`、`local-4200-verify.webm` 和 `git.diff`，确认代码已提交推送至 {{input.branch}} 后点击「通过放行」触发 Jenkins 69-sts 部署：\n\n'
-            '{{prev.output}}',
+            '问题单 {{bug.id ?? ""}} 本地 4200 验证已通过并已生成截图与录屏留证！\n'
+            '请点击下方按钮打开留证目录核对 `local-4200-after.png`、`local-4200-verify.webm` 和 `git.diff`，确认代码已提交推送至 {{input.branch}} 后点击「通过放行」触发 Jenkins 69-sts 部署（若无需重发 LC/BC 可在意见中写「跳过LC和BC」）：\n\n'
+            '{{step_local_verify.output ?? prev.output}}',
       ),
       CanvasNode(
         id: 'step_69_deploy_verify',
@@ -3171,16 +3231,21 @@ exit 1''',
         colorValue: CanvasNodeKind.agent.defaultColorValue,
         agentId: '',
         refId: root,
+        timeoutSeconds: 1800,
         content:
+            '目标单号：{{bug.id ?? 请从上游提取}}\n'
+            '本次改动仓库：{{fix.repos ?? 请核对 git 状态}}\n'
+            '人工部署意见：{{step_deploy_69_gate.note ?? 无}}\n\n'
+            '【本地修复与验证摘要】\n{{step_fix_code.output ?? 无}}\n\n{{step_local_verify.output ?? 无}}\n\n'
             '【严格按依赖顺序上 69，严禁虚报成功】\n'
-            '1. 确认所有改动仓库已推送到 origin/{{input.branch}}。\n'
-            '2. 按改动范围严格串行构建 Jenkins（http://172.16.100.122:4875）：\n'
-            '   - 若改动了 `lc`：先构建 `ng-lc-dpp`，变绿并核对 `http://172.16.100.122:4873/-/package/ng-lc-dpp/dist-tags` 的 `test5030` 版本号递增；\n'
-            '   - 若改动了 `lc` 或 `ng-bc-dpp`：再构建 `ng-bc-dpp`，变绿并核对 `http://172.16.100.122:4873/-/package/ng-bc-dpp/dist-tags` 的 `test5030` 版本号递增；\n'
-            '   - 最后打开 {{input.jenkinsUrl}}，填写 DEPLOY_BRANCH_NAME={{input.branch}}、DEPLOY_TARGET={{input.deployTarget}}、DEPLOY_SOURCE=frontEnd，**取消勾选 DUPLICATE_DEPLOY_CHECK**，触发新构建号并等待彻底变绿。\n'
-            '3. 在 69 环境复现验证该问题单，使用 Playwright 保存 69 验证截图 `{{input.evidenceDir}}/<BUG_ID>/env-69-after.png` 与完整操作视频 `{{input.evidenceDir}}/<BUG_ID>/env-69-verify.webm`。\n'
-            '4. 将 LC/BC 新版本号、Jenkins 构建号、Commit Hash、69 截图与视频绝对路径写入 `{{input.evidenceDir}}/<BUG_ID>/trace.md`。\n'
-            '5. 若任一步未真实触发（如未登录 Jenkins、构建未变绿或版本未更新）必须输出 VERDICT: FAIL；全部真实通过才输出 VERDICT: PASS。',
+            '1. 确认所有本次改动仓库已提交并推送到 `origin/{{input.branch}}`（记录最新 Commit Hash）。\n'
+            '2. 读取 `{{input.root}}/JENKINS-ENV.md` 获取 Jenkins Basic Auth 凭证，直接通过 Jenkins REST API（`curl -u <user>:<pass>` + `/crumbIssuer/api/json` + `/buildWithParameters`，绕过浏览器依赖）按改动范围严格串行构建 `http://172.16.100.122:4875`：\n'
+            '   - 若改动了 `lc` 且人工未跳过：先触发 `frontend-lc`（`feature%252Fangular-upgrade`），轮询至 `SUCCESS` 并核对 `http://172.16.100.122:4873/-/package/ng-lc-dpp/dist-tags` 的 `test5030` 版本递增；\n'
+            '   - 若改动了 `lc` 或 `ng-bc-dpp` 且人工未跳过：再触发 `frontend-bc`（`BUILD_LC_FIRST=false`），轮询至 `SUCCESS` 并核对 `ng-bc-dpp` 的 `test5030` 版本递增；\n'
+            '   - 最后触发目标业务应用（`frontend-pdm` 等，参数 `DEPLOY_TARGET={{input.deployTarget}}&BUILD_LC_FIRST=false&DUPLICATE_DEPLOY_CHECK=false`）或 `{{input.jenkinsUrl}}`，轮询等待构建号彻底 `SUCCESS`。\n'
+            '3. 使用 Python Playwright（`playwright.sync_api` + `record_video_dir`）在 69 环境（`http://172.16.100.69`）复现验证该问题单，保存 `{{input.evidenceDir}}/{{bug.id}}/env-69-after.png` 与 `{{input.evidenceDir}}/{{bug.id}}/env-69-verify.webm`。\n'
+            '4. 将 LC/BC 新版本号、Jenkins 构建号、Commit Hash、69 截图与视频绝对路径写入 `{{input.evidenceDir}}/{{bug.id}}/trace.md`。\n'
+            '5. 输出 `BUG_ID: {{bug.id}}`、构建号、Commit Hash 与留证路径；任一步未真实触发或未变绿必须末行单独输出 `VERDICT: FAIL`，全部真实通过才输出 `VERDICT: PASS`。',
       ),
       CanvasNode(
         id: 'step_human_confirm',
@@ -3191,15 +3256,16 @@ exit 1''',
         width: 290,
         height: 190,
         colorValue: CanvasNodeKind.approval.defaultColorValue,
+        timeoutSeconds: 0,
         content:
-            '69 环境已部署并完成复验！请核对 Jenkins 构建号及 `env-69-after.png` / `env-69-verify.webm`：\n'
-            '• 默认放行后将在 {{input.bugsUrl}} 更新为「开发已确认(PRCFMD)」（如需直接转测，可在下方意见点选「转交测试(QC)」）并附完整溯源说明与验证截图/视频。\n\n'
-            '{{prev.output}}',
+            '问题单 {{bug.id ?? ""}} 69 环境已部署并完成复验！请核对 Jenkins 构建号及 `env-69-after.png` / `env-69-verify.webm`：\n'
+            '• 默认放行后将在 {{input.bugsUrl}} 更新为「开发已确认(PRCFMD)」（如需直接转测，可在下方意见点选「转交测试(QC)」）并写入完整溯源说明。\n\n'
+            '{{step_69_deploy_verify.output ?? prev.output}}',
       ),
       CanvasNode(
         id: 'step_update_bug',
         kind: CanvasNodeKind.agent,
-        title: '11. 改 PLM 状态 + 附验证图文视频 + 归档',
+        title: '11. 改 PLM 状态 + 溯源回复 + 归档',
         x: 3548,
         y: 84,
         width: 295,
@@ -3208,15 +3274,17 @@ exit 1''',
         agentId: '',
         refId: root,
         content:
-            '请打开 {{input.bugsUrl}} 定位本次处理的 BUG_ID，完成最终闭环交付：\n'
-            '1. 【上传/附加验证留证】将 {{input.evidenceDir}}/<BUG_ID>/ 中的 69/本地验证截图与录屏视频上传到回复/附件区（若接口不支持大视频则上传关键帧截图并附上本地留证归档路径）。\n'
-            '2. 【写入可溯源回复】填写结构化交付说明：\n'
-            '   - 根因定位与修复范围（精确到仓库/文件与 Git Commit Hash）\n'
-            '   - Jenkins 69-sts 构建号与部署分支\n'
-            '   - 本地 4200 & 69 验证结果及留证文件清单（图片/视频/trace.md）\n'
-            '   - 人工补充意见：{{approval.note}}\n'
-            '3. 【变更 PLM 最终状态】若人工意见包含「转交测试/QC」则流转为【测试验证中(QC) → 提出人】，否则流转为【开发已确认(PRCFMD)】。\n'
-            '4. 【归档审计日志】在 `trace.md` 末尾写入最终状态变更时间与 DELIVERED 标记，确保全流程 100% 可溯源。',
+            '目标单号：{{bug.id ?? 请从上游提取}}（GUID: {{bug.guid ?? 请从上游提取}}）\n'
+            '人工终审意见：{{step_human_confirm.note ?? 无}}\n\n'
+            '【研判 / 修复 / 本地与 69 验证上下文】\n'
+            '{{step_fix_code.output ?? 无}}\n\n'
+            '{{step_69_deploy_verify.output ?? prev.output}}\n\n'
+            '请通过 {{input.bugsUrl}} REST API 完成最终闭环交付（访问 pomeloc.top 务必 `--noproxy \'*\'` / 绕过代理，基础前缀 `API="https://pomeloc.top/bugs/api"`）：\n'
+            '1. 调用 `GET \${API}/plm/meta` 与 `GET \${API}/instance/detail?guid={{bug.guid}}&className=BugInner` 获取 `classGuid`、`commitFolder`、`templateName` 及目标状态/处理人 GUID（若人工意见包含「转交测试/QC」则流转为 `QC` → 提单人，否则流转为 `PRCFMD` → 当前用户）。\n'
+            '2. 组装结构化溯源回复 `REPLYTO`：包含根因与修复范围（仓库/文件/Git Commit Hash）、Jenkins 69-sts 构建号与部署分支、本地 4200 & 69 验证结果、本地截图/视频/trace.md 归档路径以及人工补充意见。\n'
+            '3. 调用 `POST \${API}/instance/reply`（若返回 401/需登录则先用 Keychain `security find-generic-password -a chenlonga -s rd-plm -w` 登录 `POST \${API}/plm/operator` 后携带 Cookie 重试）；同步 `POST \${API}/analysis/state` 为 `FIXED_WS`。\n'
+            '4. 在 `{{input.evidenceDir}}/{{bug.id}}/trace.md` 末尾写入最终状态变更时间与 `DELIVERED` 标记。\n'
+            '5. 末行必须单独输出 `VERDICT: PASS`（PLM 真实回写成功）或 `VERDICT: FAIL`。',
       ),
       CanvasNode(
         id: 'step_reject_reply',
@@ -3229,14 +3297,17 @@ exit 1''',
         colorValue: 0xFFE5534B,
         agentId: '',
         refId: root,
+        recoversFailure: true,
         content:
-            '问题单经人工研判不在前端修改（人工决策意见：{{approval.note}}）。\n'
-            '上游研判上下文：{{prev.output}}\n\n'
-            '请打开 {{input.bugsUrl}} 执行对应流转与留痕：\n'
-            '1. 若需转后端：点击【转交后端】（保持原状态，转至 {{input.backendOwner}}）并附上清晰的前端排查证据与后端排查线索；\n'
-            '2. 若描述不清需退回补充：本地状态标记为 BLOCKED，并生成清晰、礼貌的补充清单回复提单人；\n'
-            '3. 若确认无需修改：本地状态标记为 NO_CHANGE 并写明依据；\n'
-            '4. 将最终状态流转与回复内容同步记录到 {{input.evidenceDir}}/<BUG_ID>/trace.md 备查。',
+            '目标单号：{{bug.id ?? 请从上游提取}}（GUID: {{bug.guid ?? 请从上游提取}}）\n'
+            '人工决策意见：{{step_triage_gate.note ?? 无}}\n\n'
+            '【上游研判上下文】\n{{step_triage.output ?? prev.output}}\n\n'
+            '问题单经人工研判不在前端修改，请通过 {{input.bugsUrl}} REST API 执行对应流转与留痕（访问 pomeloc.top 务必 `--noproxy \'*\'` / 绕过代理，基础前缀 `API="https://pomeloc.top/bugs/api"`；PLM 写接口若需登录则先用 Keychain `rd-plm` 调 `POST \${API}/plm/operator`）：\n'
+            '1. 若人工意见需转后端：调用 `POST \${API}/quick-reply`（`action: "backend"`）或 `POST \${API}/instance/reply`（保持原状态、转至 {{input.backendOwner}} 并附前端排查证据与后端线索），同时标记本地状态 `NO_CHANGE`；\n'
+            '2. 若描述不清需退回补充：调用 `POST \${API}/analysis/state` 标记为 `BLOCKED`，并调用 `POST \${API}/remarks`（及按需 `/instance/reply`）写入清晰的补充清单；\n'
+            '3. 若确认无需修改：调用 `POST \${API}/analysis/state` 标记为 `NO_CHANGE` 并写明依据到 `/remarks`；\n'
+            '4. 将最终状态流转与回复内容同步记录到 `{{input.evidenceDir}}/{{bug.id}}/trace.md` 备查。\n'
+            '5. 末行必须单独输出 `VERDICT: PASS` 或 `VERDICT: FAIL`。',
       ),
       CanvasNode(
         id: 'step_fail_report',
@@ -3249,7 +3320,8 @@ exit 1''',
         colorValue: 0xFFE5534B,
         refId: root,
         content:
-            'echo "[硬门禁阻断] 流程在构建/部署/验证阶段未通过，已终止后续流转，绝不将 PLM 状态改为开发已确认或转测。排查与留证目录：{{input.evidenceDir}}"',
+            'echo "[硬门禁阻断] 问题单 {{bug.id ?? 未定单}} 在构建/部署/验证阶段未通过，已终止后续流转，绝不将 PLM 状态改为开发已确认或转测。"\n'
+            'echo "排查与留证目录：{{input.evidenceDir}}/{{bug.id ?? \'\'}}"',
       ),
     ];
     const edges = [
@@ -3864,6 +3936,7 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
         expr = expr.substring(0, pipeIdx).trim();
       }
       String? fallback;
+      var fallbackQuoted = false;
       final fbIdx = expr.indexOf('??');
       if (fbIdx > 0) {
         fallback = expr.substring(fbIdx + 2).trim();
@@ -3871,14 +3944,21 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
             ((fallback.startsWith("'") && fallback.endsWith("'")) ||
                 (fallback.startsWith('"') && fallback.endsWith('"')))) {
           fallback = fallback.substring(1, fallback.length - 1);
+          fallbackQuoted = true;
         }
         expr = expr.substring(0, fbIdx).trim();
       }
       final rawVal = vars[expr];
+      final resolvedFallback = (!fallbackQuoted &&
+              fallback != null &&
+              vars[fallback] != null &&
+              vars[fallback]!.isNotEmpty)
+          ? vars[fallback]
+          : fallback;
       final value = (rawVal != null && rawVal.isNotEmpty)
           ? rawVal
-          : (fallback ?? (rawVal ?? m.group(0)!));
-      if (rawVal == null && fallback == null) {
+          : (resolvedFallback ?? (rawVal ?? m.group(0)!));
+      if (rawVal == null && resolvedFallback == null) {
         return value;
       }
       return switch (filter) {
@@ -3919,8 +3999,14 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
     return result;
   }
 
-  /// Finds the configured `evidenceDir` from any Trigger node in [nodes].
-  static String? resolveEvidenceDirFromNodes(List<CanvasNode> nodes) {
+  /// Finds the configured `evidenceDir` from runtime captured inputs first,
+  /// falling back to any Trigger node in [nodes].
+  static String? resolveEvidenceDirFromNodes(
+    List<CanvasNode> nodes, {
+    Map<String, String> capturedVars = const {},
+  }) {
+    final runtimeDir = capturedVars['input.evidenceDir']?.trim();
+    if (runtimeDir != null && runtimeDir.isNotEmpty) return runtimeDir;
     for (final n in nodes) {
       if (n.kind == CanvasNodeKind.trigger) {
         final pairs = parseKeyValueLines(n.content);
@@ -3929,6 +4015,87 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
       }
     }
     return null;
+  }
+
+  /// Extracts well-known structured key-value outputs emitted by Agent/Command
+  /// nodes (such as `BUG_ID: I2611000627`, `BUG_GUID: ...`, `CHANGED_REPOS: ...`)
+  /// so downstream nodes can reference `{{bug.id}}`, `{{bug.guid}}`,
+  /// `{{fix.repos}}`, etc. reliably across intermediate steps.
+  static Map<String, String> extractOutputVariables(String output) {
+    if (output.trim().isEmpty) return const {};
+    const keyMap = <String, List<String>>{
+      'BUG_ID': ['bug.id', 'bugId'],
+      'BUG_GUID': ['bug.guid'],
+      'BUG_TITLE': ['bug.title'],
+      'BUG_URL': ['bug.url'],
+      'CHANGED_REPOS': ['fix.repos'],
+    };
+    final result = <String, String>{};
+    final lineRe = RegExp(
+      r'''^\s*(?:[-*•>]\s*)?[*`]*([A-Z][A-Z0-9_]{2,24})[*`]*\s*[:：]\s*(.+?)\s*$''',
+    );
+    for (final rawLine in const LineSplitter().convert(output)) {
+      final m = lineRe.firstMatch(rawLine);
+      if (m == null) continue;
+      final key = m.group(1)!.toUpperCase();
+      final targets = keyMap[key];
+      if (targets == null) continue;
+      var val = m.group(2)!.trim();
+      // Strip symmetric markdown emphasis/backticks wrapping the value.
+      while (val.length >= 2 &&
+          ((val.startsWith('**') && val.endsWith('**')) ||
+              (val.startsWith('`') && val.endsWith('`')))) {
+        val = val.startsWith('**')
+            ? val.substring(2, val.length - 2).trim()
+            : val.substring(1, val.length - 1).trim();
+      }
+      if (val.isEmpty ||
+          val == '无' ||
+          val == '待定' ||
+          val.startsWith('<') && val.endsWith('>')) {
+        continue;
+      }
+      for (final target in targets) {
+        result[target] = val;
+      }
+    }
+    return result;
+  }
+
+  /// Evaluates the final `VERDICT: PASS` / `VERDICT: FAIL` signal in an agent's
+  /// output, preferring standalone verdict lines and taking the last verdict so
+  /// prose quoting rules (e.g. "若失败输出 VERDICT: FAIL") before the final
+  /// `VERDICT: PASS` does not falsely trigger a failure.
+  static ({bool? finalVerdict, bool hasPass, bool hasFail}) evaluateVerdict(
+    String output,
+  ) {
+    if (output.isEmpty) {
+      return (finalVerdict: null, hasPass: false, hasFail: false);
+    }
+    final standaloneRe = RegExp(
+      r'''^\s*(?:[-*•>]\s*)?[*`]*VERDICT\s*[:：]\s*(PASS|FAIL)\b[*`.\s]*$''',
+      caseSensitive: false,
+      multiLine: true,
+    );
+    final standalone = standaloneRe.allMatches(output).toList();
+    final matches = standalone.isNotEmpty
+        ? standalone
+        : RegExp(
+            r'VERDICT\s*[:：]\s*(PASS|FAIL)\b',
+            caseSensitive: false,
+          ).allMatches(output).toList();
+    if (matches.isEmpty) {
+      return (finalVerdict: null, hasPass: false, hasFail: false);
+    }
+    var hasPass = false;
+    var hasFail = false;
+    for (final m in matches) {
+      final token = m.group(1)!.toUpperCase();
+      if (token == 'PASS') hasPass = true;
+      if (token == 'FAIL') hasFail = true;
+    }
+    final last = matches.last.group(1)!.toUpperCase();
+    return (finalVerdict: last == 'PASS', hasPass: hasPass, hasFail: hasFail);
   }
 
   static bool evaluateCondition(
@@ -4048,6 +4215,15 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
     if (vars['approval.note'] case final an?) {
       env['AYTE_APPROVAL_NOTE'] = an;
     }
+    if (vars['bug.id'] case final bid? when bid.isNotEmpty) {
+      env['AYTE_BUG_ID'] = bid;
+    }
+    if (vars['bug.guid'] case final bguid? when bguid.isNotEmpty) {
+      env['AYTE_BUG_GUID'] = bguid;
+    }
+    if (vars['fix.repos'] case final frepos? when frepos.isNotEmpty) {
+      env['AYTE_FIX_REPOS'] = frepos;
+    }
     if (vars['cwd'] case final cwd? when cwd.isNotEmpty) {
       env['AYTE_CWD'] = cwd;
     }
@@ -4061,7 +4237,7 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
     if (node == null || node.running) return;
     final vars = <String, String>{'cwd': node.refId};
     // Seed trigger inputs and completed upstream outputs so single-step tests
-    // can reference {{input.*}} and {{prev.output}} directly.
+    // can reference {{input.*}}, {{bug.id}}, and {{prev.output}} directly.
     for (final n in _nodes) {
       if (n.kind == CanvasNodeKind.trigger) {
         final parsed = parseKeyValueLines(n.content);
@@ -4076,6 +4252,7 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
         vars['${n.id}.output'] = n.output;
         vars['${n.id}.status'] =
             n.runStatus == CanvasNodeRunStatus.succeeded ? 'PASS' : 'FAIL';
+        vars.addAll(extractOutputVariables(n.output));
       }
     }
     var prevOutput = '';
@@ -4527,6 +4704,9 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
           vars['${n.id}.output'] = n.output;
           vars['${n.id}.status'] =
               n.runStatus == CanvasNodeRunStatus.succeeded ? 'PASS' : 'FAIL';
+          if (n.runStatus == CanvasNodeRunStatus.succeeded) {
+            vars.addAll(extractOutputVariables(n.output));
+          }
         }
       }
     }
@@ -4731,13 +4911,17 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
           onLogChunk: onLogChunk,
         );
 
-        // Merge back trigger inputs & approval notes produced by this node.
+        // Merge back trigger inputs, approval notes, and extracted outputs.
         for (final entry in stepVars.entries) {
           if (entry.key.startsWith('input.') ||
               entry.key == 'approval.note' ||
+              entry.key.endsWith('.note') ||
               entry.key == 'cwd') {
             vars[entry.key] = entry.value;
           }
+        }
+        if (passed && node.output.isNotEmpty) {
+          vars.addAll(extractOutputVariables(node.output));
         }
         vars['prev.output'] = node.output;
         vars['prev.exitCode'] = '${node.exitCode ?? (passed ? 0 : 1)}';
@@ -4761,6 +4945,22 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
               : '✗ [${node.title}] 未通过（exit=${node.exitCode ?? 1}$durStr）',
           immediate: true,
         );
+
+        final approvalTimedOut = stepVars['_approvalTimedOut'] == '1';
+        if (approvalTimedOut) {
+          // Never execute onFail human-rejection side-effects on a passive
+          // approval timeout — abort downstream cleanly instead.
+          hadUnhandledFailure = true;
+          failedNodeId ??= node.id;
+          resolveDownstream(
+            node.id,
+            executed: false,
+            passed: false,
+            output: node.output,
+            exitCode: node.exitCode,
+          );
+          return;
+        }
 
         final outgoing = outgoingEdges[node.id] ?? const <CanvasEdge>[];
         if (!passed) {
@@ -5160,18 +5360,13 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
           // output) so mentioning VERDICT: PASS in an upstream node never
           // falsely arms the hard verdict gate on downstream nodes.
           final requiresPassVerdict = RegExp(
-            r'VERDICT\s*:\s*PASS\b',
+            r'VERDICT\s*[:：]\s*PASS\b',
             caseSensitive: false,
           ).hasMatch(node.content);
-          final verdictPass = RegExp(
-            r'VERDICT\s*:\s*PASS\b',
-            caseSensitive: false,
-          ).hasMatch(node.output);
-          final verdictFail = RegExp(
-            r'VERDICT\s*:\s*FAIL\b',
-            caseSensitive: false,
-          ).hasMatch(node.output);
-          final missingRequiredPass = requiresPassVerdict && !verdictPass;
+          final verdict = evaluateVerdict(node.output);
+          final verdictFail = verdict.finalVerdict == false;
+          final missingRequiredPass =
+              requiresPassVerdict && verdict.finalVerdict != true;
           if (missingRequiredPass && !verdictFail && res.ok) {
             _appendRunLog(
               '\n[硬门禁阻断] 该节点要求明确输出 VERDICT: PASS，但实际输出未确认通过，已判定失败以防虚报成功。\n',
@@ -5298,13 +5493,18 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
           );
           _flushStreamNotify();
           var timedOut = false;
-          final decision = await completer.future.timeout(
-            Duration(seconds: node.timeoutSeconds),
-            onTimeout: () {
-              timedOut = true;
-              return (approved: false, note: '审批超时（${node.timeoutSeconds}s）自动驳回');
-            },
-          );
+          final decision = node.timeoutSeconds <= 0
+              ? await completer.future
+              : await completer.future.timeout(
+                  Duration(seconds: node.timeoutSeconds),
+                  onTimeout: () {
+                    timedOut = true;
+                    return (
+                      approved: false,
+                      note: '审批超时（${node.timeoutSeconds}s）自动中止（未触发驳回分支）',
+                    );
+                  },
+                );
           if (run != null) {
             if (run.activeApprovalNodeId == node.id) {
               run.activeApprovalNodeId = null;
@@ -5317,7 +5517,11 @@ echo "3. 页面兜底入口：http://127.0.0.1:4200/uploadModel 或 {{input.apiU
             }
           }
           vars['approval.note'] = decision.note;
-          node.exitCode = decision.approved ? 0 : 1;
+          vars['${node.id}.note'] = decision.note;
+          if (timedOut) {
+            vars['_approvalTimedOut'] = '1';
+          }
+          node.exitCode = decision.approved ? 0 : (timedOut ? 124 : 1);
           node.runStatus = decision.approved
               ? CanvasNodeRunStatus.succeeded
               : CanvasNodeRunStatus.failed;

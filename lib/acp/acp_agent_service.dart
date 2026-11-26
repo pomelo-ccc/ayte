@@ -828,6 +828,16 @@ class AcpAgentService extends ChangeNotifier {
           if (decoded['event'] case final String ev) {
             if (ev == 'init') {
               onChunk?.call('[Agent] 已初始化会话，开始分析任务…\n');
+            } else if (ev == 'error') {
+              final errObj = decoded['error'];
+              final msg =
+                  '${(errObj is Map ? errObj['message'] : errObj) ?? decoded['message'] ?? ''}'
+                      .trim();
+              unrecoveredError = true;
+              if (msg.isNotEmpty) {
+                streamError = msg;
+                onChunk?.call('\n[Agent Error] $msg\n');
+              }
             } else if (ev == 'step_update') {
               final step = decoded['step_update'];
               if (step is Map) {
@@ -846,7 +856,7 @@ class AcpAgentService extends ChangeNotifier {
                     stepType != 'user_input' &&
                     stepType != 'agent_response') {
                   final label = toolName.isNotEmpty
-                      ? '$stepType ($toolName)'
+                      ? (stepType == 'tool' ? toolName : '$stepType ($toolName)')
                       : stepType;
                   onChunk?.call('\n⚙ [工具] $label…\n');
                 }
@@ -854,6 +864,20 @@ class AcpAgentService extends ChangeNotifier {
             } else if (ev == 'result') {
               final res = decoded['result'];
               if (res is Map) {
+                final status = '${res['status'] ?? ''}'.trim().toUpperCase();
+                if (status.isNotEmpty && status != 'SUCCESS') {
+                  streamFailed = true;
+                  final errObj = res['error'];
+                  final msg =
+                      '${(errObj is Map ? errObj['message'] : errObj) ?? res['message'] ?? 'Agent finished with status $status'}'
+                          .trim();
+                  if (msg.isNotEmpty) {
+                    streamError = msg;
+                    onChunk?.call('\n[Agent Failed] $msg\n');
+                  }
+                } else if (status == 'SUCCESS') {
+                  unrecoveredError = false;
+                }
                 final resp = res['response'] as String?;
                 if (resp != null && resp.trim().isNotEmpty) {
                   finalResultText = resp;
@@ -897,7 +921,19 @@ class AcpAgentService extends ChangeNotifier {
                 }
               }
             } else if (type == 'result') {
+              final isErr =
+                  decoded['is_error'] == true ||
+                  decoded['subtype'] == 'error_during_execution';
               final res = decoded['result'] as String?;
+              if (isErr) {
+                streamFailed = true;
+                final errMsg =
+                    '${decoded['error'] ?? res ?? 'Execution failed'}'.trim();
+                if (errMsg.isNotEmpty) {
+                  streamError = errMsg;
+                  onChunk?.call('\n[Agent Error] $errMsg\n');
+                }
+              }
               if (res != null && res.trim().isNotEmpty) {
                 finalResultText = res;
                 if (outBuf.isEmpty) {
@@ -1002,29 +1038,47 @@ class AcpAgentService extends ChangeNotifier {
         }
       }
 
+      final outDone = Completer<void>();
+      final errDone = Completer<void>();
       final subOut = proc.stdout
           .transform(const Utf8Decoder(allowMalformed: true))
-          .listen((c) {
-            if (!streamJson) {
-              outBuf.write(c);
-              onChunk?.call(c);
-              return;
-            }
-            lineCarry += c;
-            while (true) {
-              final nl = lineCarry.indexOf('\n');
-              if (nl < 0) break;
-              final line = lineCarry.substring(0, nl);
-              lineCarry = lineCarry.substring(nl + 1);
-              handleStreamLine(line);
-            }
-          });
+          .listen(
+            (c) {
+              if (!streamJson) {
+                outBuf.write(c);
+                onChunk?.call(c);
+                return;
+              }
+              lineCarry += c;
+              while (true) {
+                final nl = lineCarry.indexOf('\n');
+                if (nl < 0) break;
+                final line = lineCarry.substring(0, nl);
+                lineCarry = lineCarry.substring(nl + 1);
+                handleStreamLine(line);
+              }
+            },
+            onDone: () {
+              if (!outDone.isCompleted) outDone.complete();
+            },
+            onError: (_) {
+              if (!outDone.isCompleted) outDone.complete();
+            },
+          );
       final subErr = proc.stderr
           .transform(const Utf8Decoder(allowMalformed: true))
-          .listen((c) {
-            errBuf.write(c);
-            onChunk?.call(c);
-          });
+          .listen(
+            (c) {
+              errBuf.write(c);
+              onChunk?.call(c);
+            },
+            onDone: () {
+              if (!errDone.isCompleted) errDone.complete();
+            },
+            onError: (_) {
+              if (!errDone.isCompleted) errDone.complete();
+            },
+          );
       final code = await proc.exitCode.timeout(
         timeout,
         onTimeout: () async {
@@ -1032,6 +1086,15 @@ class AcpAgentService extends ChangeNotifier {
           return -1;
         },
       );
+      // Drain trailing buffered stdout/stderr chunks before cancelling so the
+      // final NDJSON `result` line emitted right before exit is never dropped.
+      try {
+        await Future.wait([outDone.future, errDone.future]).timeout(
+          const Duration(seconds: 2),
+        );
+      } on TimeoutException {
+        // Subprocess descendants kept stdio pipes open; force cancel below.
+      }
       await subOut.cancel();
       await subErr.cancel();
       if (streamJson && lineCarry.trim().isNotEmpty) {

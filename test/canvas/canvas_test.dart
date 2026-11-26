@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 
+import 'package:baocode/acp/acp_agent_service.dart';
 import 'package:baocode/canvas/canvas_ai_generator.dart';
 import 'package:baocode/canvas/canvas_controller.dart';
 import 'package:baocode/canvas/infinite_canvas_view.dart';
@@ -124,6 +125,64 @@ void main() {
         CanvasController.interpolate('{{input.msg | url}}', vars),
         contains('%26%20100%25'),
       );
+      // Unquoted fallback resolves another variable when present; quoted stays literal.
+      expect(
+        CanvasController.interpolate(
+          '{{step_triage.output ?? prev.output}}',
+          {'prev.output': 'FROM_PREV'},
+        ),
+        'FROM_PREV',
+      );
+      expect(
+        CanvasController.interpolate(
+          "{{step_triage.output ?? 'prev.output'}}",
+          {'prev.output': 'FROM_PREV'},
+        ),
+        'prev.output',
+      );
+    });
+
+    test('extractOutputVariables parses structured headers and skips placeholders', () {
+      const sample = '''
+**BUG_ID**: `I2611000627`
+BUG_GUID：EB72E4F12A5A41A198AEA62890BA2ADD
+- BUG_TITLE: 【公共】新增子文件夹重复提示
+BUG_URL: https://pomeloc.top/bugs/#I2611000627
+CHANGED_REPOS: pdm
+''';
+      final parsed = CanvasController.extractOutputVariables(sample);
+      expect(parsed['bug.id'], 'I2611000627');
+      expect(parsed['bugId'], 'I2611000627');
+      expect(parsed['bug.guid'], 'EB72E4F12A5A41A198AEA62890BA2ADD');
+      expect(parsed['bug.title'], '【公共】新增子文件夹重复提示');
+      expect(parsed['bug.url'], 'https://pomeloc.top/bugs/#I2611000627');
+      expect(parsed['fix.repos'], 'pdm');
+
+      // Angle-bracket placeholders and "无" must be ignored.
+      expect(
+        CanvasController.extractOutputVariables('BUG_ID: <单号>\nCHANGED_REPOS: 无'),
+        isEmpty,
+      );
+    });
+
+    test('evaluateVerdict respects final standalone verdict over earlier prose', () {
+      const proseThenPass = '''
+规则说明：如果失败请输出 VERDICT: FAIL，通过输出 VERDICT: PASS。
+已核实所有校验项通过。
+**VERDICT: PASS**
+''';
+      final v1 = CanvasController.evaluateVerdict(proseThenPass);
+      expect(v1.finalVerdict, isTrue);
+
+      const failAtEnd = '''
+初步排查看似正常（非 VERDICT: PASS）
+最终结论：
+VERDICT: FAIL
+''';
+      final v2 = CanvasController.evaluateVerdict(failAtEnd);
+      expect(v2.finalVerdict, isFalse);
+
+      expect(CanvasController.evaluateVerdict('no verdict here').finalVerdict, isNull);
     });
 
     test('extracts both Windows and POSIX evidence paths without false matches', () {
@@ -267,6 +326,237 @@ Linux: /tmp/run_1/trace.md
       await reloaded.load();
       expect(reloaded.nodes.length, 1);
       expect(reloaded.nodes.first.title, 'Saved Note');
+    });
+
+    test('approval nodes default to unlimited timeout (0) and preserve it in JSON', () {
+      final ctrl = CanvasController.forTest();
+      final gate = ctrl.addNode(
+        kind: CanvasNodeKind.approval,
+        title: 'Human Gate',
+      );
+      expect(gate.timeoutSeconds, 0);
+      final parsed = CanvasNode.fromJson(gate.toJson());
+      expect(parsed?.timeoutSeconds, 0);
+
+      // Command nodes still clamp to >= 10s.
+      final cmd = ctrl.addNode(
+        kind: CanvasNodeKind.command,
+        title: 'Shell',
+        timeoutSeconds: 0,
+      );
+      expect(cmd.timeoutSeconds, 10);
+    });
+
+    test('approval timeout aborts workflow WITHOUT firing onFail rejection branch', () async {
+      final ctrl = CanvasController.forTest();
+      final gate = ctrl.addNode(
+        kind: CanvasNodeKind.approval,
+        title: 'Gate',
+        content: 'Approve?',
+      );
+      // Use a short direct timeout (1s) on the node for testing.
+      gate.timeoutSeconds = 1;
+      var rejectRan = false;
+      final rejectNode = ctrl.addNode(
+        kind: CanvasNodeKind.command,
+        title: 'Reject Side Effect',
+        content: 'echo REJECT_RAN',
+        recoversFailure: true,
+      );
+      ctrl.connect(gate.id, rejectNode.id, branch: CanvasEdgeBranch.onFail);
+
+      final res = await ctrl.runWorkflow();
+      expect(res.ok, isFalse);
+      expect(res.failedNodeId, gate.id);
+      final run = ctrl.runById(res.runId!)!;
+      expect(run.nodeById(gate.id)?.exitCode, 124);
+      rejectRan = run.nodeById(rejectNode.id)?.runStatus ==
+          CanvasNodeRunStatus.succeeded;
+      expect(rejectRan, isFalse);
+      expect(run.nodeById(rejectNode.id)?.runStatus, CanvasNodeRunStatus.skipped);
+    });
+
+    test('bug verification template propagates BUG_ID/context and handles human reject cleanly', () async {
+      final dir = await Directory.systemTemp.createTemp('ayte-bug-wf-test');
+      addTearDown(() => dir.delete(recursive: true));
+      addTearDown(() => AcpAgentService.instance.headlessRunnerOverride = null);
+
+      final promptsByStep = <String, String>{};
+      AcpAgentService.instance.headlessRunnerOverride = ({
+        required String agentId,
+        required String prompt,
+        required String cwd,
+        String? model,
+        String? effort,
+        void Function(String chunk)? onChunk,
+        void Function(Process proc)? onProcessStarted,
+        Duration timeout = const Duration(minutes: 15),
+      }) async {
+        if (prompt.contains('自动筛选选单')) {
+          promptsByStep['step_triage'] = prompt;
+          return (
+            ok: true,
+            output:
+                'BUG_ID: I2611000627\n'
+                'BUG_GUID: EB72E4F12A5A41A198AEA62890BA2ADD\n'
+                'BUG_TITLE: 【公共】新增子文件夹重复提示\n'
+                'BUG_URL: https://pomeloc.top/bugs/#I2611000627\n'
+                '根因：pdm/src/app/folder-modal.html 框下多了一段重复 hint。\n'
+                'VERDICT: PASS',
+            error: null,
+          );
+        }
+        if (prompt.contains('action":"fix"')) {
+          promptsByStep['step_mark_pr'] = prompt;
+          return (
+            ok: true,
+            output: 'BUG_ID: I2611000627\n已更新为 PR\nVERDICT: PASS',
+            error: null,
+          );
+        }
+        if (prompt.contains('按最小化精准原则修复前端代码')) {
+          promptsByStep['step_fix_code'] = prompt;
+          return (
+            ok: true,
+            output:
+                'BUG_ID: I2611000627\n'
+                'CHANGED_REPOS: pdm\n'
+                '已移除 folder-modal.html 重复提示文案。\n'
+                'VERDICT: PASS',
+            error: null,
+          );
+        }
+        if (prompt.contains('不在前端修改')) {
+          promptsByStep['step_reject_reply'] = prompt;
+          return (
+            ok: true,
+            output: 'BUG_ID: I2611000627\n已转交后端林泽世\nVERDICT: PASS',
+            error: null,
+          );
+        }
+        return (ok: true, output: 'VERDICT: PASS', error: null);
+      };
+
+      final ctrl = CanvasController.forTest();
+      final tpl = CanvasController.buildBugVerificationTemplate(
+        defaultCwd: dir.path,
+      );
+      // Verify template structural invariants.
+      expect(
+        tpl.nodes.firstWhere((n) => n.id == 'step_triage_gate').timeoutSeconds,
+        0,
+      );
+      expect(
+        tpl.nodes.firstWhere((n) => n.id == 'step_reject_reply').recoversFailure,
+        isTrue,
+      );
+      expect(
+        tpl.nodes.firstWhere((n) => n.id == 'step_69_deploy_verify').timeoutSeconds,
+        1800,
+      );
+
+      // 1) Human rejection path must run step_reject_reply with BUG_ID & finish ok=true.
+      late int rejectRunId;
+      final rejectFuture = ctrl.runWorkflow(
+        templateId: CanvasController.bugVerifyTemplateId,
+        defaultCwd: dir.path,
+        onRunStarted: (id) => rejectRunId = id,
+      );
+      while (ctrl.runById(rejectRunId)?.activeApprovalNodeId !=
+          'step_triage_gate') {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      ctrl.rejectNode(
+        'step_triage_gate',
+        note: '转交后端 林泽世',
+        runId: rejectRunId,
+      );
+      final rejectRes = await rejectFuture;
+      expect(rejectRes.ok, isTrue, reason: rejectRes.error);
+      expect(promptsByStep['step_reject_reply'], contains('I2611000627'));
+      expect(
+        promptsByStep['step_reject_reply'],
+        contains('EB72E4F12A5A41A198AEA62890BA2ADD'),
+      );
+      expect(promptsByStep['step_reject_reply'], contains('转交后端 林泽世'));
+
+      // 2) Approve path: step_fix_code must still receive step_triage root cause,
+      //    BUG_ID, and step_triage_gate.note even after step_mark_pr ran in between!
+      promptsByStep.clear();
+      // Replace step_rebuild_local with a fast no-op echo so the test stays self-contained.
+      final customNodes = [
+        for (final n in tpl.nodes)
+          if (n.id == 'step_rebuild_local')
+            CanvasNode(
+              id: n.id,
+              kind: n.kind,
+              title: n.title,
+              x: n.x,
+              y: n.y,
+              content: r'echo "REBUILT:$AYTE_BUG_ID:$AYTE_FIX_REPOS"',
+            )
+          else
+            n.clone(),
+      ];
+      late int approveRunId;
+      final approveFuture = ctrl.runWorkflow(
+        customNodes: customNodes,
+        customEdges: tpl.edges,
+        defaultCwd: dir.path,
+        onRunStarted: (id) => approveRunId = id,
+      );
+      while (ctrl.runById(approveRunId)?.activeApprovalNodeId !=
+          'step_triage_gate') {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      ctrl.approveNode(
+        'step_triage_gate',
+        note: '只改 pdm',
+        runId: approveRunId,
+      );
+      while (ctrl.runById(approveRunId)?.activeApprovalNodeId !=
+          'step_deploy_69_gate') {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      final activeApproveRun = ctrl.runById(approveRunId)!;
+      expect(promptsByStep['step_fix_code'], contains('I2611000627'));
+      expect(promptsByStep['step_fix_code'], contains('folder-modal.html'));
+      expect(promptsByStep['step_fix_code'], contains('只改 pdm'));
+      expect(
+        activeApproveRun.nodeById('step_rebuild_local')?.output,
+        contains('REBUILT:I2611000627:pdm'),
+      );
+      expect(activeApproveRun.capturedVars['bug.id'], 'I2611000627');
+      expect(activeApproveRun.capturedVars['fix.repos'], 'pdm');
+      ctrl.stopWorkflow(runId: approveRunId);
+      await approveFuture;
+
+      // 3) Hard verdict gate on step_triage: missing VERDICT: PASS must fail before approval gate.
+      AcpAgentService.instance.headlessRunnerOverride = ({
+        required String agentId,
+        required String prompt,
+        required String cwd,
+        String? model,
+        String? effort,
+        void Function(String chunk)? onChunk,
+        void Function(Process proc)? onProcessStarted,
+        Duration timeout = const Duration(minutes: 15),
+      }) async => (
+        ok: true,
+        output: '当前会话未挂载浏览器工具，无法读取问题单。',
+        error: null,
+      );
+      final failRes = await ctrl.runWorkflow(
+        templateId: CanvasController.bugVerifyTemplateId,
+        defaultCwd: dir.path,
+      );
+      expect(failRes.ok, isFalse);
+      expect(failRes.failedNodeId, 'step_triage');
+      final failRun = ctrl.runById(failRes.runId!)!;
+      expect(
+        failRun.nodeById('step_triage_gate')?.runStatus,
+        CanvasNodeRunStatus.skipped,
+      );
     });
   });
 

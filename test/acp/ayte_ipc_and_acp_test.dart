@@ -1033,6 +1033,101 @@ void main(List<String> args) {
       expect(realUnknownRes.ok, isFalse);
       expect(realUnknownRes.error, contains('Unknown agent: nonexistent'));
     });
+
+    test('detects agy result status!=SUCCESS, agy error events, and claude is_error=true on exit 0', () async {
+      final binDir = Directory(p.join(tempDir.path, 'fake-stream-bin'))
+        ..createSync();
+      final scriptFile = File(p.join(binDir.path, 'fake_stream_cli.dart'))
+        ..writeAsStringSync(r'''
+import 'dart:io';
+
+void main() {
+  final mode = Platform.environment['STREAM_MODE'] ?? '';
+  if (mode == 'agy_result_error') {
+    stdout.writeln('{"event":"init","conversation_id":"c1"}');
+    stdout.writeln('{"event":"step_update","step_update":{"step_type":"tool","state":"ACTIVE","tool_name":"run_command"}}');
+    stdout.writeln('{"event":"result","result":{"status":"ERROR","error":{"message":"Quota exhausted"}}}');
+    exit(0);
+  }
+  if (mode == 'agy_event_error') {
+    stdout.writeln('{"event":"init","conversation_id":"c2"}');
+    stdout.writeln('{"event":"error","error":"Transport disconnected"}');
+    exit(0);
+  }
+  if (mode == 'claude_is_error') {
+    stdout.writeln('{"type":"system","subtype":"init"}');
+    stdout.writeln('{"type":"result","is_error":true,"result":"Rate limit reached"}');
+    exit(0);
+  }
+  stdout.writeln('{"event":"result","result":{"status":"SUCCESS","response":"OK_STREAM"}}');
+}
+''');
+      final dartExe = _resolveDartExe();
+      for (final name in const ['agy', 'claude']) {
+        if (Platform.isWindows) {
+          File(p.join(binDir.path, '$name.cmd')).writeAsStringSync(
+            '@echo off\r\n"$dartExe" "${scriptFile.path}" %*\r\n',
+          );
+        } else {
+          final sh = File(p.join(binDir.path, name))
+            ..writeAsStringSync(
+              '#!/bin/sh\nexec "$dartExe" "${scriptFile.path}" "\$@"\n',
+            );
+          await Process.run('chmod', ['+x', sh.path]);
+        }
+      }
+      final fakeHome = Directory(p.join(tempDir.path, 'fake-stream-home'))
+        ..createSync();
+      final sysRoot = Platform.environment['SystemRoot'] ?? r'C:\Windows';
+      final testPath = Platform.isWindows
+          ? '${binDir.path};$sysRoot\\System32;$sysRoot'
+          : '${binDir.path}:/usr/bin:/bin';
+      final baseEnv = <String, String>{
+        for (final entry in Platform.environment.entries)
+          if (!const {
+            'path',
+            'appdata',
+            'localappdata',
+            'userprofile',
+            'home',
+          }.contains(entry.key.toLowerCase()))
+            entry.key: entry.value,
+        'HOME': fakeHome.path,
+        'USERPROFILE': fakeHome.path,
+        'PATH': testPath,
+      };
+      addTearDown(() => ClaudeEnvironment.use(null));
+
+      final chunks = <String>[];
+      ClaudeEnvironment.use({...baseEnv, 'STREAM_MODE': 'agy_result_error'});
+      final agyResErr = await AcpAgentService.instance.runHeadlessPrompt(
+        agentId: 'agy',
+        prompt: 'test',
+        cwd: repoDir.path,
+        onChunk: chunks.add,
+      );
+      expect(agyResErr.ok, isFalse);
+      expect(agyResErr.error, contains('Quota exhausted'));
+      expect(chunks.join(), contains('[工具] run_command'));
+
+      ClaudeEnvironment.use({...baseEnv, 'STREAM_MODE': 'agy_event_error'});
+      final agyEvErr = await AcpAgentService.instance.runHeadlessPrompt(
+        agentId: 'agy',
+        prompt: 'test',
+        cwd: repoDir.path,
+      );
+      expect(agyEvErr.ok, isFalse);
+      expect(agyEvErr.error, contains('Transport disconnected'));
+
+      ClaudeEnvironment.use({...baseEnv, 'STREAM_MODE': 'claude_is_error'});
+      final claudeErr = await AcpAgentService.instance.runHeadlessPrompt(
+        agentId: 'claude',
+        prompt: 'test',
+        cwd: repoDir.path,
+      );
+      expect(claudeErr.ok, isFalse);
+      expect(claudeErr.error, contains('Rate limit reached'));
+    });
   });
 }
 

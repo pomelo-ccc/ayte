@@ -502,7 +502,7 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView>
             ? _ctrl.activeWorkflowName
             : triggerNode!.title,
         initialParams: pairs,
-        modelSummary: _workflowModelBadgeLabel(isZh),
+        modelSummaryBuilder: () => _workflowModelBadgeLabel(isZh),
         isZh: isZh,
         onConfigureModels: () => unawaited(_openWorkflowModelDialog(isZh)),
       ),
@@ -1500,14 +1500,11 @@ class _InfiniteCanvasViewState extends State<InfiniteCanvasView>
   }
 
   String? _resolveEvidenceDir() {
-    for (final n in _ctrl.displayNodes) {
-      if (n.kind == CanvasNodeKind.trigger) {
-        final pairs = CanvasController.parseKeyValueLines(n.content);
-        final dir = pairs['evidenceDir']?.trim();
-        if (dir != null && dir.isNotEmpty) return dir;
-      }
-    }
-    return null;
+    final run = _ctrl.selectedRun;
+    return CanvasController.resolveEvidenceDirFromNodes(
+      _ctrl.displayNodes,
+      capturedVars: run?.capturedVars ?? const {},
+    );
   }
 
   Future<void> _confirmClear(bool isZh) async {
@@ -4961,7 +4958,10 @@ class _ExecutionProgressStrip extends StatelessWidget {
                   ),
                 ),
               ],
-              if (CanvasController.resolveEvidenceDirFromNodes(sourceNodes)
+              if (CanvasController.resolveEvidenceDirFromNodes(
+                    sourceNodes,
+                    capturedVars: activeRun?.capturedVars ?? const {},
+                  )
                   case final evDir?
                   when _CanvasFsCache.existsCached(
                         evDir,
@@ -6919,8 +6919,13 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
       ),
       (
         label: isZh ? '人工意见' : 'Approval Note',
-        token: '{{approval.note}}',
+        token: '{{approval.note ?? 无}}',
         tone: const Color(0xFFD97706),
+      ),
+      (
+        label: isZh ? '问题单号' : 'Bug ID',
+        token: '{{bug.id}}',
+        tone: const Color(0xFFDC2626),
       ),
       (
         label: isZh ? '工作区路径' : 'Root Path',
@@ -6930,12 +6935,24 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
     ];
     final seen = {for (final c in chips) c.token};
     for (final n in allNodes) {
-      if (n.kind != CanvasNodeKind.trigger) continue;
-      final pairs = CanvasController.parseKeyValueLines(n.content);
-      for (final key in pairs.keys) {
-        final tok = '{{input.$key}}';
+      if (n.kind == CanvasNodeKind.trigger) {
+        final pairs = CanvasController.parseKeyValueLines(n.content);
+        for (final key in pairs.keys) {
+          final tok = '{{input.$key}}';
+          if (seen.add(tok)) {
+            chips.add((label: key, token: tok, tone: const Color(0xFF16A34A)));
+          }
+        }
+      } else if (n.kind.isExecutable &&
+          n.id != widget.node.id &&
+          n.kind != CanvasNodeKind.approval) {
+        final tok = '{{${n.id}.output}}';
         if (seen.add(tok)) {
-          chips.add((label: key, token: tok, tone: const Color(0xFF16A34A)));
+          chips.add((
+            label: '${n.id}.output',
+            token: tok,
+            tone: const Color(0xFF6366F1),
+          ));
         }
       }
     }
@@ -7424,22 +7441,26 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
             children: [
               _subLabel(
                 isZh
-                    ? '单步超时时间（当前 ${node.timeoutSeconds}s）'
-                    : 'Timeout (${node.timeoutSeconds}s)',
+                    ? '单步超时时间（当前 ${node.timeoutSeconds <= 0 ? "不限时" : "${node.timeoutSeconds}s"}）'
+                    : 'Timeout (${node.timeoutSeconds <= 0 ? "No limit" : "${node.timeoutSeconds}s"})',
               ),
               Wrap(
                 spacing: 6,
                 runSpacing: 6,
                 children: [
-                  for (final sec in const [60, 180, 300, 600, 1800])
+                  for (final sec in (node.kind == CanvasNodeKind.approval
+                      ? const [0, 300, 600, 1800, 3600]
+                      : const [60, 180, 300, 600, 1800]))
                     _pillChoice(
-                      label: sec >= 60 ? '${sec ~/ 60}m' : '${sec}s',
+                      label: sec <= 0
+                          ? (isZh ? '不限时' : '∞')
+                          : (sec >= 60 ? '${sec ~/ 60}m' : '${sec}s'),
                       selected: node.timeoutSeconds == sec,
                       accent: const Color(0xFF0891B2),
                       fillColor: fieldFill,
                       borderColor: subtleBorder,
                       colors: colors,
-                      mono: true,
+                      mono: sec > 0,
                       onTap: isReadOnly
                           ? () {}
                           : () => ctrl.updateNode(
@@ -8379,6 +8400,7 @@ class _NodeInspectorPanelState extends State<_NodeInspectorPanel> {
     final evidencePaths = CanvasController.extractEvidencePaths(node.output);
     final evDir = CanvasController.resolveEvidenceDirFromNodes(
       widget.run?.nodes ?? CanvasController.instance.nodes,
+      capturedVars: widget.run?.capturedVars ?? const {},
     );
     final hasExistingEvDir =
         evDir != null &&
@@ -10177,7 +10199,7 @@ class _PreRunWorkflowDialog extends StatefulWidget {
     required this.ctrl,
     required this.workflowName,
     required this.initialParams,
-    required this.modelSummary,
+    required this.modelSummaryBuilder,
     required this.isZh,
     required this.onConfigureModels,
   });
@@ -10185,7 +10207,7 @@ class _PreRunWorkflowDialog extends StatefulWidget {
   final CanvasController ctrl;
   final String workflowName;
   final Map<String, String> initialParams;
-  final String modelSummary;
+  final String Function() modelSummaryBuilder;
   final bool isZh;
   final VoidCallback onConfigureModels;
 
@@ -10217,9 +10239,11 @@ class _PreRunWorkflowDialogState extends State<_PreRunWorkflowDialog> {
   static String? _hintForKey(String key, bool isZh) {
     if (!isZh) return null;
     return switch (key) {
+      'bugsUrl' => '问题单平台地址（推荐 https://pomeloc.top/bugs/）',
+      'bugId' => '可选：指定单号（如 I2611000627）；留空则自动按规则筛单',
       'deployMode' => 'smart（极速精准）或 all（全量并行）',
       'targetApps' => '空格分隔应用名，如 pdm 或 pdm umc',
-      'filterStatus' => '问题单状态筛选（逗号分隔）',
+      'filterStatus' => '问题单状态筛选（逗号分隔，如 REOPENED,PR,ASSIGN,NEW）',
       'filterModule' => '模块筛选（默认 全部）',
       'filterSeverity' => '严重程度筛选（默认 全部）',
       'apiUrl' => '目标 PLM 后端地址',
@@ -10314,37 +10338,40 @@ class _PreRunWorkflowDialogState extends State<_PreRunWorkflowDialog> {
                     ),
                   ),
                   if (hasAgentNodes)
-                    InkWell(
-                      borderRadius: BorderRadius.circular(6),
-                      onTap: widget.onConfigureModels,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 8,
-                          vertical: 4,
-                        ),
-                        decoration: BoxDecoration(
-                          color: fieldFill,
-                          borderRadius: BorderRadius.circular(6),
-                          border: Border.all(color: hairline),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Icon(
-                              Codicons.hubot,
-                              size: 12,
-                              color: Color(0xFF2563EB),
-                            ),
-                            const SizedBox(width: 5),
-                            Text(
-                              widget.modelSummary,
-                              style: TextStyle(
-                                fontSize: 10.8,
-                                fontWeight: FontWeight.w500,
-                                color: colors['foreground'],
+                    ListenableBuilder(
+                      listenable: widget.ctrl,
+                      builder: (context, _) => InkWell(
+                        borderRadius: BorderRadius.circular(6),
+                        onTap: widget.onConfigureModels,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: fieldFill,
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(color: hairline),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(
+                                Codicons.hubot,
+                                size: 12,
+                                color: Color(0xFF2563EB),
                               ),
-                            ),
-                          ],
+                              const SizedBox(width: 5),
+                              Text(
+                                widget.modelSummaryBuilder(),
+                                style: TextStyle(
+                                  fontSize: 10.8,
+                                  fontWeight: FontWeight.w500,
+                                  color: colors['foreground'],
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
                       ),
                     ),
