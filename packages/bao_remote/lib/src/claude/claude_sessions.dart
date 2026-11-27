@@ -327,36 +327,50 @@ String _fork(
     for (final line in const LineSplitter().convert(file.readAsStringSync()))
       ?_decode(line),
   ];
-  final byId = <String, Map<String, Object?>>{
-    for (final entry in entries)
-      if (entry['uuid'] case final String uuid) uuid: entry,
-  };
+  final byId = <String, List<int>>{};
+  for (var i = 0; i < entries.length; i++) {
+    if (entries[i]['uuid'] case final String uuid) {
+      (byId[uuid] ??= []).add(i);
+    }
+  }
+  int? findParentIndex(String parent, int beforeRow) {
+    final matches = byId[parent];
+    if (matches == null) return null;
+    for (var i = matches.length - 1; i >= 0; i--) {
+      if (matches[i] < beforeRow) return matches[i];
+    }
+    return matches.last;
+  }
+
   String? parentOf(Map<String, Object?> entry) =>
       (entry['parentUuid'] ?? entry['logicalParentUuid']) as String?;
-  final Map<String, Object?>? leaf;
+  int? leafIndex;
   if (before != null) {
-    final cut = byId[before];
-    if (cut == null) throw StateError('No message $before in session $id');
-    leaf = switch (parentOf(cut)) {
-      final parent? => byId[parent],
+    final cutIndex = byId[before]?.last;
+    if (cutIndex == null) throw StateError('No message $before in session $id');
+    leafIndex = switch (parentOf(entries[cutIndex])) {
+      final parent? => findParentIndex(parent, cutIndex),
       null => null,
     };
   } else {
-    leaf = entries.reversed
-        .where(
-          (e) => _kept(e) && e['isSidechain'] != true && e['uuid'] is String,
-        )
-        .firstOrNull;
+    for (var i = entries.length - 1; i >= 0; i--) {
+      final e = entries[i];
+      if (_kept(e) && e['isSidechain'] != true && e['uuid'] is String) {
+        leafIndex = i;
+        break;
+      }
+    }
   }
   // The chain to it, every line of it as written (attachments, compaction
   // boundaries): what the CLI makes of the original, it makes of this.
   final chain = <Map<String, Object?>>[];
-  final seen = <String>{};
-  for (var entry = leaf; entry != null;) {
-    if (!seen.add(entry['uuid'] as String)) break;
+  final seen = <int>{};
+  for (var row = leafIndex; row != null;) {
+    if (!seen.add(row)) break;
+    final entry = entries[row];
     chain.add(entry);
-    entry = switch (parentOf(entry)) {
-      final parent? => byId[parent],
+    row = switch (parentOf(entry)) {
+      final parent? => findParentIndex(parent, row),
       null => null,
     };
   }
@@ -957,28 +971,40 @@ List<Map<String, Object?>> _branch(String path) {
       continue;
     }
   }
-  final byId = <String, Map<String, Object?>>{
-    for (final entry in entries)
-      if (entry['uuid'] case final String id) id: entry,
-  };
-  Map<String, Object?>? leaf;
-  for (final entry in entries.reversed) {
+  final byId = <String, List<int>>{};
+  for (var i = 0; i < entries.length; i++) {
+    if (entries[i]['uuid'] case final String id) {
+      (byId[id] ??= []).add(i);
+    }
+  }
+  int? findParent(String parent, int beforeRow) {
+    final matches = byId[parent];
+    if (matches == null) return null;
+    for (var i = matches.length - 1; i >= 0; i--) {
+      if (matches[i] < beforeRow) return matches[i];
+    }
+    return matches.last;
+  }
+
+  int? leaf;
+  for (var i = entries.length - 1; i >= 0; i--) {
+    final entry = entries[i];
     if (_kept(entry) &&
         entry['isSidechain'] != true &&
         entry['uuid'] is String) {
-      leaf = entry;
+      leaf = i;
       break;
     }
   }
   final branch = <Map<String, Object?>>[];
-  final seen = <String>{};
-  for (var entry = leaf; entry != null;) {
-    final id = entry['uuid'] as String;
-    if (!seen.add(id)) break;
+  final seen = <int>{};
+  for (var row = leaf; row != null;) {
+    if (!seen.add(row)) break;
+    final entry = entries[row];
     branch.add(entry);
     final parent =
         (entry['parentUuid'] ?? entry['logicalParentUuid']) as String?;
-    entry = parent == null ? null : byId[parent];
+    row = parent == null ? null : findParent(parent, row);
   }
   return [
     for (final entry in branch.reversed)
@@ -1131,7 +1157,19 @@ class _Lines {
   /// The lines along the branch that ends with the last message, oldest
   /// first, as [_branch] has them.
   List<int> branch() {
-    final byId = <String, int>{for (var i = 0; i < ids.length; i++) ?ids[i]: i};
+    final byId = <String, List<int>>{};
+    for (var i = 0; i < ids.length; i++) {
+      if (ids[i] case final id?) (byId[id] ??= []).add(i);
+    }
+    int? findParent(String parent, int beforeRow) {
+      final matches = byId[parent];
+      if (matches == null) return null;
+      for (var i = matches.length - 1; i >= 0; i--) {
+        if (matches[i] < beforeRow) return matches[i];
+      }
+      return matches.last;
+    }
+
     int? leaf;
     for (var i = kinds.length - 1; i >= 0; i--) {
       if (kinds[i] & (_keptLine | _sidechain) == _keptLine && ids[i] != null) {
@@ -1140,12 +1178,12 @@ class _Lines {
       }
     }
     final rows = <int>[];
-    final seen = <String>{};
+    final seen = <int>{};
     for (var row = leaf; row != null;) {
-      if (!seen.add(ids[row]!)) break;
+      if (!seen.add(row)) break;
       rows.add(row);
       row = switch (parents[row]) {
-        final parent? => byId[parent],
+        final parent? => findParent(parent, row),
         null => null,
       };
     }

@@ -77,6 +77,14 @@ class ClaudeTranslator {
   /// Replaying a kept session: nothing is pending or running any more.
   bool replaying = false;
 
+  /// Disambiguates legacy transcripts that reused synthetic Antigravity IDs
+  /// (e.g. `agy-msg-1-10`, `agy-tool-1-2`) across different turns after
+  /// restart so later turns never overwrite items from earlier turns.
+  int _replayTurn = 0;
+  final Set<String> _priorReplayIds = {};
+  final Set<String> _currentReplayIds = {};
+  final Map<String, String> _replayToolAlias = {};
+
   /// What the kept session's turns took and spent, as their footers showed
   /// it, by prompt: given to a turn replayed instead of its time guessed.
   Map<String, TurnRecord> keptTurns = const {};
@@ -459,6 +467,10 @@ class ClaudeTranslator {
     Map<String, Object?> message,
   ) {
     _timeReplayed();
+    _replayTurn++;
+    _priorReplayIds.addAll(_currentReplayIds);
+    _currentReplayIds.clear();
+    _replayToolAlias.clear();
     _replayed = (
       id: id,
       item: item,
@@ -801,7 +813,13 @@ class ClaudeTranslator {
     for (final (index, raw) in _list(body['content']).indexed) {
       final block = _map(raw);
       final kind = block['type'] == 'text' ? 'text' : 'thinking';
-      final key = '$eventId:$index';
+      final rawKey = '$eventId:$index';
+      final key = replaying && _priorReplayIds.contains(rawKey)
+          ? '$rawKey#t$_replayTurn'
+          : rawKey;
+      if (replaying && block['type'] != 'tool_use') {
+        _currentReplayIds.add(rawKey);
+      }
       final id = _blockIds[key] ??= switch (_unclaimed['$messageId:$kind']) {
         final ids? when ids.isNotEmpty => ids.removeAt(0),
         _ => key,
@@ -848,9 +866,23 @@ class ClaudeTranslator {
             );
           }
         case 'tool_use':
-          _streamedCalls.remove(block['id']);
+          final rawToolId = block['id'] as String;
+          final String toolId;
+          if (replaying) {
+            if (_priorReplayIds.contains(rawToolId)) {
+              toolId = '$rawToolId#t$_replayTurn';
+              _replayToolAlias[rawToolId] = toolId;
+            } else {
+              _replayToolAlias.remove(rawToolId);
+              _currentReplayIds.add(rawToolId);
+              toolId = rawToolId;
+            }
+          } else {
+            toolId = rawToolId;
+          }
+          _streamedCalls.remove(toolId);
           _toolUse(
-            block['id'] as String,
+            toolId,
             block['name'] as String,
             _map(block['input']),
             parent,
@@ -1456,7 +1488,10 @@ class ClaudeTranslator {
   }
 
   void _toolResult(Map<String, Object?> block, Object? result) {
-    final id = block['tool_use_id'] as String?;
+    final rawId = block['tool_use_id'] as String?;
+    final id = replaying && rawId != null
+        ? (_replayToolAlias[rawId] ?? rawId)
+        : rawId;
     final tool = id == null ? null : _tools[id];
     if (id == null || tool == null) return;
     _unanswered.remove(id);

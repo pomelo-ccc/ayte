@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:bao_agent/bao_agent.dart' show AgentPaths;
+import 'package:bao_remote/local.dart' show ClaudeSessions;
 import 'package:baocode/chat/chat_models.dart';
 import 'package:baocode/chat/panels/context_usage_panel.dart';
 import 'package:baocode/chat/session_links.dart';
@@ -3821,11 +3822,17 @@ Future<void> main(List<String> args) async {
         });
 
         final compacts = <Map<String, Object?>>[];
+        final turn3Order = <String>[];
         final responses = <String, Map<String, Object?>>{};
         var idleCount = 0;
         final sub = transport.messages.listen((m) {
           if (m['type'] == 'system' && m['subtype'] == 'compact_boundary') {
             compacts.add(m);
+            if (idleCount >= 2) turn3Order.add('compact_boundary');
+          } else if (m['type'] == 'assistant' && idleCount >= 2) {
+            turn3Order.add('assistant');
+          } else if (m['type'] == 'result' && idleCount >= 2) {
+            turn3Order.add('result');
           } else if (m['type'] == 'system' &&
               m['subtype'] == 'session_state_changed' &&
               m['state'] == 'idle') {
@@ -3889,6 +3896,454 @@ Future<void> main(List<String> args) async {
         expect(meta['pre_tokens'], 510455);
         expect(meta['post_tokens'], 36403);
         expect((await queryContext('c3'))['totalTokens'], 36403);
+        expect(turn3Order, ['compact_boundary', 'assistant', 'result']);
+      },
+    );
+
+    test(
+      'persists agy conversation binding across reopen, generates unique turn IDs, and avoids false compaction on fresh history seed',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp('agy_reopen_bind_');
+        addTearDown(() => _deleteWithRetry(tmp));
+
+        final paths = AgentPaths.from({'HOME': tmp.path});
+        const sessionId = '47721333-0f6a-4a4d-b30b-37c981a1145e';
+        const boundConvId = 'bound-agy-conv-1';
+        final sessionFile = File(paths.sessionFile(tmp.path, sessionId));
+        sessionFile.parent.createSync(recursive: true);
+
+        // Seed an existing session transcript with a high prior token count
+        // (337.1k) and legacy colliding synthetic IDs (`agy-tool-1-2`, `agy-msg-1-10`).
+        sessionFile.writeAsStringSync(
+          '${[
+            jsonEncode({
+              'parentUuid': null,
+              'isSidechain': false,
+              'userType': 'external',
+              'cwd': tmp.path,
+              'sessionId': sessionId,
+              'type': 'user',
+              'uuid': 'u-old-1',
+              'message': {'role': 'user', 'content': 'earlier task'},
+              'timestamp': '2026-11-27T07:00:00Z',
+            }),
+            jsonEncode({
+              'parentUuid': 'u-old-1',
+              'isSidechain': false,
+              'userType': 'external',
+              'cwd': tmp.path,
+              'sessionId': sessionId,
+              'type': 'assistant',
+              'uuid': 'agy-tool-msg-1-2',
+              'message': {
+                'id': 'agy-tool-msg-1-2',
+                'model': 'gemini-4-neon',
+                'role': 'assistant',
+                'content': [
+                  {
+                    'type': 'tool_use',
+                    'id': 'agy-tool-1-2',
+                    'name': 'Read',
+                    'input': {'file_path': '/tmp/old.dart'},
+                  },
+                ],
+              },
+              'timestamp': '2026-11-27T07:00:01Z',
+            }),
+            jsonEncode({
+              'parentUuid': 'agy-tool-msg-1-2',
+              'isSidechain': false,
+              'userType': 'external',
+              'cwd': tmp.path,
+              'sessionId': sessionId,
+              'type': 'user',
+              'uuid': 'agy-tool-res-1-2',
+              'message': {
+                'role': 'user',
+                'content': [
+                  {
+                    'type': 'tool_result',
+                    'tool_use_id': 'agy-tool-1-2',
+                    'content': 'old file content',
+                    'is_error': false,
+                  },
+                ],
+              },
+              'timestamp': '2026-11-27T07:00:02Z',
+            }),
+            jsonEncode({
+              'parentUuid': 'agy-tool-res-1-2',
+              'isSidechain': false,
+              'userType': 'external',
+              'cwd': tmp.path,
+              'sessionId': sessionId,
+              'type': 'assistant',
+              'uuid': 'agy-msg-1-10',
+              'message': {
+                'id': 'agy-1-10',
+                'model': 'gemini-4-neon',
+                'role': 'assistant',
+                'content': [
+                  {'type': 'text', 'text': 'old final answer'},
+                ],
+                'usage': {
+                  'input_tokens': 2894,
+                  'cache_read_input_tokens': 329925,
+                  'output_tokens': 4328,
+                },
+              },
+              'timestamp': '2026-11-27T07:00:05Z',
+            }),
+          ].join('\n')}\n',
+        );
+
+        final argLog = File(p.join(tmp.path, 'invocations.jsonl'));
+        final brainFile = File(
+          p.join(
+            tmp.path,
+            '.gemini',
+            'antigravity-cli',
+            'brain',
+            boundConvId,
+            '.system_generated',
+            'logs',
+            'transcript.jsonl',
+          ),
+        );
+
+        final fakeAgy = FakeCliExecutable.create(
+          tmp,
+          name: 'fake_agy_reopen_bind',
+          dartBody: '''
+Future<void> main(List<String> args) async {
+  final argLog = File(${jsonEncode(argLog.path)});
+  final brain = File(${jsonEncode(brainFile.path)});
+  await for (final line in stdin.transform(utf8.decoder).transform(const LineSplitter())) {
+    if (line.trim().isEmpty) continue;
+    final req = jsonDecode(line) as Map;
+    final prompt = ((req['message'] as Map)['content'] ?? '').toString();
+    argLog.writeAsStringSync(
+      "\${jsonEncode({'args': args, 'hasSeed': prompt.contains('<CONVERSATION_CONTEXT>')})}\\n",
+      mode: FileMode.append,
+      flush: true,
+    );
+    stdout.writeln(jsonEncode({'event': 'init', 'conversation_id': ${jsonEncode(boundConvId)}}));
+    brain.parent.createSync(recursive: true);
+    brain.writeAsStringSync(
+      "\${jsonEncode({'type': 'PLANNER_RESPONSE', 'input_tokens': 3101, 'cache_read_tokens': 38587, 'output_tokens': 1680})}\\n",
+      mode: FileMode.append,
+    );
+    stdout.writeln(jsonEncode({
+      'event': 'step_update',
+      'step_update': {
+        'step_index': 2,
+        'step_type': 'tool',
+        'state': 'DONE',
+        'tool_info': {
+          'name': 'read_file',
+          'parameters': {'Path': '"/tmp/new.dart"'},
+          'output': 'new content',
+        },
+      },
+    }));
+    stdout.writeln(jsonEncode({
+      'event': 'step_update',
+      'step_update': {
+        'step_index': 10,
+        'step_type': 'agent_response',
+        'state': 'DONE',
+        'text_delta': 'Fresh turn answer that must stay visible',
+        'usage': {
+          'input_tokens': 3101,
+          'cache_read_tokens': 38587,
+          'output_tokens': 1680,
+        },
+      },
+    }));
+    stdout.writeln(jsonEncode({
+      'event': 'result',
+      'result': {
+        'conversation_id': ${jsonEncode(boundConvId)},
+        'status': 'SUCCESS',
+        'response': 'Fresh turn answer that must stay visible',
+      },
+    }));
+    await stdout.flush();
+  }
+}
+''',
+        );
+
+        // Run #1: migrates existing session into a fresh agy brain with seed.
+        final t1 = AntigravityTransport.forTesting(
+          executable: fakeAgy.executablePath,
+          environment: {'HOME': tmp.path},
+          launch: ClaudeLaunch(cwd: tmp.path, resume: sessionId, persist: true),
+        );
+        final t1Compacts = <Map<String, Object?>>[];
+        final t1Uuids = <String>[];
+        final t1ToolIds = <String>[];
+        var t1Idle = 0;
+        final sub1 = t1.messages.listen((m) {
+          if (m['type'] == 'system' && m['subtype'] == 'compact_boundary') {
+            t1Compacts.add(m);
+          } else if (m['type'] == 'assistant') {
+            if (m['uuid'] case final String u) t1Uuids.add(u);
+            final content = ((m['message'] as Map?)?['content'] as List?) ?? [];
+            for (final b in content) {
+              if (b is Map && b['type'] == 'tool_use' && b['id'] is String) {
+                t1ToolIds.add(b['id'] as String);
+              }
+            }
+          } else if (m['type'] == 'system' &&
+              m['subtype'] == 'session_state_changed' &&
+              m['state'] == 'idle') {
+            t1Idle++;
+          }
+        });
+        t1.write({
+          'type': 'user',
+          'uuid': 'u-new-1',
+          'message': {'role': 'user', 'content': '整个项目都改完了？'},
+        });
+        while (t1Idle < 1) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        await sub1.cancel();
+        t1.close();
+        await t1.exited;
+
+        // No fake auto-compaction on freshly seeded conversation, and synthetic
+        // IDs must never collide with legacy `agy-tool-1-2` / `agy-msg-1-10`.
+        expect(t1Compacts, isEmpty);
+        expect(t1ToolIds, isNot(contains('agy-tool-1-2')));
+        expect(t1Uuids, isNot(contains('agy-tool-msg-1-2')));
+        expect(t1Uuids, isNot(contains('agy-msg-1-10')));
+
+        // Run #2 (reopen same session): must resume `--conversation=bound-agy-conv-1`
+        // directly without re-seeding `<CONVERSATION_CONTEXT>`, and produce fresh IDs.
+        final t2 = AntigravityTransport.forTesting(
+          executable: fakeAgy.executablePath,
+          environment: {'HOME': tmp.path},
+          launch: ClaudeLaunch(cwd: tmp.path, resume: sessionId, persist: true),
+        );
+        final t2Uuids = <String>[];
+        var t2Idle = 0;
+        final sub2 = t2.messages.listen((m) {
+          if (m['type'] == 'assistant') {
+            if (m['uuid'] case final String u) t2Uuids.add(u);
+          } else if (m['type'] == 'system' &&
+              m['subtype'] == 'session_state_changed' &&
+              m['state'] == 'idle') {
+            t2Idle++;
+          }
+        });
+        t2.write({
+          'type': 'user',
+          'uuid': 'u-new-2',
+          'message': {'role': 'user', 'content': 'follow-up after reopen'},
+        });
+        while (t2Idle < 1) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        await sub2.cancel();
+        t2.close();
+        await t2.exited;
+
+        final invocations = const LineSplitter()
+            .convert(argLog.readAsStringSync().trim())
+            .map((l) => jsonDecode(l) as Map)
+            .toList();
+        expect(invocations, hasLength(2));
+        expect(invocations[0]['hasSeed'], isTrue);
+        expect(
+          (invocations[0]['args'] as List),
+          isNot(contains('--conversation=$boundConvId')),
+        );
+        expect(invocations[1]['hasSeed'], isFalse);
+        expect(
+          (invocations[1]['args'] as List),
+          contains('--conversation=$boundConvId'),
+        );
+        expect(t2Uuids.toSet().intersection(t1Uuids.toSet()), isEmpty);
+      },
+    );
+
+    test(
+      'replaying legacy transcripts with duplicate agy UUIDs preserves full branch and both turns without overwriting',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp('agy_legacy_dup_');
+        addTearDown(() => _deleteWithRetry(tmp));
+
+        final jsonl = File(p.join(tmp.path, 'legacy.jsonl'));
+        jsonl.writeAsStringSync(
+          '${[
+            jsonEncode({
+              'parentUuid': null,
+              'isSidechain': false,
+              'type': 'user',
+              'uuid': 'u1',
+              'message': {'role': 'user', 'content': 'first question'},
+              'timestamp': '2026-11-27T07:00:00Z',
+            }),
+            jsonEncode({
+              'parentUuid': 'u1',
+              'isSidechain': false,
+              'type': 'assistant',
+              'uuid': 'agy-tool-msg-1-2',
+              'message': {
+                'id': 'agy-tool-msg-1-2',
+                'role': 'assistant',
+                'content': [
+                  {
+                    'type': 'tool_use',
+                    'id': 'agy-tool-1-2',
+                    'name': 'Bash',
+                    'input': {'command': 'echo step-a'},
+                  },
+                ],
+              },
+              'timestamp': '2026-11-27T07:00:01Z',
+            }),
+            jsonEncode({
+              'parentUuid': 'agy-tool-msg-1-2',
+              'isSidechain': false,
+              'type': 'user',
+              'uuid': 'agy-tool-res-1-2',
+              'message': {
+                'role': 'user',
+                'content': [
+                  {
+                    'type': 'tool_result',
+                    'tool_use_id': 'agy-tool-1-2',
+                    'content': 'result A',
+                    'is_error': false,
+                  },
+                ],
+              },
+              'timestamp': '2026-11-27T07:00:02Z',
+            }),
+            jsonEncode({
+              'parentUuid': 'agy-tool-res-1-2',
+              'isSidechain': false,
+              'type': 'assistant',
+              'uuid': 'agy-msg-1-10',
+              'message': {
+                'id': 'agy-1-10',
+                'role': 'assistant',
+                'content': [
+                  {'type': 'text', 'text': 'ANSWER_ONE'},
+                ],
+              },
+              'timestamp': '2026-11-27T07:00:05Z',
+            }),
+            // Turn 2 reuses the exact same legacy synthetic UUIDs & tool_use_id.
+            jsonEncode({
+              'parentUuid': 'agy-msg-1-10',
+              'isSidechain': false,
+              'type': 'user',
+              'uuid': 'u2',
+              'message': {'role': 'user', 'content': '整个项目都改完了？'},
+              'timestamp': '2026-11-27T08:51:59Z',
+            }),
+            jsonEncode({
+              'parentUuid': 'u2',
+              'isSidechain': false,
+              'type': 'assistant',
+              'uuid': 'agy-tool-msg-1-2',
+              'message': {
+                'id': 'agy-tool-msg-1-2',
+                'role': 'assistant',
+                'content': [
+                  {
+                    'type': 'tool_use',
+                    'id': 'agy-tool-1-2',
+                    'name': 'Bash',
+                    'input': {'command': 'echo step-b'},
+                  },
+                ],
+              },
+              'timestamp': '2026-11-27T08:52:13Z',
+            }),
+            jsonEncode({
+              'parentUuid': 'agy-tool-msg-1-2',
+              'isSidechain': false,
+              'type': 'user',
+              'uuid': 'agy-tool-res-1-2',
+              'message': {
+                'role': 'user',
+                'content': [
+                  {
+                    'type': 'tool_result',
+                    'tool_use_id': 'agy-tool-1-2',
+                    'content': 'result B',
+                    'is_error': false,
+                  },
+                ],
+              },
+              'timestamp': '2026-11-27T08:52:15Z',
+            }),
+            jsonEncode({
+              'parentUuid': 'agy-tool-res-1-2',
+              'isSidechain': false,
+              'type': 'assistant',
+              'uuid': 'agy-msg-1-10',
+              'message': {
+                'id': 'agy-1-10',
+                'role': 'assistant',
+                'content': [
+                  {'type': 'text', 'text': 'ANSWER_TWO'},
+                ],
+              },
+              'timestamp': '2026-11-27T08:52:59Z',
+            }),
+          ].join('\n')}\n',
+        );
+
+        final page = await ClaudeSessions.readPage(jsonl.path, turns: 10);
+        expect(page.entries, hasLength(8));
+
+        final items = <String, ChatItem>{};
+        final order = <String>[];
+        var seq = 0;
+        final translator = ClaudeTranslator(
+          emit: (event) {
+            if (event is ItemUpserted) {
+              if (!items.containsKey(event.id)) order.add(event.id);
+              items[event.id] = event.item;
+            }
+          },
+          nextSeq: () => ++seq,
+        )..replaying = true;
+        for (final line in page.entries) {
+          translator.translate(line);
+        }
+        translator.endReplay();
+
+        final rendered = [for (final id in order) items[id]!];
+        final texts = rendered
+            .whereType<AssistantTextItem>()
+            .map((e) => e.text)
+            .toList();
+        final commands = rendered
+            .whereType<TerminalItem>()
+            .map((e) => (e.command, e.output))
+            .toList();
+
+        expect(texts, ['ANSWER_ONE', 'ANSWER_TWO']);
+        expect(commands, [
+          ('echo step-a', 'result A'),
+          ('echo step-b', 'result B'),
+        ]);
+        // Turn 2's answer must appear AFTER Turn 2's prompt, not overwritten into Turn 1.
+        final u2Index = rendered.indexWhere(
+          (item) => item is UserMessageItem && item.text == '整个项目都改完了？',
+        );
+        final a2Index = rendered.indexWhere(
+          (item) => item is AssistantTextItem && item.text == 'ANSWER_TWO',
+        );
+        expect(u2Index, greaterThan(0));
+        expect(a2Index, greaterThan(u2Index));
       },
     );
   });

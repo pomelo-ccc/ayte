@@ -133,6 +133,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
 
   static final Set<AntigravityTransport> _live = {};
   static final Set<Future<void>> _pendingStops = {};
+  static int _transportSeq = 0;
 
   static Future<void> stopAll() async {
     final live = [..._live];
@@ -266,8 +267,12 @@ class AntigravityTransport implements ClaudeCodeTransport {
 
   bool _interrupted = false;
   bool _needsAccountRespawn = false;
+  late final String _instanceId =
+      '${_now().microsecondsSinceEpoch.toRadixString(36)}-${++_transportSeq}';
   int _turnCounter = 0;
   int _lastContextTokens = 0;
+
+  String _nextTurnKey() => '$_instanceId-${++_turnCounter}';
 
   /// FIFO queue of user turns waiting to execute sequentially.
   final List<({String? uuid, Map<String, Object?> message})> _pendingTurns = [];
@@ -283,6 +288,15 @@ class AntigravityTransport implements ClaudeCodeTransport {
     final id = _sessionId;
     if (id == null || id.isEmpty) return;
 
+    if (launch.persist) {
+      _sessionLog = _AntigravitySessionLog(
+        paths: _paths,
+        cwd: launch.cwd,
+        sessionId: id,
+        persist: launch.persist,
+      );
+    }
+
     final hasAgyConv = _hasAntigravityConversation(id);
     if (hasAgyConv) {
       _agyConversationId = id;
@@ -294,24 +308,25 @@ class AntigravityTransport implements ClaudeCodeTransport {
           model: _model,
         );
       }
+    } else if (_sessionLog?.readLastConversationId() case final boundId?
+        when _hasAntigravityConversation(boundId)) {
+      // Previously mapped to an Antigravity conversation (e.g. a session
+      // originally started under another engine): resume that exact brain
+      // instead of creating a fresh empty conversation on every reopen.
+      _agyConversationId = boundId;
+      _needsHistorySeed = false;
     } else {
-      // Switching an existing Claude Code session to Antigravity CLI:
+      // Switching an existing non-Antigravity session to Antigravity CLI:
       // keep Ayte's `_sessionId` intact and seed prior context on turn 1.
       _agyConversationId = null;
       _needsHistorySeed = true;
     }
 
-    if (launch.persist) {
-      _sessionLog = _AntigravitySessionLog(
-        paths: _paths,
-        cwd: launch.cwd,
-        sessionId: id,
-        persist: launch.persist,
-      );
-    }
-
     final seeded =
-        readBrainContextTokens(id, home: _paths.home)?.contextTokens ??
+        readBrainContextTokens(
+          _agyConversationId ?? id,
+          home: _paths.home,
+        )?.contextTokens ??
         _sessionLog?.readLastContextTokens();
     if (seeded != null && seeded > 0) {
       _lastContextTokens = seeded;
@@ -364,6 +379,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
         _sessionLog!.noteTitle(title);
       }
     }
+    _sessionLog?.noteConversationId(convId);
   }
 
   void _emit(Map<String, Object?> message) {
@@ -2363,8 +2379,10 @@ class AntigravityTransport implements ClaudeCodeTransport {
     final isManualCompact =
         prompt.trim() == '/compact' || prompt.trim().startsWith('/compact ');
     final preTurnContextTokens = _lastContextTokens;
+    final startedFreshWithSeed = _needsHistorySeed;
     var hadStepUsage = false;
-    var peakContextTokens = preTurnContextTokens;
+    var anyCompactEmitted = false;
+    var peakContextTokens = startedFreshWithSeed ? 0 : preTurnContextTokens;
 
     if (_needsHistorySeed && _sessionLog != null) {
       _needsHistorySeed = false;
@@ -2379,7 +2397,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
       }
     }
 
-    final turnId = ++_turnCounter;
+    final turnKey = _nextTurnKey();
     final turnStartedAt = _now();
     _interrupted = false;
     _activeTurnUuid = switch (userMessage['uuid']) {
@@ -2407,8 +2425,11 @@ class AntigravityTransport implements ClaudeCodeTransport {
 
     final turn = _ActiveTurn(
       transport: this,
-      turnId: turnId,
+      turnKey: turnKey,
       startedAt: turnStartedAt,
+      isManualCompact: isManualCompact,
+      startedFreshWithSeed: startedFreshWithSeed,
+      initialPeakContextTokens: peakContextTokens,
       onConversationBound: (convId) {
         _bindConversationId(convId);
         if (pendingUserRecord != null && _sessionLog != null) {
@@ -2465,6 +2486,7 @@ class AntigravityTransport implements ClaudeCodeTransport {
       }
       await active.done.future;
       hadStepUsage = hadStepUsage || active.hadStepUsage;
+      anyCompactEmitted = anyCompactEmitted || active.compactBoundaryEmitted;
       if (active.peakContextTokens > peakContextTokens) {
         peakContextTokens = active.peakContextTokens;
       }
@@ -2479,8 +2501,11 @@ class AntigravityTransport implements ClaudeCodeTransport {
       if (retry && !_interrupted && !_closed) {
         active = _ActiveTurn(
           transport: this,
-          turnId: turnId,
+          turnKey: _nextTurnKey(),
           startedAt: turnStartedAt,
+          isManualCompact: isManualCompact,
+          startedFreshWithSeed: startedFreshWithSeed,
+          initialPeakContextTokens: peakContextTokens,
           onConversationBound: turn.onConversationBound,
         );
         await runOnce(active);
@@ -2494,11 +2519,12 @@ class AntigravityTransport implements ClaudeCodeTransport {
         if (switched != null) {
           await _stopProcess(notifyActiveTurn: false);
           if (_closed) return;
+          final failoverKey = _nextTurnKey();
           _emit({
             'type': 'assistant',
-            'uuid': 'agy-failover-$turnId',
+            'uuid': 'agy-failover-$failoverKey',
             'message': {
-              'id': 'agy-failover-$turnId',
+              'id': 'agy-failover-$failoverKey',
               'model': _model,
               'role': 'assistant',
               'content': [
@@ -2512,8 +2538,11 @@ class AntigravityTransport implements ClaudeCodeTransport {
           });
           final failoverTurn = _ActiveTurn(
             transport: this,
-            turnId: turnId,
+            turnKey: failoverKey,
             startedAt: turnStartedAt,
+            isManualCompact: isManualCompact,
+            startedFreshWithSeed: startedFreshWithSeed,
+            initialPeakContextTokens: peakContextTokens,
             allowAutoFailover: false,
             onConversationBound: turn.onConversationBound,
           );
@@ -2570,24 +2599,33 @@ class AntigravityTransport implements ClaudeCodeTransport {
     if (_closed) return;
 
     // Refresh ground-truth context occupancy from agy's brain transcript when
-    // manual /compact ran or when the turn noticeably shrunk the context.
+    // manual /compact ran, or as a fallback when auto-compaction was not
+    // already detected mid-turn via `step_update.usage`. Never treat a freshly
+    // seeded new conversation as an auto-compaction of the prior session.
     final convId = _agyConversationId ?? _sessionId;
     if (convId != null && convId.isNotEmpty) {
       final brain = readBrainContextTokens(convId, home: _paths.home);
       if (brain != null && brain.contextTokens > 0) {
-        if (isManualCompact ||
-            (peakContextTokens > 60000 &&
-                brain.contextTokens < (peakContextTokens * 0.55).round())) {
+        final shouldEmitPostCompact =
+            isManualCompact ||
+            (!anyCompactEmitted &&
+                !startedFreshWithSeed &&
+                peakContextTokens > 60000 &&
+                brain.contextTokens < (peakContextTokens * 0.55).round());
+        if (shouldEmitPostCompact) {
           _lastContextTokens = brain.contextTokens;
-          _emit({
+          final compactEvent = <String, Object?>{
             'type': 'system',
             'subtype': 'compact_boundary',
+            'uuid': 'agy-compact-$turnKey-post',
             'compact_metadata': {
               'trigger': isManualCompact ? 'manual' : 'auto',
               if (peakContextTokens > 0) 'pre_tokens': peakContextTokens,
               'post_tokens': _lastContextTokens,
             },
-          });
+          };
+          _emit(compactEvent);
+          _sessionLog?.append(compactEvent);
         } else if (!hadStepUsage) {
           _lastContextTokens = brain.contextTokens;
         }
@@ -2705,17 +2743,15 @@ class AntigravityTransport implements ClaudeCodeTransport {
     );
   }
 
-  Map<String, Object?>? _recordStepUsage(Object? rawUsage) {
+  ({Map<String, Object?> usage, int contextTokens})? _recordStepUsage(
+    Object? rawUsage,
+  ) {
     final converted = convertAgyUsage(rawUsage);
     if (converted == null) return null;
     if (converted.contextTokens > 0) {
       _lastContextTokens = converted.contextTokens;
-      if (_activeTurn case final active?
-          when converted.contextTokens > active.peakContextTokens) {
-        active.peakContextTokens = converted.contextTokens;
-      }
     }
-    return converted.usage;
+    return converted;
   }
 
   Map<String, Object?>? _recordResultUsage(
@@ -3299,16 +3335,21 @@ class AntigravityTransport implements ClaudeCodeTransport {
 class _ActiveTurn {
   _ActiveTurn({
     required this.transport,
-    required this.turnId,
+    required this.turnKey,
     required this.startedAt,
     required this.onConversationBound,
+    this.isManualCompact = false,
+    this.startedFreshWithSeed = false,
+    int initialPeakContextTokens = 0,
     this.allowAutoFailover = true,
-  });
+  }) : peakContextTokens = initialPeakContextTokens;
 
   final AntigravityTransport transport;
-  final int turnId;
+  final String turnKey;
   final DateTime startedAt;
   final void Function(String convId) onConversationBound;
+  final bool isManualCompact;
+  final bool startedFreshWithSeed;
   final bool allowAutoFailover;
   final Completer<void> done = Completer<void>();
 
@@ -3323,7 +3364,8 @@ class _ActiveTurn {
   bool needsFreshRetry = false;
   bool streamedAnyResponse = false;
   bool hadStepUsage = false;
-  int peakContextTokens = 0;
+  bool compactBoundaryEmitted = false;
+  int peakContextTokens;
   Map<String, Object?>? pendingSilentStepUsage;
   String? lastToolError;
   String? unansweredPermissionError;
@@ -3419,7 +3461,7 @@ class _ActiveTurn {
       'event': {
         'type': 'message_start',
         'message': {
-          'id': 'agy-$turnId-$stepIndex',
+          'id': 'agy-$turnKey-$stepIndex',
           'model': transport._model,
           'usage': const <String, Object?>{},
         },
@@ -3469,9 +3511,9 @@ class _ActiveTurn {
     }
     _emitAndLog({
       'type': 'assistant',
-      'uuid': 'agy-msg-$turnId-$stepIndex',
+      'uuid': 'agy-msg-$turnKey-$stepIndex',
       'message': {
-        'id': 'agy-$turnId-$stepIndex',
+        'id': 'agy-$turnKey-$stepIndex',
         'model': transport._model,
         'role': 'assistant',
         'content': [
@@ -3556,7 +3598,7 @@ class _ActiveTurn {
 
     _emitAndLog({
       'type': 'user',
-      'uuid': 'agy-tool-res-$turnId-$stepIndex',
+      'uuid': 'agy-tool-res-$turnKey-$stepIndex',
       'message': {
         'role': 'user',
         'content': [
@@ -3600,11 +3642,37 @@ class _ActiveTurn {
     if (stepType == 'agent_response') {
       final thinkingDelta = step['thinking_delta'] as String? ?? '';
       final textDelta = step['text_delta'] as String? ?? '';
-      final usage = transport._recordStepUsage(step['usage']);
-      if (usage != null) {
+      final recordedUsage = transport._recordStepUsage(step['usage']);
+      final usage = recordedUsage?.usage;
+      if (recordedUsage != null) {
         hadStepUsage = true;
-        stepUsage[stepIndex] = usage;
-        pendingSilentStepUsage = usage;
+        stepUsage[stepIndex] = recordedUsage.usage;
+        pendingSilentStepUsage = recordedUsage.usage;
+        final ctxTokens = recordedUsage.contextTokens;
+        if (!isManualCompact &&
+            !startedFreshWithSeed &&
+            !compactBoundaryEmitted &&
+            peakContextTokens > 60000 &&
+            ctxTokens > 0 &&
+            ctxTokens < (peakContextTokens * 0.55).round()) {
+          // Emit the compaction divider BEFORE this post-compaction step starts
+          // so the divider sits chronologically ahead of the model's reply.
+          compactBoundaryEmitted = true;
+          final preTokens = peakContextTokens;
+          peakContextTokens = ctxTokens;
+          _emitAndLog({
+            'type': 'system',
+            'subtype': 'compact_boundary',
+            'uuid': 'agy-compact-$turnKey-$stepIndex',
+            'compact_metadata': {
+              'trigger': 'auto',
+              'pre_tokens': preTokens,
+              'post_tokens': ctxTokens,
+            },
+          }, persist: true);
+        } else if (ctxTokens > peakContextTokens) {
+          peakContextTokens = ctxTokens;
+        }
       }
 
       if (thinkingDelta.isNotEmpty) {
@@ -3726,7 +3794,7 @@ class _ActiveTurn {
         defaultCwd: transport.launch.cwd,
         serverName: serverName,
       );
-      final toolId = 'agy-tool-$turnId-$stepIndex';
+      final toolId = 'agy-tool-$turnKey-$stepIndex';
 
       toolLatest[stepIndex] = (
         toolId: toolId,
@@ -3765,9 +3833,9 @@ class _ActiveTurn {
         pendingSilentStepUsage = null;
         _emitAndLog({
           'type': 'assistant',
-          'uuid': 'agy-tool-msg-$turnId-$stepIndex',
+          'uuid': 'agy-tool-msg-$turnKey-$stepIndex',
           'message': {
-            'id': 'agy-tool-msg-$turnId-$stepIndex',
+            'id': 'agy-tool-msg-$turnKey-$stepIndex',
             'model': transport._model,
             'role': 'assistant',
             'content': [
@@ -3900,12 +3968,12 @@ class _ActiveTurn {
         // Plan path alone still surfaces the awaiting card.
       }
     }
-    final synthId = 'agy-exit-plan-$turnId';
+    final synthId = 'agy-exit-plan-$turnKey';
     _emitAndLog({
       'type': 'assistant',
-      'uuid': 'agy-exit-plan-msg-$turnId',
+      'uuid': 'agy-exit-plan-msg-$turnKey',
       'message': {
-        'id': 'agy-exit-plan-msg-$turnId',
+        'id': 'agy-exit-plan-msg-$turnKey',
         'model': transport._model,
         'role': 'assistant',
         'content': [
@@ -3923,7 +3991,7 @@ class _ActiveTurn {
     }, persist: true);
     _emitAndLog({
       'type': 'user',
-      'uuid': 'agy-exit-plan-res-$turnId',
+      'uuid': 'agy-exit-plan-res-$turnKey',
       'message': {
         'role': 'user',
         'content': [
@@ -3967,9 +4035,9 @@ class _ActiveTurn {
       if (fallbackText.isNotEmpty) {
         _emitAndLog({
           'type': 'assistant',
-          'uuid': 'agy-final-$turnId',
+          'uuid': 'agy-final-$turnKey',
           'message': {
-            'id': 'agy-final-$turnId',
+            'id': 'agy-final-$turnKey',
             'model': transport._model,
             'role': 'assistant',
             'content': [
@@ -3984,9 +4052,9 @@ class _ActiveTurn {
         unansweredPermissionError != null) {
       _emitAndLog({
         'type': 'assistant',
-        'uuid': 'agy-perm-abort-$turnId',
+        'uuid': 'agy-perm-abort-$turnKey',
         'message': {
-          'id': 'agy-perm-abort-$turnId',
+          'id': 'agy-perm-abort-$turnKey',
           'model': transport._model,
           'role': 'assistant',
           'content': [
@@ -4124,6 +4192,7 @@ class _AntigravitySessionLog {
   final String filePath;
 
   String? _leafUuid;
+  String? _lastRecordedConvId;
   int _seq = 0;
 
   static List<String> _readLinesLossySync(File file) {
@@ -4142,8 +4211,17 @@ class _AntigravitySessionLog {
         if (trimmed.isEmpty) continue;
         try {
           final decoded = jsonDecode(trimmed);
-          if (decoded is Map && decoded['uuid'] is String) {
+          if (decoded is! Map) continue;
+          if (_leafUuid == null && decoded['uuid'] is String) {
             _leafUuid = decoded['uuid'] as String;
+          }
+          if (_lastRecordedConvId == null &&
+              decoded['type'] == 'antigravity-conversation' &&
+              decoded['conversationId'] is String) {
+            final cid = decoded['conversationId'] as String;
+            if (cid.isNotEmpty) _lastRecordedConvId = cid;
+          }
+          if (_leafUuid != null && _lastRecordedConvId != null) {
             break;
           }
         } on Object {
@@ -4153,6 +4231,25 @@ class _AntigravitySessionLog {
     } on Object {
       // Ignore unreadable transcript file.
     }
+  }
+
+  /// Returns the latest `agy` conversation ID recorded for this session, if
+  /// it differs from [sessionId] (e.g. a session that started on another core).
+  String? readLastConversationId() => _lastRecordedConvId;
+
+  void noteConversationId(String convId) {
+    if (!persist ||
+        convId.isEmpty ||
+        convId == sessionId ||
+        convId == _lastRecordedConvId) {
+      return;
+    }
+    _lastRecordedConvId = convId;
+    _writeRaw({
+      'type': 'antigravity-conversation',
+      'conversationId': convId,
+      'sessionId': sessionId,
+    });
   }
 
   void append(Map<String, Object?> entry) {
