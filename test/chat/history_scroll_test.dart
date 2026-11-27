@@ -1,5 +1,8 @@
+import 'dart:typed_data';
+
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:baocode/chat/chat_feed.dart';
 import 'package:baocode/chat/chat_history_view.dart';
@@ -563,5 +566,340 @@ void main() {
     await tester.pump(const Duration(milliseconds: 300));
 
     expect(_position(tester).pixels, pixels);
+  });
+
+  group('rows folded above the cached window', () {
+    List<ChatItem> doneTurn(int n) => [
+      UserMessageItem(text: 'Q$n', worked: const Duration(seconds: 30)),
+      const ToolCallItem(kind: ToolKind.read, target: 'a.dart'),
+      const ToolCallItem(kind: ToolKind.read, target: 'b.dart'),
+      AssistantTextItem(
+        'Answer $n.\n\n${'Long paragraph for turn $n to make history tall. ' * 6}',
+      ),
+    ];
+
+    Uint8List fakePng(int width, int height) {
+      final bytes = Uint8List(33);
+      bytes.setAll(0, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+      final bd = ByteData.sublistView(bytes);
+      bd.setUint32(16, width);
+      bd.setUint32(20, height);
+      return bytes;
+    }
+
+    RenderSliverMultiBoxAdaptor findSliver(WidgetTester tester) {
+      RenderSliverMultiBoxAdaptor? found;
+      void visit(RenderObject obj) {
+        if (found != null) return;
+        if (obj is RenderSliverMultiBoxAdaptor) {
+          found = obj;
+        } else {
+          obj.visitChildren(visit);
+        }
+      }
+
+      tester.renderObject(find.byType(ChatHistoryView)).visitChildren(visit);
+      return found!;
+    }
+
+    testWidgets(
+      'keeps latest progress aligned and visible at bottom instead of clipping below maxScrollExtent',
+      (tester) async {
+        tester.view.physicalSize = const Size(1000, 600);
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.reset);
+
+        final items = <ChatItem>[
+          for (var i = 0; i < 30; i++) ...doneTurn(i),
+          const UserMessageItem(text: 'Live turn'),
+        ];
+        final feed = _Feed(
+          [...items, const LiveStatusItem('Planning next move', visible: true)],
+          streaming: true,
+        );
+        addTearDown(feed.dispose);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: buildAppTheme(),
+            home: Scaffold(body: ChatHistoryView(feed: feed)),
+          ),
+        );
+        await tester.pump();
+
+        for (var i = 0; i < 2; i++) {
+          items.add(ToolCallItem(kind: ToolKind.read, target: 'step_$i.dart'));
+          items.add(
+            AssistantTextItem(
+              'Step note $i\n\n${'Measured tall text block line.\n\n' * 10}',
+            ),
+          );
+          feed.update(
+            [
+              ...items,
+              const LiveStatusItem('Planning next move', visible: true),
+            ],
+            streaming: true,
+          );
+          await tester.pump();
+        }
+
+        for (var i = 0; i < 55; i++) {
+          items.add(AssistantTextItem('Trailing line $i.'));
+          feed.update(
+            [
+              ...items,
+              const LiveStatusItem('Planning next move', visible: true),
+            ],
+            streaming: true,
+          );
+          await tester.pump();
+        }
+        items.add(const AssistantTextItem('LATEST_PROGRESS_SENTINEL'));
+        feed.update(
+          [...items, const LiveStatusItem('Planning next move', visible: true)],
+          streaming: true,
+        );
+        await tester.pump();
+
+        // Fold the tall work rows strictly above firstChild while a new turn streams.
+        items[items.length - 1 - 55 - 4 - 1] = const UserMessageItem(
+          text: 'Live turn',
+          worked: Duration(seconds: 90),
+        );
+        items.add(const UserMessageItem(text: 'Next live turn'));
+        items.add(const AssistantTextItem('BRAND_NEW_PROGRESS'));
+        feed.update(
+          [...items, const LiveStatusItem('Planning next move', visible: true)],
+          streaming: true,
+        );
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+
+        final sliver = findSliver(tester);
+        final pos = _position(tester);
+        final lastAfter =
+            sliver.lastChild!.parentData! as SliverMultiBoxAdaptorParentData;
+        final lastEndAfter =
+            lastAfter.layoutOffset! + sliver.lastChild!.size.height;
+        final viewRect = tester.getRect(find.byType(ChatHistoryView));
+        final latestFinder = _text('BRAND_NEW_PROGRESS');
+
+        expect(lastEndAfter, closeTo(sliver.geometry!.scrollExtent, 1.0));
+        expect(pos.pixels, closeTo(pos.maxScrollExtent, 1.0));
+        expect(latestFinder, findsOneWidget);
+        final rect = tester.getRect(latestFinder);
+        expect(rect.bottom, lessThanOrEqualTo(viewRect.bottom));
+        expect(rect.bottom, greaterThan(viewRect.bottom - 120));
+      },
+    );
+
+    testWidgets(
+      'keeps live progress visible when tall screenshots and a queued tray shrink the viewport',
+      (tester) async {
+        tester.view.physicalSize = const Size(1000, 600);
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.reset);
+
+        final img1 = ImageAttachment(
+          bytes: fakePng(960, 600),
+          mediaType: 'image/png',
+        );
+        final img2 = ImageAttachment(
+          bytes: fakePng(960, 600),
+          mediaType: 'image/png',
+        );
+        final items = <ChatItem>[
+          for (var i = 0; i < 25; i++) ...doneTurn(i),
+          const UserMessageItem(text: 'Debug session'),
+        ];
+        final feed = _Feed(
+          [...items, const LiveStatusItem('Planning next move', visible: true)],
+          streaming: true,
+        );
+        addTearDown(feed.dispose);
+
+        final queuePanelHeight = ValueNotifier<double>(0);
+        addTearDown(queuePanelHeight.dispose);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: buildAppTheme(),
+            home: Scaffold(
+              body: Column(
+                children: [
+                  Expanded(child: ChatHistoryView(feed: feed)),
+                  ValueListenableBuilder<double>(
+                    valueListenable: queuePanelHeight,
+                    builder: (_, h, _) => SizedBox(height: h),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+
+        for (var i = 0; i < 2; i++) {
+          items.add(ToolCallItem(kind: ToolKind.read, target: 'file_$i.ts'));
+          items.add(
+            AssistantTextItem(
+              'Investigation $i\n\n${'Detailed log excerpt line.\n\n' * 10}',
+            ),
+          );
+          feed.update(
+            [
+              ...items,
+              const LiveStatusItem('Planning next move', visible: true),
+            ],
+            streaming: true,
+          );
+          await tester.pump();
+        }
+
+        for (var i = 0; i < 30; i++) {
+          items.add(AssistantTextItem('Check step $i.'));
+          feed.update(
+            [
+              ...items,
+              const LiveStatusItem('Planning next move', visible: true),
+            ],
+            streaming: true,
+          );
+          await tester.pump();
+        }
+        items.add(
+          ToolCallItem(
+            kind: ToolKind.image,
+            target: 'shots.png',
+            images: [img1, img2],
+          ),
+        );
+        feed.update(
+          [...items, const LiveStatusItem('Planning next move', visible: true)],
+          streaming: true,
+        );
+        await tester.pump();
+
+        // Previous turn folds while queued tray appears and new progress streams.
+        items[items.length - 1 - 30 - 4 - 1] = const UserMessageItem(
+          text: 'Debug session',
+          worked: Duration(seconds: 75),
+        );
+        items.add(const AssistantTextItem('LIVE_PROGRESS_VISIBLE_ABOVE_QUEUE'));
+        queuePanelHeight.value = 130;
+        feed.update(
+          [...items, const LiveStatusItem('Planning next move', visible: true)],
+          streaming: true,
+        );
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+
+        final sliver = findSliver(tester);
+        final lastAfter =
+            sliver.lastChild!.parentData! as SliverMultiBoxAdaptorParentData;
+        final lastEndAfter =
+            lastAfter.layoutOffset! + sliver.lastChild!.size.height;
+        final viewRect = tester.getRect(find.byType(ChatHistoryView));
+        final latestFinder = _text('LIVE_PROGRESS_VISIBLE_ABOVE_QUEUE');
+
+        expect(lastEndAfter, closeTo(sliver.geometry!.scrollExtent, 1.0));
+        expect(latestFinder, findsOneWidget);
+        expect(
+          tester.getRect(latestFinder).bottom,
+          lessThanOrEqualTo(viewRect.bottom),
+        );
+      },
+    );
+
+    testWidgets(
+      'keeps the currently read message steady when scrolled up and still aligns the tail',
+      (tester) async {
+        tester.view.physicalSize = const Size(1000, 600);
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.reset);
+
+        final items = <ChatItem>[
+          for (var i = 0; i < 30; i++) ...doneTurn(i),
+          const UserMessageItem(text: 'Live turn'),
+        ];
+        final feed = _Feed(
+          [...items, const LiveStatusItem('Working', visible: true)],
+          streaming: true,
+        );
+        addTearDown(feed.dispose);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: buildAppTheme(),
+            home: Scaffold(body: ChatHistoryView(feed: feed)),
+          ),
+        );
+        await tester.pump();
+
+        for (var i = 0; i < 2; i++) {
+          items.add(ToolCallItem(kind: ToolKind.read, target: 'read_$i.dart'));
+          items.add(
+            AssistantTextItem(
+              'Note $i\n\n${'Measured tall text block line.\n\n' * 10}',
+            ),
+          );
+          feed.update(
+            [...items, const LiveStatusItem('Working', visible: true)],
+            streaming: true,
+          );
+          await tester.pump();
+        }
+
+        for (var i = 0; i < 55; i++) {
+          items.add(AssistantTextItem('Reading line $i.'));
+          feed.update(
+            [...items, const LiveStatusItem('Working', visible: true)],
+            streaming: true,
+          );
+          await tester.pump();
+        }
+
+        // Scroll up slightly so we are reading an earlier line (still leaving
+        // the tall work block strictly above firstChild).
+        await _wheelUp(tester, 200);
+        await tester.pumpAndSettle();
+
+        final anchorFinder = _text('Reading line 40.');
+        expect(anchorFinder, findsOneWidget);
+        final topBefore = tester.getTopLeft(anchorFinder).dy;
+
+        // Fold the earlier turn's tall work rows while an unprompted turn starts.
+        items[items.length - 55 - 4 - 1] = const UserMessageItem(
+          text: 'Live turn',
+          worked: Duration(seconds: 80),
+        );
+        items.add(const UserMessageItem(text: 'Background report'));
+        items.add(const AssistantTextItem('TAIL_AFTER_SCROLL'));
+        feed.update(
+          [...items, const LiveStatusItem('Working', visible: true)],
+          streaming: true,
+          unprompted: true,
+        );
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+
+        expect(anchorFinder, findsOneWidget);
+        expect(tester.getTopLeft(anchorFinder).dy, closeTo(topBefore, 2.0));
+
+        // Scrolling back to the bottom reaches the real tail with no drift.
+        final pos = _position(tester);
+        pos.jumpTo(pos.maxScrollExtent);
+        await tester.pumpAndSettle();
+
+        final sliver = findSliver(tester);
+        final lastAfter =
+            sliver.lastChild!.parentData! as SliverMultiBoxAdaptorParentData;
+        final lastEndAfter =
+            lastAfter.layoutOffset! + sliver.lastChild!.size.height;
+        expect(lastEndAfter, closeTo(sliver.geometry!.scrollExtent, 1.0));
+        expect(_text('TAIL_AFTER_SCROLL'), findsOneWidget);
+      },
+    );
   });
 }

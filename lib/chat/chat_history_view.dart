@@ -830,6 +830,13 @@ class _ChatHistoryViewState extends State<ChatHistoryView>
       _unfoldedTurns.clear();
       // Another conversation's rows: the list takes them as it finds them.
       _rows = const [];
+      _realignRows = false;
+      _pendingScrollDelta = 0;
+      _forgetRows = true;
+      if (_listController.isAttached && !_listController.isLocked) {
+        _listController.invalidateAllExtents();
+      }
+      _listKey.currentContext?.findRenderObject()?.markNeedsLayout();
       _leaving.clear();
       _entering.clear();
       _wasLive = widget.feed.isStreaming;
@@ -1203,26 +1210,161 @@ class _ChatHistoryViewState extends State<ChatHistoryView>
   /// [_forgetRowsLaidOut]).
   bool _forgetRows = false;
 
+  /// Laid-out children need their `layoutOffset`s realigned with the extent
+  /// list before the next layout pass because rows were inserted or removed
+  /// (e.g. a fold closing/opening above `firstChild`). Without this,
+  /// `RenderSuperSliverList` keeps `firstChild`'s stale `layoutOffset` while
+  /// reporting `_totalExtent()`, which pushes trailing items past
+  /// `maxScrollExtent` (clipping the latest progress below the viewport) or
+  /// leaves blank space at the bottom.
+  bool _realignRows = false;
+  bool _realignPending = false;
+  double _pendingScrollDelta = 0;
+
   /// Lets go of the rows laid out, once built with the items now at their
   /// indexes: kept where they are, each would show the item now at its
   /// index where the one before was, and the list keep to them. Laid out
   /// anew, from the extents, the list keeps what is shown in place as it
   /// measures the rows before it.
   void _forgetRowsLaidOut(RenderObject list) {
-    if (!_forgetRows) return;
-    _forgetRows = false;
-    void forget(RenderObject node) {
+    if (_forgetRows) {
+      _forgetRows = false;
+      _realignRows = false;
+      _pendingScrollDelta = 0;
+      void forget(RenderObject node) {
+        if (node is RenderSliverMultiBoxAdaptor) {
+          node.visitChildren((child) {
+            (child.parentData! as SliverMultiBoxAdaptorParentData)
+                    .layoutOffset =
+                null;
+          });
+        } else {
+          node.visitChildren(forget);
+        }
+      }
+
+      forget(list);
+      return;
+    }
+    if (!_realignRows) return;
+    _realignRows = false;
+    _realignLaidOutRows(list);
+  }
+
+  /// Aligns `firstChild`'s `layoutOffset` with the sum of extents before it in
+  /// [_listController] and clears subsequent children's cached offsets so
+  /// `RenderSuperSliverList` lays them out cleanly from that exact offset.
+  ///
+  /// When rows above `firstChild` are added or removed, Flutter's
+  /// `SliverMultiBoxAdaptorElement.performRebuild` clears `layoutOffset` on the
+  /// newly shifted leading children while stamping stale pre-shift offsets from
+  /// `indexToLayoutOffset` onto overlapping slots. Left uncorrected,
+  /// `RenderSuperSliverList` anchors on the first stale child and drifts away
+  /// from `_totalExtent()`, clipping trailing content below `maxScrollExtent`.
+  void _realignLaidOutRows(RenderObject list) {
+    final pendingDelta = _pendingScrollDelta;
+    _pendingScrollDelta = 0;
+    if (!_listController.isAttached || _listController.isLocked) return;
+    RenderSliverMultiBoxAdaptor? sliver;
+    void find(RenderObject node) {
+      if (sliver != null) return;
       if (node is RenderSliverMultiBoxAdaptor) {
-        node.visitChildren((child) {
-          (child.parentData! as SliverMultiBoxAdaptorParentData).layoutOffset =
-              null;
-        });
+        sliver = node;
       } else {
-        node.visitChildren(forget);
+        node.visitChildren(find);
       }
     }
 
-    forget(list);
+    find(list);
+    final first = sliver?.firstChild;
+    if (sliver == null || first == null) return;
+    final firstData = first.parentData! as SliverMultiBoxAdaptorParentData;
+    final firstIndex = firstData.index;
+    final count = _listController.numberOfItems;
+    if (firstIndex == null || firstIndex < 0 || firstIndex >= count) {
+      return;
+    }
+    var expectedFirstOffset = 0.0;
+    for (var row = 0; row < firstIndex; row++) {
+      expectedFirstOffset += _listController.extentForIndex(row).$1;
+    }
+
+    // Find the first child that still carries a non-null layoutOffset (used as
+    // a fallback shift estimate when realignment was triggered outside
+    // [_syncRows], e.g. by [_ensureTailAligned]).
+    int? anchorIndex;
+    double? anchorOffset;
+    for (
+      RenderBox? child = first;
+      child != null;
+      child = sliver!.childAfter(child)
+    ) {
+      final data = child.parentData! as SliverMultiBoxAdaptorParentData;
+      if (data.index case final index?
+          when index >= 0 && index < count && data.layoutOffset != null) {
+        anchorIndex = index;
+        anchorOffset = data.layoutOffset;
+        break;
+      }
+    }
+
+    final firstOffset = firstData.layoutOffset;
+    final misaligned =
+        firstOffset == null ||
+        (firstOffset - expectedFirstOffset).abs() >= 0.5 ||
+        pendingDelta.abs() >= 0.5;
+    if (!misaligned) return;
+
+    firstData.layoutOffset = expectedFirstOffset;
+    for (
+      var child = sliver!.childAfter(first);
+      child != null;
+      child = sliver!.childAfter(child)
+    ) {
+      (child.parentData! as SliverMultiBoxAdaptorParentData).layoutOffset =
+          null;
+    }
+
+    var shift = pendingDelta;
+    if (shift.abs() < 0.5 && anchorIndex != null && anchorOffset != null) {
+      var expectedAnchorOffset = expectedFirstOffset;
+      for (var row = firstIndex; row < anchorIndex; row++) {
+        expectedAnchorOffset += _listController.extentForIndex(row).$1;
+      }
+      shift = expectedAnchorOffset - anchorOffset;
+    }
+    if (shift.abs() >= 0.5 && _scrollController.hasClients) {
+      final position = _scrollController.position;
+      if (position.hasPixels) {
+        final delta = math.max(-position.pixels, shift);
+        if (delta.abs() >= 0.5) position.correctBy(delta);
+      }
+    }
+  }
+
+  /// Safety net: if the final laid-out row's end disagrees with the sliver's
+  /// reported `scrollExtent`, schedule a realignment pass so trailing progress
+  /// can never stay clipped below `maxScrollExtent`.
+  void _ensureTailAligned() {
+    if (_realignPending || _rows.isEmpty || !_listController.isAttached) return;
+    final sliver = _findSliver();
+    final last = sliver?.lastChild;
+    final geometry = sliver?.geometry;
+    if (sliver == null || last == null || geometry == null || !last.hasSize) {
+      return;
+    }
+    final data = last.parentData! as SliverMultiBoxAdaptorParentData;
+    if (data.index != _rows.length - 1 || data.layoutOffset == null) return;
+    final end = data.layoutOffset! + last.size.height;
+    if ((end - geometry.scrollExtent).abs() < 1.0) return;
+    _realignPending = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _realignPending = false;
+      if (!mounted) return;
+      _realignRows = true;
+      _findSliver()?.markNeedsLayout();
+      _listKey.currentContext?.findRenderObject()?.markNeedsLayout();
+    });
   }
 
   /// Puts row [index] where it was (see [_held]), [above] its top above the
@@ -1338,6 +1480,7 @@ class _ChatHistoryViewState extends State<ChatHistoryView>
       setState(_unfoldedTurns.clear);
     }
     _syncEdgeFades();
+    _ensureTailAligned();
     _scheduleStickyUpdate();
     if (_pointersDown > 0) {
       if (_recordNow()) {
@@ -1680,6 +1823,7 @@ class _ChatHistoryViewState extends State<ChatHistoryView>
       setState(() => _shownAtBottom = _atBottom);
     }
     _syncEdgeFades();
+    _ensureTailAligned();
     _scheduleStickyUpdate();
     _editorMoved.value++;
     _wantEarlier();
@@ -2460,20 +2604,49 @@ class _ChatHistoryViewState extends State<ChatHistoryView>
         _listController.numberOfItems != before.length) {
       return;
     }
+    int? anchorItem;
+    if (!_forgetRows) {
+      anchorItem = _firstShown()?.index;
+      if (anchorItem == null) {
+        final first = _findSliver()?.firstChild;
+        if (first != null) {
+          final firstRow =
+              (first.parentData! as SliverMultiBoxAdaptorParentData).index;
+          if (firstRow != null && firstRow >= 0 && firstRow < before.length) {
+            anchorItem = before[firstRow];
+          }
+        }
+      }
+    }
     var old = 0;
     var row = 0;
+    var needsRealign = false;
+    var scrollDelta = 0.0;
     while (old < before.length || row < rows.length) {
       if (row == rows.length ||
           (old < before.length && before[old] < rows[row])) {
+        needsRealign = true;
+        if (anchorItem != null && before[old] < anchorItem) {
+          scrollDelta -= _listController.extentForIndex(row).$1;
+        }
         _listController.removeItem(row);
         old++;
       } else if (old == before.length || rows[row] < before[old]) {
+        if (old < before.length) needsRealign = true;
         _listController.addItem(row);
+        if (anchorItem != null && rows[row] < anchorItem) {
+          scrollDelta += _listController.extentForIndex(row).$1;
+        }
         row++;
       } else {
         old++;
         row++;
       }
+    }
+    if (!_forgetRows && needsRealign) {
+      _realignRows = true;
+      _pendingScrollDelta += scrollDelta;
+      _listKey.currentContext?.findRenderObject()?.markNeedsLayout();
     }
   }
 
