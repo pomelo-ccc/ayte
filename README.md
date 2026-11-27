@@ -6,16 +6,16 @@
 
 ## Download & Install
 
-Grab the prebuilt installer for your platform from [GitHub Releases](https://github.com/pomelo-ccc/ayte/releases/latest) (current version `v2.0.10`):
+Grab the prebuilt installer for your platform from [GitHub Releases](https://github.com/pomelo-ccc/ayte/releases/latest) (current version `v2.0.11`):
 
 | Platform | Architecture | Direct Download |
 | --- | --- | --- |
-| **macOS** | Apple Silicon (M1 / M2 / M3 / M4) | [Ayte-2.0.10-arm64.dmg](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.10/Ayte-2.0.10-arm64.dmg) |
-| **macOS** | Intel (x86_64) | [Ayte-2.0.10-x64.dmg](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.10/Ayte-2.0.10-x64.dmg) |
-| **Windows** | x64 (Windows 10 / 11) | [Ayte-2.0.10-setup.exe](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.10/Ayte-2.0.10-setup.exe) |
-| **Windows** | ARM64 | [Ayte-2.0.10-setup-arm64.exe](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.10/Ayte-2.0.10-setup-arm64.exe) |
-| **Linux** | x64 (Ubuntu / Debian `.deb`) | [Ayte-2.0.10-linux-amd64.deb](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.10/Ayte-2.0.10-linux-amd64.deb) · [.tar.gz](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.10/Ayte-2.0.10-linux-amd64.tar.gz) |
-| **Linux** | ARM64 (Ubuntu / Debian `.deb`) | [Ayte-2.0.10-linux-arm64.deb](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.10/Ayte-2.0.10-linux-arm64.deb) · [.tar.gz](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.10/Ayte-2.0.10-linux-arm64.tar.gz) |
+| **macOS** | Apple Silicon (M1 / M2 / M3 / M4) | [Ayte-2.0.11-arm64.dmg](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.11/Ayte-2.0.11-arm64.dmg) |
+| **macOS** | Intel (x86_64) | [Ayte-2.0.11-x64.dmg](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.11/Ayte-2.0.11-x64.dmg) |
+| **Windows** | x64 (Windows 10 / 11) | [Ayte-2.0.11-setup.exe](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.11/Ayte-2.0.11-setup.exe) |
+| **Windows** | ARM64 | [Ayte-2.0.11-setup-arm64.exe](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.11/Ayte-2.0.11-setup-arm64.exe) |
+| **Linux** | x64 (Ubuntu / Debian `.deb`) | [Ayte-2.0.11-linux-amd64.deb](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.11/Ayte-2.0.11-linux-amd64.deb) · [.tar.gz](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.11/Ayte-2.0.11-linux-amd64.tar.gz) |
+| **Linux** | ARM64 (Ubuntu / Debian `.deb`) | [Ayte-2.0.11-linux-arm64.deb](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.11/Ayte-2.0.11-linux-arm64.deb) · [.tar.gz](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.11/Ayte-2.0.11-linux-arm64.tar.gz) |
 
 > **macOS First Launch Note**: After dragging `Ayte` into `Applications`, if Gatekeeper blocks opening an ad-hoc signed build, run this once in Terminal:
 > ```bash

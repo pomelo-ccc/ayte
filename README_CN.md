@@ -6,16 +6,16 @@
 
 ## 下载安装
 
-直接前往 [GitHub Releases](https://github.com/pomelo-ccc/ayte/releases/latest) 或点击下方对应平台安装包下载（当前版本 `v2.0.10`）：
+直接前往 [GitHub Releases](https://github.com/pomelo-ccc/ayte/releases/latest) 或点击下方对应平台安装包下载（当前版本 `v2.0.11`）：
 
 | 平台 | 架构 | 直接下载 |
 | --- | --- | --- |
-| **macOS** | Apple Silicon (M1 / M2 / M3 / M4) | [Ayte-2.0.10-arm64.dmg](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.10/Ayte-2.0.10-arm64.dmg) |
-| **macOS** | Intel (x86_64) | [Ayte-2.0.10-x64.dmg](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.10/Ayte-2.0.10-x64.dmg) |
-| **Windows** | x64 (Windows 10 / 11) | [Ayte-2.0.10-setup.exe](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.10/Ayte-2.0.10-setup.exe) |
-| **Windows** | ARM64 | [Ayte-2.0.10-setup-arm64.exe](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.10/Ayte-2.0.10-setup-arm64.exe) |
-| **Linux** | x64 (Ubuntu / Debian `.deb`) | [Ayte-2.0.10-linux-amd64.deb](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.10/Ayte-2.0.10-linux-amd64.deb) · [.tar.gz](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.10/Ayte-2.0.10-linux-amd64.tar.gz) |
-| **Linux** | ARM64 (Ubuntu / Debian `.deb`) | [Ayte-2.0.10-linux-arm64.deb](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.10/Ayte-2.0.10-linux-arm64.deb) · [.tar.gz](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.10/Ayte-2.0.10-linux-arm64.tar.gz) |
+| **macOS** | Apple Silicon (M1 / M2 / M3 / M4) | [Ayte-2.0.11-arm64.dmg](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.11/Ayte-2.0.11-arm64.dmg) |
+| **macOS** | Intel (x86_64) | [Ayte-2.0.11-x64.dmg](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.11/Ayte-2.0.11-x64.dmg) |
+| **Windows** | x64 (Windows 10 / 11) | [Ayte-2.0.11-setup.exe](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.11/Ayte-2.0.11-setup.exe) |
+| **Windows** | ARM64 | [Ayte-2.0.11-setup-arm64.exe](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.11/Ayte-2.0.11-setup-arm64.exe) |
+| **Linux** | x64 (Ubuntu / Debian `.deb`) | [Ayte-2.0.11-linux-amd64.deb](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.11/Ayte-2.0.11-linux-amd64.deb) · [.tar.gz](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.11/Ayte-2.0.11-linux-amd64.tar.gz) |
+| **Linux** | ARM64 (Ubuntu / Debian `.deb`) | [Ayte-2.0.11-linux-arm64.deb](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.11/Ayte-2.0.11-linux-arm64.deb) · [.tar.gz](https://github.com/pomelo-ccc/ayte/releases/download/v2.0.11/Ayte-2.0.11-linux-arm64.tar.gz) |
 
 > **macOS 首次运行说明**：打开 `.dmg` 将 `Ayte` 拖入 `Applications` 后，若系统提示「已损坏 / 无法验证开发者」（未开启 Apple 公证签名），请在终端执行一次以下命令即可正常打开：
 > ```bash
